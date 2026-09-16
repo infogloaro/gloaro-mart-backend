@@ -1,0 +1,38 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "migrate:sprint1": "node scripts/migrate-sprint1.js",
+    "migrate:sprint2": "node scripts/migrate-sprint2.js",
+    "migrate:sprint3": "node scripts/migrate-sprint3.js",
+    "migrate:sprint4": "node scripts/migrate-sprint4.js",
+    "migrate:sprint5": "node scripts/migrate-sprint5.js",
+    "migrate:sprint7": "node scripts/migrate-sprint7.js",
+    "migrate:returns-reviews": "node scripts/migrate-returns-reviews.js",
+    "migrate:brands": "node scripts/migrate-brands.js",
+    "migrate:settings": "node scripts/migrate-settings.js",
+    "migrate:notifications": "node scripts/migrate-notifications.js",
+    "migrate:audit": "node scripts/migrate-audit.js",
+    "migrate:feature-flags": "node scripts/migrate-feature-flags.js",
+    "migrate:card-banners": "node scripts/migrate-card-banners.js",
+    "seed:sprint1": "node scripts/seed-sprint1.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
