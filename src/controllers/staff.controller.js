@@ -2,6 +2,7 @@ const bcrypt = require('bcrypt');
 const pool = require('../config/db');
 const { PERMISSIONS, PERMISSION_KEYS, SUPER_ADMIN } = require('../services/permissions');
 const { loadStaffContext } = require('../middleware/rbac');
+const { revokeSessions } = require('../services/sessions');
 
 /**
  * Staff accounts and the roles they hold.
@@ -278,6 +279,31 @@ async function revokeStaff(req, res) {
   }
 
   await pool.query(`UPDATE users SET role = 'customer', staff_role_id = NULL WHERE id = $1`, [targetId]);
+  // A revoked admin's existing token still says role: 'admin' — that field is
+  // baked into the JWT from login and is never rechecked against the users
+  // table. Without this, someone just revoked would keep the panel open until
+  // their token expired on its own, up to 7 days later.
+  await revokeSessions(targetId);
+  res.status(204).end();
+}
+
+/** Sets a staff member's password and ends every session already open on the account. */
+async function resetStaffPassword(req, res) {
+  const targetId = Number(req.params.id);
+  const { password } = req.body || {};
+  if (!password || String(password).length < 8) {
+    return res.status(400).json({ message: 'A password of at least 8 characters is required.' });
+  }
+
+  const { rows } = await pool.query(`${SELECT_STAFF} AND u.id = $1`, [targetId]);
+  if (!rows[0]) return res.status(404).json({ message: 'Staff member not found' });
+
+  const hash = await bcrypt.hash(String(password), 10);
+  await pool.query('UPDATE users SET password_hash = $2 WHERE id = $1', [targetId, hash]);
+  // The whole point of a super admin resetting someone's password is usually
+  // "get them out now" — a compromised account, an offboarding, a mistake.
+  // Leaving their old token valid until it expires would defeat that.
+  await revokeSessions(targetId);
   res.status(204).end();
 }
 
@@ -292,4 +318,5 @@ module.exports = {
   createStaff,
   updateStaff,
   revokeStaff,
+  resetStaffPassword,
 };

@@ -1415,3 +1415,15 @@ CREATE INDEX IF NOT EXISTS idx_wishlist_user ON wishlist_items (user_id, created
 ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS logo_url TEXT;
 ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS cover_image_url TEXT;
+
+-- ===== SESSION REVOCATION (PHASE 25) =====
+--
+-- A JWT is stateless by design — the server never tracked who was logged in,
+-- so changing a password or revoking admin access only affected the *next*
+-- login. The old token kept working until it expired (up to 7 days).
+--
+-- token_version is embedded in every token issued at login and rechecked on
+-- every authenticated request. Bumping it — on a password change or a staff
+-- revocation — makes every token issued before that moment fail its very
+-- next request, everywhere, without needing a session store.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;

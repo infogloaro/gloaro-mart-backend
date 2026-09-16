@@ -46,6 +46,7 @@ router.delete("/feature-flags/:id", featureFlags.deleteFlag);
 router.get("/staff", staff.listStaff);
 router.post("/staff", staff.createStaff);
 router.patch("/staff/:id", staff.updateStaff);
+router.patch("/staff/:id/password", staff.resetStaffPassword);
 router.delete("/staff/:id", staff.revokeStaff);
 
 router.get("/roles", staff.listRoles);
