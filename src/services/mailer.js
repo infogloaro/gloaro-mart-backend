@@ -1,31 +1,36 @@
-const nodemailer = require("nodemailer");
-
 /**
- * Gmail SMTP via an app password (GMAIL_USER / GMAIL_APP_PASSWORD in env).
- * Built lazily so a backend missing mail config can still boot — the OTP
- * routes fail loudly with a clear message instead of the whole server
- * crashing at require time.
+ * Mail over Resend's HTTPS API rather than SMTP.
+ *
+ * Render blocks outbound SMTP ports on its lower tiers, so a Gmail
+ * transport hangs for two minutes and then fails — the credentials are
+ * never the problem, the port is simply unreachable. HTTPS is not
+ * blocked, so the same mail goes out over the API instead.
+ *
+ * MAIL_FROM must be an address Resend will send as: their shared
+ * onboarding@resend.dev works without any DNS setup but only delivers to
+ * the account's own address, which is enough for an OTP going to one
+ * inbox. Sending anywhere else needs a verified domain.
  */
-let transporter;
-function getTransporter() {
-  if (!transporter) {
-    const user = process.env.GMAIL_USER;
-    const pass = process.env.GMAIL_APP_PASSWORD;
-    if (!user || !pass) {
-      throw new Error("GMAIL_USER and GMAIL_APP_PASSWORD must be set to send mail.");
-    }
-    transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: { user, pass },
-    });
-  }
-  return transporter;
-}
+const MAIL_FROM = process.env.MAIL_FROM || 'onboarding@resend.dev';
 
 async function sendMail({ to, subject, text, html }) {
-  const from = process.env.GMAIL_USER;
-  const info = await getTransporter().sendMail({ from, to, subject, text, html });
-  console.log(`[mail] "${subject}" -> accepted=${info.accepted} rejected=${info.rejected} id=${info.messageId}`);
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) throw new Error('RESEND_API_KEY must be set to send mail.');
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ from: MAIL_FROM, to: [to], subject, text, html }),
+  });
+
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(body?.message || `Resend returned ${res.status}`);
+  }
+  console.log(`[mail] "${subject}" -> ${to} id=${body?.id}`);
 }
 
 module.exports = { sendMail };
