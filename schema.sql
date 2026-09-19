@@ -1427,3 +1427,23 @@ ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS cover_image_url TEXT;
 -- revocation — makes every token issued before that moment fail its very
 -- next request, everywhere, without needing a session store.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;
+
+-- ===== ADMIN PASSWORD CHANGE OTP (PHASE 26) =====
+--
+-- A super admin changing their own password is one of the highest-blast-radius
+-- actions in the panel, so it is gated by an OTP mailed to the company inbox
+-- rather than trusted on the current password alone. The new password is
+-- hashed and staged here the moment it is requested, and only ever written to
+-- users.password_hash once the matching OTP comes back — nothing sensitive is
+-- kept around waiting on a second form submission from the browser.
+CREATE TABLE IF NOT EXISTS admin_password_otps (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  otp_hash TEXT NOT NULL,
+  new_password_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_password_otps_user ON admin_password_otps(user_id, created_at DESC);

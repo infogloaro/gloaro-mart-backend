@@ -32,6 +32,8 @@ router.use(requireAuth, requireRole("admin"));
 // — a staff member with no role still has to be able to load the panel and be
 // told that, rather than meeting a bare 403 at the door.
 router.get("/me", staff.getMe);
+router.post("/me/password/otp", staff.requestMyPasswordOtp);
+router.post("/me/password/otp/confirm", staff.confirmMyPasswordOtp);
 router.get("/permissions", staff.listPermissions);
 
 // Phase 15 — everything below is gated by the role's permissions.

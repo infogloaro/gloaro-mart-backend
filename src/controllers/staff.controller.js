@@ -1,8 +1,13 @@
+const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const pool = require('../config/db');
 const { PERMISSIONS, PERMISSION_KEYS, SUPER_ADMIN } = require('../services/permissions');
 const { loadStaffContext } = require('../middleware/rbac');
 const { revokeSessions } = require('../services/sessions');
+const { sendMail } = require('../services/mailer');
+
+const NOTICE_EMAIL = 'infogloaro@gmail.com';
+const OTP_TTL_MS = 10 * 60 * 1000;
 
 /**
  * Staff accounts and the roles they hold.
@@ -307,8 +312,104 @@ async function resetStaffPassword(req, res) {
   res.status(204).end();
 }
 
+/**
+ * Step 1 of a signed-in admin's own password change: verify the current
+ * password, stage the new one (hashed) against a one-time code, and mail
+ * that code to the company inbox rather than the admin themself — the point
+ * is a second party has to see it before the change takes effect.
+ */
+async function requestMyPasswordOtp(req, res) {
+  const { currentPassword, newPassword } = req.body || {};
+  if (!newPassword || String(newPassword).length < 8) {
+    return res.status(400).json({ message: 'A new password of at least 8 characters is required.' });
+  }
+  if (!currentPassword) {
+    return res.status(400).json({ message: 'Enter your current password.' });
+  }
+
+  const { rows } = await pool.query('SELECT email, password_hash FROM users WHERE id = $1', [req.user.id]);
+  if (!rows[0]) return res.status(404).json({ message: 'Account not found' });
+
+  const matches = await bcrypt.compare(String(currentPassword), rows[0].password_hash);
+  if (!matches) return res.status(400).json({ message: 'Current password is incorrect.' });
+
+  const otp = crypto.randomInt(100000, 1000000).toString();
+  const [otpHash, newPasswordHash] = await Promise.all([
+    bcrypt.hash(otp, 10),
+    bcrypt.hash(String(newPassword), 10),
+  ]);
+  const expiresAt = new Date(Date.now() + OTP_TTL_MS);
+
+  // Mailed before the code is staged: an OTP nobody can read is worse than no
+  // OTP at all, because the next attempt would then find a pending row and the
+  // operator would be chasing a code that never arrived.
+  try {
+    await sendMail({
+      to: NOTICE_EMAIL,
+      subject: 'Gloaro Mart admin — password change OTP',
+      text: `${rows[0].email} requested a password change on the Gloaro Mart admin console.\n\nOTP: ${otp}\n\nThis code expires in 10 minutes. Ignore this email if you did not expect it.`,
+    });
+  } catch (err) {
+    console.error('[mail] OTP send failed:', err.message);
+    return res.status(502).json({
+      message: `Could not email the OTP to ${NOTICE_EMAIL}. The password was not changed. Check the mail settings and try again.`,
+    });
+  }
+
+  await pool.query(
+    `INSERT INTO admin_password_otps (user_id, otp_hash, new_password_hash, expires_at)
+     VALUES ($1, $2, $3, $4)`,
+    [req.user.id, otpHash, newPasswordHash, expiresAt]
+  );
+
+  res.status(202).json({ message: `OTP sent to ${NOTICE_EMAIL}. Enter it below within 10 minutes.` });
+}
+
+/** Step 2: the OTP mailed out above confirms the change and ends every session, including this one. */
+async function confirmMyPasswordOtp(req, res) {
+  const { otp } = req.body || {};
+  if (!otp) return res.status(400).json({ message: 'Enter the OTP.' });
+
+  const { rows } = await pool.query(
+    `SELECT id, otp_hash, new_password_hash FROM admin_password_otps
+     WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > NOW()
+     ORDER BY created_at DESC LIMIT 1`,
+    [req.user.id]
+  );
+  const pending = rows[0];
+  if (!pending) {
+    return res.status(400).json({ message: 'No pending request or the OTP has expired. Start again.' });
+  }
+
+  const matches = await bcrypt.compare(String(otp), pending.otp_hash);
+  if (!matches) return res.status(400).json({ message: 'Incorrect OTP.' });
+
+  const { rows: userRows } = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
+
+  await pool.query('UPDATE users SET password_hash = $2 WHERE id = $1', [req.user.id, pending.new_password_hash]);
+  await pool.query('UPDATE admin_password_otps SET consumed_at = NOW() WHERE id = $1', [pending.id]);
+  await revokeSessions(req.user.id);
+
+  // The password is already changed by this point, so a failed courtesy notice
+  // must not report failure — telling the operator it went wrong would send
+  // them back to the old password that no longer works.
+  try {
+    await sendMail({
+      to: NOTICE_EMAIL,
+      subject: 'Gloaro Mart admin — password changed',
+      text: `The password for ${userRows[0]?.email ?? 'an admin account'} was just changed on the Gloaro Mart admin console. All of that account's sessions have been signed out.`,
+    });
+  } catch (err) {
+    console.error('[mail] password-changed notice failed:', err.message);
+  }
+
+  res.status(204).end();
+}
+
 module.exports = {
   getMe,
+  requestMyPasswordOtp,
+  confirmMyPasswordOtp,
   listPermissions,
   listRoles,
   createRole,
