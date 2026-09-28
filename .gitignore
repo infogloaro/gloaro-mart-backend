@@ -6,3 +6,9 @@ node_modules/
 
 # Dev scratch scripts, not part of the deployed app
 *.tmp.js
+
+.DS_Store
+
+# Unrelated Flutter mobile app files accidentally placed in this repo
+/lib/
+/lib.zip

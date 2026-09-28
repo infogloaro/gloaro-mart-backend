@@ -1,5 +1,6 @@
 const pool = require('../config/db');
 const { getProvider, providerForMethod } = require('../services/payments');
+const { applyTopupEvent } = require('./customerWallet.controller');
 const { confirmReservations, releaseReservations } = require('../services/inventory');
 
 /**
@@ -340,6 +341,12 @@ async function handleWebhook(req, res) {
     );
     const payment = rows[0];
     if (!payment) {
+      // Not a purchase payment — it may be a wallet top-up.
+      const topup = await applyTopupEvent(client, parsed);
+      if (topup) {
+        await client.query('COMMIT');
+        return res.json({ status: topup.status === 'ignored' ? 'ignored' : 'applied' });
+      }
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'No payment matches this event' });
     }

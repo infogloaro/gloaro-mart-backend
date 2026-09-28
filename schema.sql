@@ -1447,3 +1447,95 @@ CREATE TABLE IF NOT EXISTS admin_password_otps (
 );
 
 CREATE INDEX IF NOT EXISTS idx_admin_password_otps_user ON admin_password_otps(user_id, created_at DESC);
+
+-- ===== CUSTOMER LOGIN OTP =====
+
+CREATE TABLE IF NOT EXISTS login_otps (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  otp_hash TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS login_otps_user_idx ON login_otps (user_id, created_at DESC);
+
+-- ===== PUSH DEVICE TOKENS =====
+
+CREATE TABLE IF NOT EXISTS device_tokens (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token TEXT NOT NULL UNIQUE,
+  platform TEXT NOT NULL CHECK (platform IN ('android', 'ios', 'web')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS device_tokens_user_idx ON device_tokens (user_id);
+
+-- ===== PRODUCT REVIEWS =====
+--
+-- A customer's rating of one product, earned by a delivered order that
+-- contained it. One per (user, product): re-buying and re-rating edits the
+-- same row rather than stacking ratings. The summary is computed on read, so
+-- there is no running total to drift out of step with these rows.
+CREATE TABLE IF NOT EXISTS product_reviews (
+  id SERIAL PRIMARY KEY,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  comment TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (product_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_reviews_product ON product_reviews (product_id, created_at DESC);
+
+-- ===== CUSTOMER WALLET & TOP-UPS =====
+--
+-- Separate from vendor_wallets (a vendor's earnings, credit-only). A customer
+-- wallet holds money the customer loaded. Money enters only through a top-up
+-- that a verified gateway webhook confirms; the ledger is append-only and the
+-- balance can never go negative.
+CREATE TABLE IF NOT EXISTS customer_wallets (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE RESTRICT,
+  balance_cents INTEGER NOT NULL DEFAULT 0 CHECK (balance_cents >= 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS wallet_topups (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'successful', 'failed', 'cancelled')),
+  provider TEXT NOT NULL,
+  provider_order_id TEXT UNIQUE,
+  provider_payment_id TEXT,
+  failure_reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_topups_user ON wallet_topups (user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS customer_wallet_transactions (
+  id SERIAL PRIMARY KEY,
+  wallet_id INTEGER NOT NULL REFERENCES customer_wallets(id) ON DELETE RESTRICT,
+  topup_id INTEGER REFERENCES wallet_topups(id) ON DELETE SET NULL,
+  type TEXT NOT NULL CHECK (type IN ('credit', 'debit')),
+  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+  balance_after_cents INTEGER NOT NULL,
+  description TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_customer_wallet_txns_wallet ON customer_wallet_transactions (wallet_id, created_at DESC);
+-- A top-up can credit at most once, whatever the gateway replays.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_wallet_txns_one_credit_per_topup
+  ON customer_wallet_transactions (topup_id) WHERE type = 'credit';
