@@ -259,6 +259,38 @@ async function verifyLoginOtp(req, res) {
 }
 
 /**
+ * Lightweight auth check the app calls before a purchase action.
+ *
+ * Returns { authenticated: true, user: { … } } when the caller has a valid,
+ * non-revoked token, and { authenticated: false } otherwise. A 200 is always
+ * returned — the caller decides what to do with the answer (redirect to login,
+ * show a prompt, etc.).
+ */
+async function checkAuthStatus(req, res) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) {
+    return res.json({ authenticated: false, message: 'Please login to continue your purchase.' });
+  }
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    const { rows } = await pool.query(
+      `SELECT ${PROFILE_COLUMNS} FROM users WHERE id = $1`,
+      [payload.id]
+    );
+    const user = rows[0];
+    if (!user) {
+      return res.json({ authenticated: false, message: 'Please login to continue your purchase.' });
+    }
+    if (payload.tokenVersion !== undefined && user.token_version !== payload.tokenVersion) {
+      return res.json({ authenticated: false, message: 'Session expired. Please login again.' });
+    }
+    res.json({ authenticated: true, user: toProfile(user) });
+  } catch {
+    res.json({ authenticated: false, message: 'Please login to continue your purchase.' });
+  }
+}
+
+/**
  * Changes the password while signed in. Every other session is revoked, and a
  * fresh token comes back so the device that made the change stays signed in.
  */
@@ -361,4 +393,4 @@ async function deleteMe(req, res) {
   res.json({ message: 'Your account has been deleted' });
 }
 
-module.exports = { deleteMe, changePassword, sendLoginOtp, verifyLoginOtp, signup, login, forgotPassword, resetPassword, getMe, updateMe, logout, refresh };
+module.exports = { deleteMe, changePassword, sendLoginOtp, verifyLoginOtp, checkAuthStatus, signup, login, forgotPassword, resetPassword, getMe, updateMe, logout, refresh };

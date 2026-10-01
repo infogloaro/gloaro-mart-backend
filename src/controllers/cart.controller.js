@@ -42,6 +42,10 @@ async function validateVariant(productId, variantId) {
 }
 
 async function getCart(req, res) {
+  // Guest user — the app manages the cart on the device.
+  if (!req.user) {
+    return res.json({ cartId: null, items: [], guest: true });
+  }
   const cart = await getOrCreateActiveCart(req.user.id);
   const { rows } = await pool.query(
     `SELECT ci.product_id, ci.variant_id, ci.quantity, p.name, p.currency, p.vendor_id, p.is_active,
@@ -68,6 +72,9 @@ async function getCart(req, res) {
 }
 
 async function addItem(req, res) {
+  if (!req.user) {
+    return res.json({ guest: true, message: 'Item managed locally. Login to sync your cart.' });
+  }
   const { productId, quantity, variantId } = req.body || {};
   if (!productId || !Number.isInteger(quantity) || quantity < 1) {
     return res.status(400).json({ message: 'productId and a positive integer quantity are required' });
@@ -105,6 +112,9 @@ function addressedVariant(req) {
 }
 
 async function updateItem(req, res) {
+  if (!req.user) {
+    return res.json({ guest: true, message: 'Item managed locally. Login to sync your cart.' });
+  }
   const { quantity } = req.body || {};
   if (!Number.isInteger(quantity) || quantity < 1) {
     return res.status(400).json({ message: 'A positive integer quantity is required' });
@@ -121,6 +131,9 @@ async function updateItem(req, res) {
 }
 
 async function removeItem(req, res) {
+  if (!req.user) {
+    return res.json({ guest: true, message: 'Item managed locally. Login to sync your cart.' });
+  }
   const cart = await getOrCreateActiveCart(req.user.id);
   await pool.query(
     'DELETE FROM cart_items WHERE cart_id = $1 AND product_id = $2 AND variant_id IS NOT DISTINCT FROM $3',
@@ -129,4 +142,53 @@ async function removeItem(req, res) {
   res.status(204).send();
 }
 
-module.exports = { getCart, addItem, updateItem, removeItem, getOrCreateActiveCart, validateVariant };
+/**
+ * After login, the app sends its locally-held guest cart here so the items
+ * are merged into the server-side cart. Quantities add up if a line already
+ * exists. Requires authentication.
+ *
+ * Body: { items: [{ productId, quantity, variantId? }, …] }
+ */
+async function mergeCart(req, res) {
+  const { items } = req.body || {};
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ message: 'items array is required' });
+  }
+
+  const cart = await getOrCreateActiveCart(req.user.id);
+  let merged = 0;
+  let skipped = 0;
+
+  for (const item of items) {
+    const { productId, quantity, variantId } = item;
+    if (!productId || !Number.isInteger(quantity) || quantity < 1) {
+      skipped++;
+      continue;
+    }
+
+    const problem = await validateVariant(productId, variantId ?? null);
+    if (problem) {
+      skipped++;
+      continue;
+    }
+
+    const vid = variantId ?? null;
+    await pool.query(
+      vid == null
+        ? `INSERT INTO cart_items (cart_id, product_id, quantity)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (cart_id, product_id) WHERE variant_id IS NULL
+           DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity`
+        : `INSERT INTO cart_items (cart_id, product_id, quantity, variant_id)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (cart_id, product_id, variant_id) WHERE variant_id IS NOT NULL
+           DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity`,
+      vid == null ? [cart.id, productId, quantity] : [cart.id, productId, quantity, vid]
+    );
+    merged++;
+  }
+
+  res.json({ message: `${merged} item(s) merged into your cart`, merged, skipped });
+}
+
+module.exports = { getCart, addItem, updateItem, removeItem, mergeCart, getOrCreateActiveCart, validateVariant };
