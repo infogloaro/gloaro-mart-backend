@@ -14,6 +14,9 @@ async function getOrCreateWallet(vendorId) {
 // more than once for the same order: idx_wallet_txns_one_credit_per_order
 // prevents a duplicate 'credit' row, so the balance only ever moves once.
 async function creditWalletForOrder(order) {
+  // A free replacement (₹0) earns nothing at delivery; what the platform owes for
+  // it, if anything, comes through settlements.
+  if (order.total_cents <= 0) return null;
   const wallet = await getOrCreateWallet(order.vendor_id);
   const newBalance = wallet.balance_cents + order.total_cents;
   const { rows: txnRows } = await pool.query(

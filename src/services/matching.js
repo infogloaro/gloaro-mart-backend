@@ -88,6 +88,18 @@ function performanceScore(metrics, workloadScore) {
  * shop, not the nearest-weighted-by-five-other-things shop.
  */
 function rank(candidates, weights, strategy = 'recommended') {
+  // Beyond the admin's radius a shop is never a candidate, whatever its own
+  // delivery rules say. Kept in the list, marked, so the log can explain it.
+  const maxKm = weights.max_radius_km == null ? null : Number(weights.max_radius_km);
+  if (maxKm != null) {
+    for (const c of candidates) {
+      if (c.deliverable && c.distanceKm != null && c.distanceKm > maxKm) {
+        c.deliverable = false;
+        c.reason = 'BEYOND_MAX_RADIUS';
+      }
+    }
+  }
+
   // The scale is built from the shops that can actually serve this address.
   //
   // Including the others would let a shop 400km away stretch the distance axis
@@ -104,13 +116,16 @@ function rank(candidates, weights, strategy = 'recommended') {
     { lowerIsBetter: true }
   );
 
+  // A factor switched off counts for nothing but keeps its weight for when it's back on.
+  const off = new Set(weights.disabled_factors ?? []);
+  const weightOf = (key) => (off.has(key) ? 0 : Number(weights[`${key}_weight`]));
   const w = {
-    stock: Number(weights.stock_weight),
-    distance: Number(weights.distance_weight),
-    delivery: Number(weights.delivery_weight),
-    price: Number(weights.price_weight),
-    rating: Number(weights.rating_weight),
-    performance: Number(weights.performance_weight),
+    stock: weightOf('stock'),
+    distance: weightOf('distance'),
+    delivery: weightOf('delivery'),
+    price: weightOf('price'),
+    rating: weightOf('rating'),
+    performance: weightOf('performance'),
   };
   const totalWeight = Object.values(w).reduce((sum, n) => sum + n, 0);
 
@@ -299,13 +314,16 @@ async function findCandidates({
  * use today's stock and today's weights, and could never explain a decision
  * made last week.
  */
-async function logMatch(client, { userId, addressId, context, strategy, seed, quantity, candidates, weights }) {
+async function logMatch(
+  client,
+  { userId, addressId, context, strategy, seed, quantity, candidates, weights, orderId = null, attempt = null, durationMs = null }
+) {
   const winner = candidates.find((c) => c.deliverable) ?? null;
-  await client.query(
+  const { rows } = await client.query(
     `INSERT INTO vendor_matching_logs
        (user_id, address_id, context, strategy, match_key, product_id, quantity,
-        candidate_count, selected_vendor_id, weights, candidates)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        candidate_count, selected_vendor_id, weights, candidates, order_id, attempt, duration_ms)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id`,
     [
       userId ?? null,
       addressId ?? null,
@@ -332,8 +350,12 @@ async function logMatch(client, { userId, addressId, context, strategy, seed, qu
           availableQty: c.availableQty,
         }))
       ),
+      orderId,
+      attempt,
+      durationMs,
     ]
   );
+  return rows[0].id;
 }
 
 /**

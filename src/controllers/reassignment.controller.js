@@ -14,10 +14,12 @@ const {
   reserveForOrder,
   confirmReservations,
 } = require('../services/inventory');
+const { notifyNewOrders } = require('../services/vendorNotify');
 
 /**
  * Rejection and re-routing.
- * Contracts per documents/SPRINT_5_VENDOR_MATCHING_SPEC.md §6.
+ * Contracts per documents/SPRINT_5_VENDOR_MATCHING_SPEC.md §6, plus the admin
+ * rules of schema VENDOR MATCHING RULES (PHASE 39).
  *
  * A rejection is not a cancellation. A cancelled order is over; a rejected one
  * is looking for another shop — which is why this is its own endpoint rather
@@ -28,6 +30,10 @@ const {
  * vendor keeps its own order and its own lifecycle — the constraint every
  * sprint since Sprint 2 has been written around. order_assignment_history is
  * the link between the two.
+ *
+ * Three things start a re-route, all through rerouteOrder(): the shop rejects
+ * the order, the shop lets the accept window run out (the sweep at the bottom),
+ * or an admin approves a re-route that was waiting for them.
  */
 
 /** The lines of an order, in the shape the stock engine and matcher both want. */
@@ -41,18 +47,48 @@ async function orderLines(client, orderId) {
   return rows;
 }
 
+/** `orderId` becomes the deep link the app opens (/orders/<id>); a moved order links to its new order. */
+async function notify(client, userId, type, title, body, orderId = null) {
+  if (!userId) return;
+  await client.query('INSERT INTO notifications (user_id, type, title, body, deep_link) VALUES ($1, $2, $3, $4, $5)', [
+    userId,
+    type,
+    title,
+    body,
+    orderId ? `/orders/${orderId}` : null,
+  ]);
+}
+
+/** How many re-routes this order is already the result of (0 for an order as placed). */
+async function rerouteDepth(client, orderId) {
+  const { rows } = await client.query(
+    `WITH RECURSIVE chain(order_id, depth) AS (
+       SELECT $1::int, 0
+       UNION ALL
+       SELECT h.from_order_id, c.depth + 1
+       FROM order_assignment_history h JOIN chain c ON h.to_order_id = c.order_id
+       WHERE h.from_order_id IS NOT NULL AND c.depth < 20
+     )
+     SELECT MAX(depth)::int AS depth FROM chain`,
+    [orderId]
+  );
+  return rows[0].depth ?? 0;
+}
+
 /**
  * The best shop that can fill every line of a rejected order.
  *
  * All-or-nothing on purpose: an alternative that can supply two of three items
  * is not an alternative, it is a second problem. Each line is matched
- * independently and only vendors present in every result survive.
+ * independently and only vendors present in every result survive. Every
+ * line's run is logged; `logIds` collects them so the outcome can be stamped.
  */
-async function findReplacementVendor(client, { lines, address, excludeVendorId, weights, userId }) {
+async function findReplacementVendor(client, { lines, address, excludeVendorId, weights, userId, orderId = null, attempt = null, logIds = [] }) {
   let shared = null;
   const perLine = [];
 
   for (const line of lines) {
+    const started = Date.now();
     const found = await findCandidates({
       productId: line.product_id,
       quantity: line.quantity,
@@ -63,16 +99,21 @@ async function findReplacementVendor(client, { lines, address, excludeVendorId, 
     const ranked = rank(found.candidates, weights, 'recommended');
     const deliverable = ranked.filter((c) => c.deliverable);
 
-    await logMatch(client, {
-      userId,
-      addressId: address?.id ?? null,
-      context: 'reroute',
-      strategy: 'recommended',
-      seed: found.seed,
-      quantity: line.quantity,
-      candidates: ranked,
-      weights,
-    });
+    logIds.push(
+      await logMatch(client, {
+        userId,
+        addressId: address?.id ?? null,
+        context: 'reroute',
+        strategy: 'recommended',
+        seed: found.seed,
+        quantity: line.quantity,
+        candidates: ranked,
+        weights,
+        orderId,
+        attempt,
+        durationMs: Date.now() - started,
+      })
+    );
 
     perLine.push({ line, candidates: deliverable });
     const vendorIds = new Set(deliverable.map((c) => c.vendorId));
@@ -98,13 +139,142 @@ async function findReplacementVendor(client, { lines, address, excludeVendorId, 
   return [...totals.values()].sort((a, b) => b.score - a.score)[0];
 }
 
+/** Stamps how the run ended on the log rows it wrote. */
+async function stampLogs(client, logIds, { outcome, vendorId = null, reason = null }) {
+  if (!logIds.length) return;
+  await client.query(
+    `UPDATE vendor_matching_logs SET outcome = $2, reason = $3,
+       selected_vendor_id = CASE WHEN $4::int IS NULL THEN selected_vendor_id ELSE $4 END
+     WHERE id = ANY($1)`,
+    [logIds, outcome, reason, vendorId]
+  );
+}
+
+/**
+ * Ends the original shop's order: stock back, cancelled, counted against the
+ * shop as a rejection. Inside the caller's transaction; COD settles after commit.
+ */
+async function cancelOriginal(client, order, { note, userId, actorRole }) {
+  await releaseReservations(client, { orderId: order.id, userId, note });
+  await client.query(`UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1`, [order.id]);
+  await recordStatusChange(client, {
+    orderId: order.id,
+    fromStatus: order.status,
+    toStatus: 'cancelled',
+    userId,
+    actorRole,
+    note,
+  });
+  await bumpMetrics(client, order.vendor_id, { ordersRejected: 1, openOrders: -1 });
+}
+
+const proposedTotalOf = (replacement) => replacement.lines.reduce((sum, l) => sum + l.lineTotalCents, 0);
+const withinTolerance = (order, proposedTotal, weights) =>
+  proposedTotal <= order.subtotal_cents * (1 + Number(weights.reassign_price_tolerance_percent) / 100);
+
+/**
+ * Looks for another shop for a pending order and acts on the admin's rules.
+ * `order` must be locked by the caller. Returns the outcome and whether the
+ * original was cancelled (the caller settles its COD after committing).
+ *
+ *   trigger 'rejected' — the shop said no: the original always ends.
+ *   trigger 'expired'  — the shop didn't answer in time: the original only ends
+ *                        when a replacement is placed, so it can still be accepted
+ *                        while a re-route waits for someone.
+ */
+async function rerouteOrder(client, order, { reason, trigger, actorRole, userId, weights }) {
+  const lines = await orderLines(client, order.id);
+  const depth = await rerouteDepth(client, order.id);
+  const attempt = depth + 1;
+  const { rows: addressRows } = await client.query('SELECT * FROM addresses WHERE id = $1', [order.address_id]);
+  const address = addressRows[0] ?? null;
+  const logIds = [];
+
+  const limitReached = depth >= weights.max_reassign_attempts;
+  const replacement = limitReached
+    ? null
+    : await findReplacementVendor(client, {
+        lines,
+        address,
+        excludeVendorId: order.vendor_id,
+        weights,
+        userId: order.user_id,
+        orderId: order.id,
+        attempt,
+        logIds,
+      });
+
+  let cancelled = false;
+  const endOriginal = async () => {
+    await cancelOriginal(client, order, {
+      note: trigger === 'rejected' ? `Rejected: ${reason}` : reason,
+      userId,
+      actorRole,
+    });
+    cancelled = true;
+  };
+  if (trigger === 'rejected') await endOriginal();
+
+  const history = (status, extra = {}) =>
+    client.query(
+      `INSERT INTO order_assignment_history
+         (checkout_group_id, from_order_id, to_order_id, from_vendor_id, to_vendor_id, status, reason,
+          original_total_cents, proposed_total_cents, actor_role, changed_by_user_id, trigger)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+      [order.checkout_group_id, order.id, extra.toOrderId ?? null, order.vendor_id, extra.toVendorId ?? null, status,
+        reason, order.subtotal_cents, extra.proposedTotal ?? null, extra.actorRole ?? actorRole, userId, trigger]
+    );
+
+  if (!replacement) {
+    const why = limitReached ? `Re-route limit reached (${weights.max_reassign_attempts})` : 'No other shop can fill this order';
+    await history('no_alternative');
+    await stampLogs(client, logIds, { outcome: trigger === 'expired' ? 'expired' : 'no_vendor', reason: why });
+    if (cancelled) {
+      await notify(client, order.user_id, 'order_cancelled', 'Your order was cancelled',
+        `The shop couldn't fill order #${order.id} and no other shop nearby can. Please try again or pick another shop.`, order.id);
+    }
+    return { outcome: { status: 'no_alternative', message: `${why}.` }, cancelled };
+  }
+
+  const proposedTotal = proposedTotalOf(replacement);
+  const proposedVendor = { id: replacement.vendorId, businessName: replacement.businessName };
+
+  if (!withinTolerance(order, proposedTotal, weights)) {
+    // Dearer than the customer agreed to. Silently charging more is not a
+    // reassignment the platform gets to make alone.
+    const { rows } = await history('pending_customer', { toVendorId: replacement.vendorId, proposedTotal });
+    await stampLogs(client, logIds, { outcome: 'matched', vendorId: replacement.vendorId, reason: 'Costs more — waiting for the customer' });
+    await notify(client, order.user_id, 'reassignment_offer', 'Another shop can fill your order',
+      `${replacement.businessName} can deliver order #${order.id}, but it costs more. Open the app to accept or decline.`, order.id);
+    return {
+      outcome: { status: 'pending_customer', reassignmentId: rows[0].id, proposedVendor,
+        originalSubtotalCents: order.subtotal_cents, proposedSubtotalCents: proposedTotal },
+      cancelled,
+    };
+  }
+
+  if (!weights.auto_reassign) {
+    const { rows } = await history('pending_admin', { toVendorId: replacement.vendorId, proposedTotal });
+    await stampLogs(client, logIds, { outcome: 'matched', vendorId: replacement.vendorId, reason: 'Waiting for an admin to approve' });
+    return { outcome: { status: 'pending_admin', reassignmentId: rows[0].id, proposedVendor }, cancelled };
+  }
+
+  if (!cancelled) await endOriginal();
+  const newOrder = await createReplacementOrder(client, { order, replacement, lines, actorUserId: userId });
+  await history('assigned', { toOrderId: newOrder.id, toVendorId: replacement.vendorId, proposedTotal, actorRole: 'system' });
+  await stampLogs(client, logIds, { outcome: 'reassigned', vendorId: replacement.vendorId });
+  await notify(client, order.user_id, 'order_rerouted', 'Your order moved to another shop',
+    `${replacement.businessName} is now fulfilling your order (it was #${order.id}, now #${newOrder.id}).`, newOrder.id);
+  return { outcome: { status: 'assigned', newOrderId: newOrder.id, vendor: proposedVendor }, cancelled };
+}
+
 /**
  * The vendor cannot fill this order.
  *
- * Releases the hold, looks for somewhere else, and either assigns it or asks
- * the customer — a dearer replacement is not a decision the platform makes on
- * its own. Finding nothing leaves the order cancelled with a reason, because a
- * rejected order that stays pending forever is the worst of the three outcomes.
+ * Releases the hold, looks for somewhere else, and either assigns it, asks the
+ * customer (dearer) or an admin (auto re-route off). Finding nothing leaves the
+ * order cancelled with a reason, because a rejected order that stays pending
+ * forever is the worst of the outcomes.
  */
 async function rejectOrder(req, res) {
   const { reason } = req.body || {};
@@ -120,7 +290,7 @@ async function rejectOrder(req, res) {
 
   const weights = await loadWeights();
   const client = await pool.connect();
-  let outcome;
+  let result;
   try {
     await client.query('BEGIN');
 
@@ -143,6 +313,11 @@ async function rejectOrder(req, res) {
       await client.query('ROLLBACK');
       return res.status(409).json({ message: `This order is already ${order.status}.` });
     }
+    if (order.replacement_of_order_id) {
+      // Re-routing would charge the customer for a replacement they get free.
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'This is a free replacement — cancel it instead, and an admin will arrange another shop.' });
+    }
     if (order.status !== 'pending') {
       // Past 'pending' the shop has accepted it. Backing out then is a
       // cancellation, and cancellations do not re-route.
@@ -152,98 +327,13 @@ async function rejectOrder(req, res) {
       });
     }
 
-    const lines = await orderLines(client, order.id);
-
-    // The hold goes back before anything else: whatever happens next, this shop
-    // is not filling this order and must not keep its stock reserved.
-    await releaseReservations(client, {
-      orderId: order.id,
+    result = await rerouteOrder(client, order, {
+      reason: String(reason).trim(),
+      trigger: 'rejected',
+      actorRole: req.user.role === 'admin' ? 'admin' : 'vendor',
       userId: req.user.id,
-      note: `Rejected by the vendor: ${reason}`,
-    });
-
-    const { rows: addressRows } = await client.query('SELECT * FROM addresses WHERE id = $1', [order.address_id]);
-    const address = addressRows[0] ?? null;
-
-    const replacement = await findReplacementVendor(client, {
-      lines,
-      address,
-      excludeVendorId: order.vendor_id,
       weights,
-      userId: order.user_id,
     });
-
-    // The rejecting shop's order ends here either way.
-    await client.query(
-      `UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1`,
-      [order.id]
-    );
-    await recordStatusChange(client, {
-      orderId: order.id,
-      fromStatus: order.status,
-      toStatus: 'cancelled',
-      userId: req.user.id,
-      actorRole: 'vendor',
-      note: `Rejected: ${reason}`,
-    });
-    await bumpMetrics(client, order.vendor_id, { ordersRejected: 1, openOrders: -1 });
-
-    if (!replacement) {
-      await client.query(
-        `INSERT INTO order_assignment_history
-           (checkout_group_id, from_order_id, from_vendor_id, status, reason,
-            original_total_cents, actor_role, changed_by_user_id)
-         VALUES ($1, $2, $3, 'no_alternative', $4, $5, 'vendor', $6)`,
-        [order.checkout_group_id, order.id, order.vendor_id, reason, order.total_cents, req.user.id]
-      );
-      outcome = { status: 'no_alternative', message: 'No other shop can fill this order.' };
-    } else {
-      const proposedTotal = replacement.lines.reduce((sum, l) => sum + l.lineTotalCents, 0);
-      const tolerance = Number(weights.reassign_price_tolerance_percent);
-      const ceiling = order.subtotal_cents * (1 + tolerance / 100);
-
-      if (proposedTotal > ceiling) {
-        // Dearer than the customer agreed to. Silently charging more is not a
-        // reassignment the platform gets to make alone.
-        const { rows: pending } = await client.query(
-          `INSERT INTO order_assignment_history
-             (checkout_group_id, from_order_id, from_vendor_id, to_vendor_id, status, reason,
-              original_total_cents, proposed_total_cents, actor_role, changed_by_user_id)
-           VALUES ($1, $2, $3, $4, 'pending_customer', $5, $6, $7, 'vendor', $8)
-           RETURNING id`,
-          [order.checkout_group_id, order.id, order.vendor_id, replacement.vendorId, reason,
-           order.subtotal_cents, proposedTotal, req.user.id]
-        );
-        outcome = {
-          status: 'pending_customer',
-          reassignmentId: pending[0].id,
-          proposedVendor: { id: replacement.vendorId, businessName: replacement.businessName },
-          originalSubtotalCents: order.subtotal_cents,
-          proposedSubtotalCents: proposedTotal,
-        };
-      } else {
-        const newOrder = await createReplacementOrder(client, {
-          order,
-          replacement,
-          lines,
-          actorUserId: req.user.id,
-        });
-        await client.query(
-          `INSERT INTO order_assignment_history
-             (checkout_group_id, from_order_id, to_order_id, from_vendor_id, to_vendor_id, status, reason,
-              original_total_cents, proposed_total_cents, actor_role, changed_by_user_id)
-           VALUES ($1, $2, $3, $4, $5, 'assigned', $6, $7, $8, 'system', $9)`,
-          [order.checkout_group_id, order.id, newOrder.id, order.vendor_id, replacement.vendorId,
-           reason, order.subtotal_cents, proposedTotal, req.user.id]
-        );
-        outcome = {
-          status: 'assigned',
-          newOrderId: newOrder.id,
-          vendor: { id: replacement.vendorId, businessName: replacement.businessName },
-        };
-      }
-    }
-
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -255,8 +345,8 @@ async function rejectOrder(req, res) {
 
   // After the commit, for the same reason Sprint 3 settles COD after one: a
   // failure here must not undo a rejection that really happened.
-  await settleCodForOrder(req.params.id);
-  res.json(outcome);
+  if (result.cancelled) await settleCodForOrder(req.params.id);
+  res.json(result.outcome);
 }
 
 /**
@@ -346,6 +436,7 @@ async function createReplacementOrder(client, { order, replacement, lines, actor
   });
   // COD, so the sale commits immediately — the same rule checkout follows.
   await confirmReservations(client, { orderId: newOrder.id, note: 'Re-routed COD order placed' });
+  await notifyNewOrders(client, { orderId: newOrder.id });
 
   await bumpMetrics(client, replacement.vendorId, { ordersTotal: 1, openOrders: 1 });
 
@@ -365,6 +456,68 @@ async function createReplacementOrder(client, { order, replacement, lines, actor
   );
 
   return newOrder;
+}
+
+/**
+ * A waiting re-route goes ahead (customer accepted, or an admin approved).
+ * Re-matched rather than replayed: stock or price may have moved while it
+ * waited. Ends the original if it's still open. Returns the outcome and the
+ * original order id when it was cancelled here.
+ */
+async function completeWaitingReroute(client, reassignment, { userId, actorRole, resolvedBy = null, checkPrice }) {
+  const { rows: originalRows } = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [reassignment.from_order_id]);
+  const original = originalRows[0];
+  const lines = await orderLines(client, original.id);
+  const weights = await loadWeights(client);
+  const { rows: addressRows } = await client.query('SELECT * FROM addresses WHERE id = $1', [original.address_id]);
+  const replacement = await findReplacementVendor(client, {
+    lines,
+    address: addressRows[0] ?? null,
+    excludeVendorId: reassignment.from_vendor_id,
+    weights,
+    userId: original.user_id,
+    orderId: original.id,
+    attempt: (await rerouteDepth(client, original.id)) + 1,
+  });
+
+  if (!replacement) {
+    await client.query(
+      `UPDATE order_assignment_history SET status = 'no_alternative', resolved_by = $2, resolved_at = now(), updated_at = now() WHERE id = $1`,
+      [reassignment.id, resolvedBy]
+    );
+    return { outcome: { status: 'no_alternative', message: 'That shop can no longer fill this order.' }, cancelledOrderId: null };
+  }
+  const proposedTotal = proposedTotalOf(replacement);
+  if (checkPrice && !withinTolerance(original, proposedTotal, weights)) {
+    // It got dearer while it waited: the customer has to agree first.
+    await client.query(
+      `UPDATE order_assignment_history SET status = 'pending_customer', to_vendor_id = $2, proposed_total_cents = $3, updated_at = now() WHERE id = $1`,
+      [reassignment.id, replacement.vendorId, proposedTotal]
+    );
+    await notify(client, original.user_id, 'reassignment_offer', 'Another shop can fill your order',
+      `${replacement.businessName} can deliver order #${original.id}, but it costs more. Open the app to accept or decline.`, original.id);
+    return { outcome: { status: 'pending_customer', message: 'It now costs more, so the customer has been asked.' }, cancelledOrderId: null };
+  }
+
+  let cancelledOrderId = null;
+  if (original.status !== 'cancelled') {
+    await cancelOriginal(client, original, { note: `Re-routed: ${reassignment.reason ?? 'not accepted in time'}`, userId, actorRole });
+    cancelledOrderId = original.id;
+  }
+  const newOrder = await createReplacementOrder(client, { order: original, replacement, lines, actorUserId: userId });
+  await client.query(
+    `UPDATE order_assignment_history
+     SET status = $4, to_order_id = $2, to_vendor_id = $3, proposed_total_cents = $5, resolved_by = $6, resolved_at = now(), updated_at = now()
+     WHERE id = $1`,
+    [reassignment.id, newOrder.id, replacement.vendorId, actorRole === 'customer' ? 'accepted' : 'assigned', proposedTotal, resolvedBy]
+  );
+  await notify(client, original.user_id, 'order_rerouted', 'Your order moved to another shop',
+    `${replacement.businessName} is now fulfilling your order (it was #${original.id}, now #${newOrder.id}).`, newOrder.id);
+  return {
+    outcome: { status: actorRole === 'customer' ? 'accepted' : 'assigned', newOrderId: newOrder.id,
+      vendor: { id: replacement.vendorId, businessName: replacement.businessName } },
+    cancelledOrderId,
+  };
 }
 
 /** Reassignments the customer still has to decide on. */
@@ -390,6 +543,7 @@ async function respond(req, res) {
 
   const client = await pool.connect();
   let result;
+  let cancelledOrderId = null;
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
@@ -414,55 +568,15 @@ async function respond(req, res) {
 
     if (!accept) {
       await client.query(
-        `UPDATE order_assignment_history SET status = 'declined', updated_at = now() WHERE id = $1`,
+        `UPDATE order_assignment_history SET status = 'declined', resolved_at = now(), updated_at = now() WHERE id = $1`,
         [reassignment.id]
       );
       result = { status: 'declined' };
     } else {
-      const { rows: originalRows } = await client.query('SELECT * FROM orders WHERE id = $1', [
-        reassignment.from_order_id,
-      ]);
-      const original = originalRows[0];
-      const lines = await orderLines(client, original.id);
-
-      // Re-matched rather than replayed: the quote was made when the vendor
-      // rejected, and stock or price may have moved while the customer thought
-      // about it.
-      const weights = await loadWeights(client);
-      const { rows: addressRows } = await client.query('SELECT * FROM addresses WHERE id = $1', [original.address_id]);
-      const replacement = await findReplacementVendor(client, {
-        lines,
-        address: addressRows[0] ?? null,
-        excludeVendorId: reassignment.from_vendor_id,
-        weights,
-        userId: req.user.id,
-      });
-
-      if (!replacement) {
-        await client.query(
-          `UPDATE order_assignment_history SET status = 'no_alternative', updated_at = now() WHERE id = $1`,
-          [reassignment.id]
-        );
-        result = { status: 'no_alternative', message: 'That shop can no longer fill this order.' };
-      } else {
-        const newOrder = await createReplacementOrder(client, {
-          order: original,
-          replacement,
-          lines,
-          actorUserId: req.user.id,
-        });
-        await client.query(
-          `UPDATE order_assignment_history
-           SET status = 'accepted', to_order_id = $2, to_vendor_id = $3, updated_at = now()
-           WHERE id = $1`,
-          [reassignment.id, newOrder.id, replacement.vendorId]
-        );
-        result = {
-          status: 'accepted',
-          newOrderId: newOrder.id,
-          vendor: { id: replacement.vendorId, businessName: replacement.businessName },
-        };
-      }
+      // The customer agreeing to the price is the whole point, so no price check here.
+      const done = await completeWaitingReroute(client, reassignment, { userId: req.user.id, actorRole: 'customer', checkPrice: false });
+      result = done.outcome;
+      cancelledOrderId = done.cancelledOrderId;
     }
 
     await client.query('COMMIT');
@@ -474,6 +588,7 @@ async function respond(req, res) {
     client.release();
   }
 
+  if (cancelledOrderId) await settleCodForOrder(cancelledOrderId);
   res.json(result);
 }
 
@@ -497,4 +612,65 @@ async function listForGroup(req, res) {
   res.json({ reassignments: rows });
 }
 
-module.exports = { rejectOrder, listPending, respond, listForGroup };
+/**
+ * Orders the shop hasn't accepted within the admin's window are re-routed.
+ * Only orders placed after the window was introduced, only those the customer
+ * has paid for or chose COD on, and only once each — any re-route record for
+ * the order (waiting, turned down, or nothing found) stops it being swept again.
+ * Each order is its own transaction, skipping any another sweep has locked.
+ */
+async function expireUnaccepted() {
+  const weights = await loadWeights();
+  const { rows } = await pool.query(
+    `SELECT o.id FROM orders o
+     LEFT JOIN payments p ON p.checkout_group_id = o.checkout_group_id
+     WHERE o.status = 'pending' AND o.checkout_group_id IS NOT NULL
+       -- A replacement goes to the shop chosen on the Replacements page, not wherever is free.
+       AND o.replacement_of_order_id IS NULL
+       AND o.created_at >= $1 AND o.created_at < now() - make_interval(mins => $2)
+       AND (p.id IS NULL OR p.method = 'cod' OR p.status = 'successful')
+       AND NOT EXISTS (SELECT 1 FROM order_assignment_history h WHERE h.from_order_id = o.id)
+     ORDER BY o.created_at LIMIT 20`,
+    [weights.accept_window_since, weights.accept_window_minutes]
+  );
+  const results = [];
+  for (const { id } of rows) {
+    const client = await pool.connect();
+    let result = null;
+    try {
+      await client.query('BEGIN');
+      const { rows: locked } = await client.query(
+        `SELECT o.*, cg.address_id FROM orders o JOIN checkout_groups cg ON cg.id = o.checkout_group_id
+         WHERE o.id = $1 AND o.status = 'pending' FOR UPDATE OF o SKIP LOCKED`,
+        [id]
+      );
+      if (locked[0]) {
+        result = await rerouteOrder(client, locked[0], {
+          reason: `Not accepted within ${weights.accept_window_minutes} minutes`,
+          trigger: 'expired',
+          actorRole: 'system',
+          userId: null,
+          weights,
+        });
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error(`[matching] re-routing order ${id} failed: ${err.message}`);
+    } finally {
+      client.release();
+    }
+    if (result?.cancelled) await settleCodForOrder(id);
+    if (result) results.push({ orderId: id, ...result.outcome });
+  }
+  return results;
+}
+
+module.exports = {
+  rejectOrder,
+  listPending,
+  respond,
+  listForGroup,
+  completeWaitingReroute,
+  expireUnaccepted,
+};

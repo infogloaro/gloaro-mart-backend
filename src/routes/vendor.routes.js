@@ -1,5 +1,5 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, optionalAuth, requireRole } = require('../middleware/auth');
 const vendorController = require('../controllers/vendor.controller');
 const delivery = require('../controllers/deliverySettings.controller');
 const { getVendorProducts } = require('../controllers/product.controller');
@@ -25,7 +25,7 @@ router.get('/', vendorController.listVendors);
 
 router.get('/:id/products', getVendorProducts);
 // Public: what a customer reads before deciding to buy from this shop.
-router.get('/:id/reviews', review.listVendorReviews);
+router.get('/:id/reviews', optionalAuth, review.listVendorReviews);
 router.get('/:id', vendorController.getPublicProfile);
 
 module.exports = router;

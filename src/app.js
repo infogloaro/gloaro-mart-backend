@@ -20,6 +20,18 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+// Admin-uploaded images. File names are generated server-side, so a name never
+// changes content and can be cached hard.
+app.use(
+  "/uploads",
+  express.static(require("./controllers/upload.controller").UPLOAD_ROOT, {
+    maxAge: "30d",
+    immutable: true,
+    index: false,
+    setHeaders: (res) => res.setHeader("X-Content-Type-Options", "nosniff"),
+  }),
+);
+
 app.use("/api/auth", require("./routes/auth.routes"));
 app.use("/api/vendors", require("./routes/vendor.routes"));
 app.use("/api/products", require("./routes/product.routes"));
@@ -27,6 +39,9 @@ app.use("/api/nearby", require("./routes/nearby.routes"));
 app.use("/api/cart", require("./routes/cart.routes"));
 app.use("/api/wishlist", require("./routes/wishlist.routes"));
 app.use("/api/orders", require("./routes/order.routes"));
+app.use("/api/reviews", require("./routes/review.routes"));
+app.use("/api/support", require("./routes/support.routes"));
+app.use("/api/business", require("./routes/business.routes"));
 app.use("/api/wallet", require("./routes/wallet.routes"));
 app.use("/api/coupons", require("./routes/coupon.routes"));
 app.use("/api/org", require("./routes/org.routes"));
@@ -44,6 +59,15 @@ app.use("/api/serviceability", require("./routes/serviceability.routes"));
 app.use("/api/payments", require("./routes/payment.routes"));
 app.use("/api/matching", require("./routes/matching.routes"));
 app.use("/api/notifications", require("./routes/notification.routes"));
+app.use("/api/webhooks/platforms", require("./routes/platformWebhook.routes"));
+app.use("/api/bot", require("./routes/bot.routes"));
+app.use("/api/ads", require("./routes/ads.routes"));
+// Public: running discount campaigns, for the shopper app to show.
+app.get("/api/campaigns/active", require("./controllers/campaign.controller").publicCampaigns);
+// Public: the app's home screen sections, live ones only, in order.
+app.get("/api/home/sections", require("./controllers/homeSection.controller").publicSections);
+// Public: the enabled channels and campaigns the shopper apps read on start-up.
+app.get("/api/platform/public", require("./controllers/platformPublic.controller").publicPlatforms);
 // Mounted above /api/vendors so the vendor's own portal is a distinct namespace
 // from the public vendor profiles under /api/vendors/:id.
 app.use("/api/vendor", require("./routes/vendorPortal.routes"));

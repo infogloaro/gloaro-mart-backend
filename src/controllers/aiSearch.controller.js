@@ -92,7 +92,9 @@ async function aiSearch(req, res) {
   const includeTiers = req.query.includeTiers === 'true';
   const withTiers = includeTiers ? await attachTiers(products) : products;
 
-  res.json({ results: withTiers, aiApplied });
+  // `filters` is what the model understood (null when it wasn't used), so a
+  // client can show it and let the shopper edit it.
+  res.json({ results: withTiers, aiApplied, filters: filters || null });
 }
 
 module.exports = { aiSearch };

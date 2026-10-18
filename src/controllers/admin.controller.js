@@ -6,6 +6,9 @@ const { attachTiers } = require('./product.controller');
 const { settleStockForOrder, setSimpleStock } = require('../services/inventory');
 const { bumpMetrics, metricsForTransition } = require('../services/matching');
 const { recordAudit } = require('../services/auditLog');
+const cancellations = require('../services/cancellations');
+const shipments = require('../services/shipments');
+const { issueAfterDelivery } = require('../services/invoices');
 
 const ALL_ORDER_STATUSES = [...STATUS_FLOW, 'cancelled'];
 const USER_ROLES = ['customer', 'vendor', 'admin'];
@@ -161,7 +164,7 @@ async function updateVendor(req, res) {
 // ── Orders (read-only, platform-wide) ──
 
 async function listAllOrders(req, res) {
-  const { status, vendorId, userId, from, to, city, q, groupRef } = req.query;
+  const { status, vendorId, userId, from, to, city, q, groupRef, channel } = req.query;
   const { page, pageSize, offset } = parsePaging(req);
   const conditions = [];
   const params = [];
@@ -186,6 +189,13 @@ async function listAllOrders(req, res) {
     params.push(to);
     conditions.push(`o.created_at < ($${params.length}::date + INTERVAL '1 day')`);
   }
+  // A Platform Registry sales channel by id, or 'none' for orders no channel claimed.
+  if (channel === 'none') {
+    conditions.push('o.sales_channel_id IS NULL');
+  } else if (channel) {
+    params.push(Number(channel));
+    conditions.push(`o.sales_channel_id = $${params.length}`);
+  }
   if (city) {
     params.push(city);
     conditions.push(`vp.city ILIKE $${params.length}`);
@@ -208,7 +218,8 @@ async function listAllOrders(req, res) {
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const joins = `JOIN users u ON u.id = o.user_id
      JOIN vendor_profiles vp ON vp.id = o.vendor_id
-     LEFT JOIN checkout_groups cg ON cg.id = o.checkout_group_id`;
+     LEFT JOIN checkout_groups cg ON cg.id = o.checkout_group_id
+     LEFT JOIN platforms sc ON sc.id = o.sales_channel_id`;
 
   const { rows: countRows } = await pool.query(
     `SELECT COUNT(*)::int AS total FROM orders o ${joins} ${where}`,
@@ -218,6 +229,7 @@ async function listAllOrders(req, res) {
     `SELECT o.*, u.full_name AS customer_name, u.email AS customer_email,
             vp.business_name AS vendor_name, vp.city AS vendor_city,
             cg.reference AS checkout_group_reference,
+            sc.name AS sales_channel_name, sc.slug AS sales_channel_slug,
             (SELECT COUNT(*)::int FROM orders sib WHERE sib.checkout_group_id = o.checkout_group_id)
               AS checkout_group_order_count
      FROM orders o
@@ -256,6 +268,17 @@ async function updateOrderStatus(req, res) {
   const { status, deliveryPartnerName, deliveryPartnerPhone, estimatedDeliveryAt } = req.body || {};
   if (!ALL_ORDER_STATUSES.includes(status)) {
     return res.status(400).json({ message: `status must be one of ${ALL_ORDER_STATUSES.join(', ')}` });
+  }
+  // Cancelling is its own path: it is recorded under Cancellations, refunds
+  // what was paid and puts the stock back (services/cancellations.js).
+  if (status === 'cancelled') {
+    try {
+      const result = await cancellations.adminCancel({ orderId: req.params.id, userId: req.user.id, body: req.body });
+      return res.json(result.order);
+    } catch (err) {
+      if (err instanceof cancellations.CancellationError) return res.status(err.status).json({ message: err.message });
+      throw err;
+    }
   }
   // Ops assign the courier from the admin panel, the same fields the vendor
   // endpoint already sets — otherwise an order can reach 'out_for_delivery'
@@ -300,6 +323,7 @@ async function updateOrderStatus(req, res) {
       (Date.now() - new Date(order.created_at).getTime()) / 60000
     );
     if (deltas) await bumpMetrics(client, order.vendor_id, deltas);
+    await shipments.onOrderStatusChanged(client, order, status, { actorRole: 'admin', userId: req.user.id });
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -310,6 +334,7 @@ async function updateOrderStatus(req, res) {
 
   if (status === 'delivered') {
     await creditWalletForOrder(order);
+    await issueAfterDelivery(order.id);
   }
   // Same rule as the vendor endpoint: a cancellation puts the stock back,
   // whether it was still held or already counted as sold.

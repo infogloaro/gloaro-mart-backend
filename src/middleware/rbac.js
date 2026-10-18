@@ -1,5 +1,6 @@
 const pool = require('../config/db');
 const { SUPER_ADMIN, expand, requiredFor, actionFor } = require('../services/permissions');
+const platformAccess = require('./platformAccess');
 
 /**
  * The second gate behind requireRole('admin').
@@ -49,6 +50,17 @@ async function requirePermission(req, res, next) {
         message: 'Your account has no staff role, so it cannot use the admin panel yet. Ask a super admin to assign one.',
       });
     }
+
+    // The Platform Registry's permission depends on the category a platform
+    // is in, which the path doesn't name, so it has its own guard.
+    const segment = req.path.split('/').filter(Boolean)[0];
+    if (platformAccess.SEGMENTS.has(segment)) {
+      return await platformAccess.guardPlatformRegistry(req, res, next, staff);
+    }
+
+    // Anyone on the staff may see and cancel their own approval requests;
+    // approving, rejecting and seeing everyone's is checked in the controller.
+    if (segment === 'approvals') return next();
 
     const needed = requiredFor(req.method, req.path);
     if (!needed) {

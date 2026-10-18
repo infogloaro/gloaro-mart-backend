@@ -35,7 +35,7 @@ async function createProduct(req, res) {
   const vendorId = await getVendorProfileId(req.user.id);
   if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
 
-  const { name, description, priceCents, currency, stockQuantity, imageUrl, category, brandId, gstRatePercent, moq } =
+  const { name, description, priceCents, currency, stockQuantity, imageUrl, category, subcategory, brandId, gstRatePercent, moq } =
     req.body || {};
   if (!name || !Number.isInteger(priceCents) || priceCents < 0) {
     return res.status(400).json({ message: 'name and a valid priceCents are required' });
@@ -55,8 +55,8 @@ async function createProduct(req, res) {
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO products (vendor_id, name, description, price_cents, currency, stock_quantity, image_url, category, brand_id, gst_rate_percent, moq)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `INSERT INTO products (vendor_id, name, description, price_cents, currency, stock_quantity, image_url, category, brand_id, gst_rate_percent, moq, subcategory)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
       [
         vendorId,
@@ -70,6 +70,7 @@ async function createProduct(req, res) {
         brandId ?? null,
         gstRatePercent ?? 0,
         moq ?? 1,
+        typeof subcategory === 'string' && subcategory.trim() ? subcategory.trim() : null,
       ]
     );
     product = rows[0];
@@ -131,6 +132,7 @@ async function updateProduct(req, res) {
     stockQuantity,
     imageUrl,
     category,
+    subcategory,
     brandId,
     isActive,
     gstRatePercent,
@@ -166,6 +168,8 @@ async function updateProduct(req, res) {
         is_active = COALESCE($10, is_active),
         gst_rate_percent = COALESCE($11, gst_rate_percent),
         moq = COALESCE($12, moq),
+        -- Absent leaves it; an empty string clears it.
+        subcategory = CASE WHEN $13::text IS NULL THEN subcategory ELSE NULLIF(trim($13::text), '') END,
         updated_at = now()
        WHERE id = $1 AND vendor_id = $2
        RETURNING *`,
@@ -182,6 +186,7 @@ async function updateProduct(req, res) {
         isActive,
         gstRatePercent,
         moq,
+        typeof subcategory === 'string' ? subcategory : null,
       ]
     );
     product = rows[0];

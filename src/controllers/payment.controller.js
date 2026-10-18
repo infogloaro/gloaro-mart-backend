@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const { getProvider, providerForMethod } = require('../services/payments');
 const { confirmReservations, releaseReservations } = require('../services/inventory');
+const { notifyNewOrders } = require('../services/vendorNotify');
 
 /**
  * Payments, refunds and the ledger behind them.
@@ -43,7 +44,8 @@ async function createPaymentForGroup(client, { groupId, userId, amountCents, met
      RETURNING *`,
     // COD is owed rather than merely created: nothing more is needed from the
     // customer until the courier arrives.
-    [groupId, userId, method, provider.name, method === 'cod' ? 'pending' : 'created', amountCents]
+    // Credit is the same: the business owes it on its terms, with nothing to do now.
+    [groupId, userId, method, provider.name, ['cod', 'credit'].includes(method) ? 'pending' : 'created', amountCents]
   );
   const payment = rows[0];
   await recordPaymentEvent(client, {
@@ -379,6 +381,8 @@ async function handleWebhook(req, res) {
         groupId: payment.checkout_group_id,
         note: 'Payment captured',
       });
+      // The shops hear about an online order only once it's paid for.
+      await notifyNewOrders(client, { groupId: payment.checkout_group_id });
     } else if (parsed.event === 'failed' || parsed.event === 'cancelled') {
       await releaseReservations(client, {
         groupId: payment.checkout_group_id,

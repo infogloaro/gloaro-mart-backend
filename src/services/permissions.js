@@ -98,6 +98,7 @@ const MODULES = [
   { key: "app_menu", label: "App Menu", group: "Marketing & CMS", routes: [], guardedElsewhere: true },
   { key: "home_sections", label: "Home Sections", group: "Marketing & CMS", routes: ["home-sections"] },
   { key: "campaigns", label: "Campaigns", group: "Marketing & CMS", routes: ["campaigns"] },
+  { key: "ad_promotions", label: "Ad Promotions", group: "Marketing & CMS", routes: ["ads"] },
 
   // ----- Customers & Network -----
   { key: "users", label: "Users", group: "Customers & Network", routes: ["users"] },
@@ -115,6 +116,7 @@ const MODULES = [
   { key: "audit_logs", label: "Admin Logs", group: "System & Administration", routes: ["audit-logs"] },
   { key: "feature_flags", label: "Feature Flags", group: "System & Administration", routes: ["feature-flags"] },
   { key: "settings", label: "General Settings", group: "System & Administration", routes: ["settings"] },
+  { key: "channels", label: "Channels", group: "System & Administration", routes: ["channels", "whatsapp"] },
 ];
 
 /**
@@ -161,15 +163,61 @@ function actionFor(method) {
   return "edit";
 }
 
-/** Expands granted keys with everything they imply, so a check is a plain lookup. */
+/**
+ * Expands granted keys with everything they imply, so a check is a plain lookup.
+ * Every edit or delete implies its module's view — the same rule PERMISSIONS
+ * spells out per key, applied by shape so that dynamic keys (below) follow it too.
+ */
 function expand(granted) {
   const held = new Set(granted);
-  for (const permission of PERMISSIONS) {
-    if (held.has(permission.key) && permission.implies) {
-      for (const implied of permission.implies) held.add(implied);
-    }
+  for (const key of granted) {
+    const match = /^(.+)\.(edit|delete)$/.exec(key);
+    if (match) held.add(`${match[1]}.view`);
   }
   return held;
+}
+
+// ----- Dynamic permissions: one module per Platform Registry category -----
+//
+// A category added in Settings → Platform Registry becomes a permission module
+// at once — platform_<slug>.view / .edit / .delete — with no code change. They
+// are read from the database on each request that needs them, so a new
+// category is grantable the moment it exists. No static module key starts with
+// "platform_", so the two sets can never collide.
+
+const PLATFORM_PREFIX = "platform_";
+const PLATFORM_GROUP = "Platform Registry";
+
+/** The permission module of one registry category. */
+const platformModuleKey = (categorySlug) => `${PLATFORM_PREFIX}${categorySlug}`;
+
+/** True for a key like platform_sales_channels.edit. */
+const isPlatformPermission = (key) => key.startsWith(PLATFORM_PREFIX);
+
+function platformPermissions(categories) {
+  return categories.flatMap((c) =>
+    ACTIONS.map(({ action, verb }) => ({
+      key: `${platformModuleKey(c.slug)}.${action}`,
+      module: platformModuleKey(c.slug),
+      moduleLabel: c.name,
+      group: PLATFORM_GROUP,
+      action,
+      label: `${verb} ${c.name}`,
+      implies: action === "view" ? undefined : [`${platformModuleKey(c.slug)}.view`],
+      pending: false,
+      covers: undefined,
+    })),
+  );
+}
+
+/**
+ * The full catalogue: the modules in code plus one per registry category.
+ * Takes a pg pool/client so this file stays free of a database import.
+ */
+async function loadCatalogue(db) {
+  const { rows } = await db.query("SELECT slug, name FROM platform_categories ORDER BY sort_order, name");
+  const all = [...PERMISSIONS, ...platformPermissions(rows)];
+  return { permissions: all, keys: new Set(all.map((p) => p.key)) };
 }
 
 /** The permission a request needs, or null when the path is unmapped. */
@@ -190,4 +238,7 @@ module.exports = {
   actionFor,
   expand,
   requiredFor,
+  loadCatalogue,
+  platformModuleKey,
+  isPlatformPermission,
 };

@@ -5,6 +5,13 @@ const pool = require('../config/db');
 // and only the newest active one of each is used.
 const PLACEMENTS = ['home', 'card_shop', 'card_b2b', 'card_nearme'];
 
+// image_data holds either a file uploaded through /api/admin/banners/uploads
+// (a /uploads/banners/... path) or, for banners made before uploads existed,
+// a base64 data URI.
+function isBannerImage(value) {
+  return typeof value === 'string' && (value.startsWith('/uploads/banners/') || value.startsWith('data:image/'));
+}
+
 // ── Public ──
 
 async function listActiveBanners(req, res) {
@@ -30,8 +37,8 @@ async function listAllBanners(req, res) {
 
 async function createBanner(req, res) {
   const { title, subtitle, imageData, linkUrl, sortOrder, placement } = req.body || {};
-  if (!imageData || !imageData.startsWith('data:image/')) {
-    return res.status(400).json({ message: 'imageData must be a base64 image data URI' });
+  if (!isBannerImage(imageData)) {
+    return res.status(400).json({ message: 'imageData must be an uploaded /uploads/banners/ path or a base64 image' });
   }
   if (placement && !PLACEMENTS.includes(placement)) {
     return res.status(400).json({ message: `placement must be one of: ${PLACEMENTS.join(', ')}` });
@@ -46,6 +53,9 @@ async function createBanner(req, res) {
 
 async function updateBanner(req, res) {
   const { title, subtitle, imageData, linkUrl, sortOrder, isActive, placement } = req.body || {};
+  if (imageData != null && !isBannerImage(imageData)) {
+    return res.status(400).json({ message: 'imageData must be an uploaded /uploads/banners/ path or a base64 image' });
+  }
   if (placement && !PLACEMENTS.includes(placement)) {
     return res.status(400).json({ message: `placement must be one of: ${PLACEMENTS.join(', ')}` });
   }

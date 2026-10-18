@@ -4,5 +4,13 @@ node_modules/
 
 .vercel
 
+# Admin-uploaded images live on the server's disk, not in git
+uploads/
+
 # Dev scratch scripts, not part of the deployed app
 *.tmp.js
+
+# Stray copies, not part of the backend
+.DS_Store
+lib/
+lib.zip

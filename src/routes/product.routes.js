@@ -1,6 +1,7 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, optionalAuth, requireRole } = require('../middleware/auth');
 const productController = require('../controllers/product.controller');
+const review = require('../controllers/review.controller');
 const { aiSearch } = require('../controllers/aiSearch.controller');
 const search = require('../controllers/search.controller');
 
@@ -14,6 +15,11 @@ router.get('/search', search.searchProducts);
 router.patch('/:id', requireAuth, requireRole('vendor'), productController.updateProduct);
 router.delete('/:id', requireAuth, requireRole('vendor'), productController.deleteProduct);
 router.get('/:id/tiers', productController.getTiers);
+// Public reviews (optionalAuth only to mark the ones the viewer found helpful),
+// and the signed-in customer's own review of the product.
+router.get('/:id/reviews', optionalAuth, review.listProductReviews);
+router.get('/:id/review', requireAuth, review.getMyProductReview);
+router.put('/:id/review', requireAuth, review.upsertProductReview);
 router.put('/:id/tiers', requireAuth, requireRole('vendor'), productController.setTiers);
 router.get('/:id', productController.getProduct);
 router.get('/', productController.listProducts);

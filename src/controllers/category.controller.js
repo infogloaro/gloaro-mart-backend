@@ -4,7 +4,7 @@ const pool = require('../config/db');
 
 async function listActiveCategories(req, res) {
   const { rows } = await pool.query(
-    'SELECT id, name, icon_key, sort_order FROM categories WHERE is_active = true ORDER BY sort_order ASC, name ASC'
+    'SELECT id, name, icon_key, image_url, sort_order FROM categories WHERE is_active = true ORDER BY sort_order ASC, name ASC'
   );
   res.json(rows);
 }
@@ -17,14 +17,14 @@ async function listAllCategories(req, res) {
 }
 
 async function createCategory(req, res) {
-  const { name, iconKey, sortOrder } = req.body || {};
+  const { name, iconKey, imageUrl, sortOrder } = req.body || {};
   if (!name || !name.trim()) {
     return res.status(400).json({ message: 'name is required' });
   }
   try {
     const { rows } = await pool.query(
-      `INSERT INTO categories (name, icon_key, sort_order) VALUES ($1, $2, $3) RETURNING *`,
-      [name.trim(), iconKey || 'other', sortOrder ?? 0]
+      `INSERT INTO categories (name, icon_key, image_url, sort_order) VALUES ($1, $2, $3, $4) RETURNING *`,
+      [name.trim(), iconKey || 'other', imageUrl || null, sortOrder ?? 0]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -36,7 +36,7 @@ async function createCategory(req, res) {
 }
 
 async function updateCategory(req, res) {
-  const { name, iconKey, sortOrder, isActive } = req.body || {};
+  const { name, iconKey, imageUrl, sortOrder, isActive } = req.body || {};
   if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
     return res.status(400).json({ message: 'name must be a non-empty string' });
   }
@@ -53,9 +53,11 @@ async function updateCategory(req, res) {
         name = COALESCE($2, name),
         icon_key = COALESCE($3, icon_key),
         sort_order = COALESCE($4, sort_order),
-        is_active = COALESCE($5, is_active)
+        is_active = COALESCE($5, is_active),
+        -- Sent as "" or null, the image is removed; left out, it is kept.
+        image_url = CASE WHEN $6::boolean THEN $7 ELSE image_url END
        WHERE id = $1 RETURNING *`,
-      [req.params.id, nextName, iconKey, sortOrder, isActive]
+      [req.params.id, nextName, iconKey, sortOrder, isActive, imageUrl !== undefined, imageUrl || null]
     );
     // products.category stores the name, not the id, so a rename has to follow through.
     if (nextName && nextName !== existing[0].name) {

@@ -5,6 +5,7 @@ const reassignment = require('../controllers/reassignment.controller');
 const payment = require('../controllers/payment.controller');
 const returns = require('../controllers/returns.controller');
 const review = require('../controllers/review.controller');
+const shipment = require('../controllers/shipment.controller');
 
 const router = express.Router();
 
@@ -25,12 +26,18 @@ router.get('/groups/:id', requireAuth, orderController.getOrderGroup);
 router.get('/groups/:id/reassignments', requireAuth, reassignment.listForGroup);
 router.get('/', requireAuth, orderController.getMyOrders);
 router.get('/:id/history', requireAuth, orderController.getOrderHistory);
+// The customer's parcel tracking: every delivery attempt with its scans.
+router.get('/:id/shipments', requireAuth, shipment.listForOrder);
+// The tax invoice, issued on delivery.
+router.get('/:id/invoice', requireAuth, require('../controllers/invoice.controller').getForOrder);
+router.get('/:id/credit-notes', requireAuth, require('../controllers/creditNote.controller').listForOrder);
 // The customer's own view of money owed back to them, on their own order.
 router.get('/:id/refunds', requireAuth, payment.listRefundsForOrder);
 // Returns: raised against a delivered order, decided by an admin.
 router.post('/:id/returns', requireAuth, returns.requestReturn);
 router.get('/:id/returns', requireAuth, returns.listReturnsForOrder);
 router.delete('/:id/returns/:returnId', requireAuth, returns.cancelReturn);
+router.post('/:id/returns/:returnId/dispute', requireAuth, returns.disputeReturn);
 // Shop review, earned by a delivered order. PUT because there is one per
 // order and changing your mind replaces it.
 router.put('/:id/review', requireAuth, review.upsertReview);
@@ -40,6 +47,10 @@ router.patch('/:id/status', requireAuth, requireRole('vendor'), orderController.
 // The customer's own cancel. Not a status PATCH: that route is the vendor's
 // fulfilment path and is role-locked to them.
 router.post('/:id/cancel', requireAuth, orderController.cancelOrder);
+// The latest cancellation request and what cancelling would mean right now;
+// DELETE withdraws a request still waiting for an admin.
+router.get('/:id/cancellation', requireAuth, orderController.getCancellation);
+router.delete('/:id/cancellation', requireAuth, orderController.withdrawCancellation);
 // Its own route, not a status value: 'I can't fill this' and 'this order is
 // over' are different events, and only the first one re-routes.
 router.post('/:id/reject', requireAuth, requireRole('vendor', 'admin'), reassignment.rejectOrder);

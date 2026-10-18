@@ -1,10 +1,11 @@
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const pool = require('../config/db');
-const { PERMISSIONS, PERMISSION_KEYS, SUPER_ADMIN } = require('../services/permissions');
+const { SUPER_ADMIN, loadCatalogue } = require('../services/permissions');
 const { loadStaffContext } = require('../middleware/rbac');
 const { revokeSessions } = require('../services/sessions');
 const { sendMail } = require('../services/mailer');
+const { holdForApproval } = require('../services/approvals');
 
 const NOTICE_EMAIL = 'infogloaro@gmail.com';
 const OTP_TTL_MS = 10 * 60 * 1000;
@@ -34,12 +35,13 @@ async function getMe(req, res) {
     isSuperAdmin: staff.isSuperAdmin,
     // A super admin holds everything by definition, so send the full list rather
     // than an empty one the panel would read as "no access".
-    permissions: staff.isSuperAdmin ? PERMISSIONS.map((p) => p.key) : [...staff.permissions],
+    permissions: staff.isSuperAdmin ? [...(await loadCatalogue(pool)).keys] : [...staff.permissions],
   });
 }
 
-function listPermissions(req, res) {
-  res.json(PERMISSIONS);
+// Includes one module per Platform Registry category, so it changes as categories do.
+async function listPermissions(req, res) {
+  res.json((await loadCatalogue(pool)).permissions);
 }
 
 async function listRoles(req, res) {
@@ -55,9 +57,10 @@ async function listRoles(req, res) {
   res.json(rows);
 }
 
-function validatePermissions(list) {
+async function validatePermissions(list) {
   if (!Array.isArray(list)) return 'permissions must be a list';
-  const unknown = list.filter((p) => !PERMISSION_KEYS.has(p));
+  const { keys } = await loadCatalogue(pool);
+  const unknown = list.filter((p) => !keys.has(p));
   if (unknown.length > 0) return `Unknown permission: ${unknown.join(', ')}`;
   return null;
 }
@@ -70,12 +73,23 @@ async function createRole(req, res) {
   const { name, description, permissions = [] } = req.body || {};
   if (!name?.trim()) return res.status(400).json({ message: 'A role name is required' });
 
-  const error = validatePermissions(permissions);
+  const error = await validatePermissions(permissions);
   if (error) return res.status(400).json({ message: error });
 
   const slug = slugify(name);
   if (slug === SUPER_ADMIN) {
     return res.status(400).json({ message: 'That name is reserved for the built-in super admin role.' });
+  }
+
+  if (permissions.length > 0) {
+    const held = await holdForApproval(req, res, {
+      action: 'role.permissions',
+      entityType: 'role',
+      entityId: `new:${slug}`,
+      summary: `Create role "${name.trim()}" with ${permissions.length} permission(s)`,
+      handler: 'role.create',
+    });
+    if (held) return;
   }
 
   const client = await pool.connect();
@@ -105,7 +119,7 @@ async function createRole(req, res) {
 async function updateRole(req, res) {
   const { name, description, permissions } = req.body || {};
   if (permissions !== undefined) {
-    const error = validatePermissions(permissions);
+    const error = await validatePermissions(permissions);
     if (error) return res.status(400).json({ message: error });
   }
 
@@ -117,6 +131,17 @@ async function updateRole(req, res) {
   // would have no effect — refusing is more honest than accepting a no-op.
   if (role.is_system && permissions !== undefined) {
     return res.status(400).json({ message: 'The super admin role always has every permission and cannot be restricted.' });
+  }
+
+  if (permissions !== undefined) {
+    const held = await holdForApproval(req, res, {
+      action: 'role.permissions',
+      entityType: 'role',
+      entityId: role.id,
+      summary: `Change what the "${role.name}" role may do (${permissions.length} permission(s))`,
+      handler: 'role.update',
+    });
+    if (held) return;
   }
 
   const client = await pool.connect();

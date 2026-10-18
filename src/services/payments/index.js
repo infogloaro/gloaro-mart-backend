@@ -20,8 +20,9 @@
  */
 const cod = require('./cod');
 const manual = require('./manual');
+const credit = require('./credit');
 
-const PROVIDERS = { cod, manual };
+const PROVIDERS = { cod, manual, credit };
 
 /** The provider handling a payment, by name. Throws rather than guessing. */
 function getProvider(name) {
@@ -36,7 +37,9 @@ function getProvider(name) {
 
 /** Which method names each provider is willing to handle. */
 function providerForMethod(method) {
-  return method === 'cod' ? cod : manual;
+  if (method === 'cod') return cod;
+  if (method === 'credit') return credit;
+  return manual;
 }
 
 module.exports = { getProvider, providerForMethod, PROVIDERS };

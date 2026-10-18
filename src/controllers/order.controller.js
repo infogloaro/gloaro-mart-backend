@@ -7,6 +7,7 @@ const { findOwnedAddress, toSnapshot } = require('./address.controller');
 const { evaluate } = require('./serviceability.controller');
 const { createPaymentForGroup, settleCodForOrder } = require('./payment.controller');
 const { returnEligibility, deliveredAtFor } = require('./returns.controller');
+const { bestCampaignForOrder } = require('../services/campaigns');
 const {
   lockStockForLines,
   reserveForOrder,
@@ -15,6 +16,13 @@ const {
   settleStockForOrder,
 } = require('../services/inventory');
 const { bumpMetrics, metricsForTransition } = require('../services/matching');
+const cancellations = require('../services/cancellations');
+const shipments = require('../services/shipments');
+const { issueAfterDelivery } = require('../services/invoices');
+const business = require('../services/business');
+const analytics = require('../services/analytics');
+const { notifyNewOrders } = require('../services/vendorNotify');
+const { CancellationError } = cancellations;
 
 const STATUS_FLOW = ['pending', 'confirmed', 'packed', 'out_for_delivery', 'delivered'];
 
@@ -59,7 +67,22 @@ function addressToLine(a) {
  * Everything payments has understood since Sprint 3. COD is the default because
  * an app build already in the field sends no method at all.
  */
-const PAYMENT_METHODS = ['cod', 'upi', 'card', 'netbanking', 'wallet'];
+const PAYMENT_METHODS = ['cod', 'upi', 'card', 'netbanking', 'wallet', 'credit'];
+
+/**
+ * The sales channel an order came through, from the X-Sales-Channel header: the
+ * slug of an enabled Platform Registry entry with the "orders" capability (e.g.
+ * mobile_app, website_storefront). Anything else — no header, an unknown or
+ * disabled channel — leaves the order unattributed; it never blocks checkout.
+ */
+async function resolveSalesChannel(slug) {
+  if (!slug || !/^[a-z][a-z0-9_]{1,79}$/.test(slug)) return null;
+  const { rows } = await pool.query(
+    `SELECT id FROM platforms WHERE slug = $1 AND status = 'active' AND capabilities ? 'orders'`,
+    [slug]
+  );
+  return rows[0]?.id ?? null;
+}
 
 async function checkout(req, res) {
   const {
@@ -68,6 +91,9 @@ async function checkout(req, res) {
     deliveryMethod = 'delivery',
     couponsByVendor,
     paymentMethod = 'cod',
+    // Set to order for the caller's business (Business Accounts): its GSTIN goes
+    // on the invoices, and it may pay 'credit'.
+    businessAccountId = null,
   } = req.body || {};
   // addressId is the current contract; deliveryAddress is the legacy free-text
   // field, still accepted while older app builds are in the field.
@@ -80,7 +106,22 @@ async function checkout(req, res) {
   if (!PAYMENT_METHODS.includes(paymentMethod)) {
     return res.status(400).json({ message: `paymentMethod must be one of ${PAYMENT_METHODS.join(', ')}` });
   }
-  const isCod = paymentMethod === 'cod';
+  if (paymentMethod === 'credit' && !businessAccountId) {
+    return res.status(400).json({ message: 'Credit is only for orders placed for a business account.' });
+  }
+  // Credit, like COD, needs nothing more from the buyer now; both commit the sale at once.
+  const isCod = paymentMethod === 'cod' || paymentMethod === 'credit';
+
+  let member = null;
+  if (businessAccountId != null) {
+    if (!Number.isInteger(businessAccountId)) return res.status(400).json({ message: 'businessAccountId must be an id' });
+    try {
+      member = await business.assertCanOrderFor(req.user.id, businessAccountId);
+    } catch (err) {
+      if (err.status) return res.status(err.status).json({ message: err.message });
+      throw err;
+    }
+  }
 
   let address = null;
   if (addressId) {
@@ -90,7 +131,7 @@ async function checkout(req, res) {
 
   const cart = await getOrCreateActiveCart(req.user.id);
   const { rows: items } = await pool.query(
-    `SELECT ci.product_id, ci.variant_id, ci.quantity, p.name, p.vendor_id, p.gst_rate_percent, p.moq,
+    `SELECT ci.product_id, ci.variant_id, ci.quantity, p.name, p.vendor_id, p.gst_rate_percent, p.moq, p.category,
             -- The variant's price when the line names one; the product's own
             -- otherwise. Bulk tiers still apply on top of whichever it is.
             COALESCE(v.price_cents, p.price_cents) AS price_cents,
@@ -196,6 +237,11 @@ async function checkout(req, res) {
     name: it.variant_label ? `${it.name} (${it.variant_label})` : it.name,
   }));
 
+  const salesChannelId = await resolveSalesChannel(req.get('x-sales-channel'));
+  // Which app surface the cart was built from, for Analytics. Unknown values
+  // leave it unset rather than refuse the order.
+  const origin = ['shop', 'near_me'].includes(req.body?.origin) ? req.body.origin : null;
+
   const client = await pool.connect();
   const createdOrders = [];
   try {
@@ -215,10 +261,10 @@ async function checkout(req, res) {
     // money columns start at zero and are rolled up once the orders exist.
     const { rows: groupRows } = await client.query(
       `INSERT INTO checkout_groups
-         (reference, user_id, address_id, delivery_address_snapshot, delivery_method, payment_method)
+         (reference, user_id, address_id, delivery_address_snapshot, delivery_method, payment_method, business_account_id)
        VALUES (
          'GLM-' || to_char(now(), 'YYYY') || '-' || lpad(nextval('checkout_group_ref_seq')::text, 5, '0'),
-         $1, $2, $3, $4, $5
+         $1, $2, $3, $4, $5, $6
        )
        RETURNING id, reference`,
       [
@@ -227,6 +273,7 @@ async function checkout(req, res) {
         address ? JSON.stringify(toSnapshot(address)) : null,
         deliveryMethod,
         paymentMethod,
+        businessAccountId,
       ]
     );
     const group = groupRows[0];
@@ -242,16 +289,29 @@ async function checkout(req, res) {
         0
       );
       const coupon = resolvedCoupons.get(vendorId);
-      const discountCents = coupon?.discountCents || 0;
+      const couponDiscountCents = coupon?.discountCents || 0;
       const deliveryChargeCents = deliveryChargeByVendor.get(vendorId) || 0;
+      // The best running campaign this shop's order qualifies for, on top of any
+      // coupon. Its row is locked until commit so its budget can't be overspent.
+      const campaign = await bestCampaignForOrder(client, {
+        vendorId,
+        items: resolvedItems,
+        subtotalCents,
+        couponDiscountCents,
+        deliveryChargeCents,
+      });
+      const campaignDiscountCents = campaign?.discountCents || 0;
+      // discount_cents stays the whole discount, so totals and groups add up as before.
+      const discountCents = couponDiscountCents + campaignDiscountCents;
       const totalCents = subtotalCents - discountCents + gstCents + deliveryChargeCents;
 
       const { rows: orderRows } = await client.query(
         `INSERT INTO orders
           (user_id, vendor_id, status, payment_method, subtotal_cents, gst_cents, discount_cents, total_cents,
            delivery_address, coupon_id, coupon_code_snapshot,
-           address_id, delivery_address_snapshot, delivery_charge_cents, delivery_method, checkout_group_id)
-         VALUES ($1, $2, 'pending', $15, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+           address_id, delivery_address_snapshot, delivery_charge_cents, delivery_method, checkout_group_id,
+           sales_channel_id, campaign_discount_cents, business_account_id, origin)
+         VALUES ($1, $2, 'pending', $15, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $16, $17, $18, $19)
          RETURNING *`,
         [
           req.user.id,
@@ -271,9 +331,20 @@ async function checkout(req, res) {
           deliveryMethod,
           group.id,
           paymentMethod,
+          salesChannelId,
+          campaignDiscountCents,
+          businessAccountId,
+          origin,
         ]
       );
       const order = orderRows[0];
+      if (campaign) {
+        await client.query(
+          `INSERT INTO order_campaigns (order_id, campaign_id, discount_cents, platform_cents, vendor_cents)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [order.id, campaign.campaign.id, campaign.discountCents, campaign.platformCents, campaign.vendorCents]
+        );
+      }
       await recordStatusChange(client, {
         orderId: order.id,
         toStatus: 'pending',
@@ -342,6 +413,15 @@ async function checkout(req, res) {
       'SELECT total_cents FROM checkout_groups WHERE id = $1',
       [group.id]
     );
+    // The buyer's per-order limit and, on credit, the account's room — now that the total is known.
+    if (member) {
+      await business.checkFinalCredit(client, {
+        member,
+        accountId: businessAccountId,
+        totalCents: groupTotals[0].total_cents,
+        paymentMethod,
+      });
+    }
     await createPaymentForGroup(client, {
       groupId: group.id,
       userId: req.user.id,
@@ -358,6 +438,7 @@ async function checkout(req, res) {
     // arrived and might never.
     if (isCod) {
       await confirmReservations(client, { groupId: group.id, note: 'COD order placed' });
+      await notifyNewOrders(client, { groupId: group.id });
     }
 
     await client.query("UPDATE carts SET status = 'converted' WHERE id = $1", [cart.id]);
@@ -371,6 +452,10 @@ async function checkout(req, res) {
   } finally {
     client.release();
   }
+
+  // Analytics: the session that placed it reached the end of the funnel. Never
+  // allowed to fail a checkout that has already committed.
+  await analytics.recordServerEvent(req, 'order_placed').catch(() => {});
 
   // Still an array of vendor orders, with a few fields added. Changing this to
   // { group, orders } would break every app build already in the field.
@@ -400,6 +485,9 @@ async function getOrderGroups(req, res) {
     `SELECT cg.id, cg.reference, cg.total_cents, cg.delivery_charge_cents, cg.created_at,
             cg.payment_method, cg.payment_status,
             COUNT(o.id)::int AS order_count,
+            -- What is still owed once some shops cancelled; total_cents stays what was placed.
+            COALESCE(SUM(o.total_cents) FILTER (WHERE o.status <> 'cancelled'), 0)::int AS payable_cents,
+            COUNT(o.id) FILTER (WHERE o.status = 'cancelled')::int AS cancelled_count,
             ARRAY_AGG(vp.business_name ORDER BY o.id) AS vendor_names,
             ARRAY_AGG(o.status ORDER BY o.id) AS statuses
      FROM checkout_groups cg
@@ -417,8 +505,10 @@ async function getOrderGroups(req, res) {
       reference: g.reference,
       derivedStatus: deriveGroupStatus(g.statuses),
       totalCents: g.total_cents,
+      payableCents: g.payable_cents,
       deliveryChargeCents: g.delivery_charge_cents,
       orderCount: g.order_count,
+      cancelledCount: g.cancelled_count,
       vendorNames: g.vendor_names,
       paymentMethod: g.payment_method,
       paymentStatus: g.payment_status,
@@ -550,20 +640,24 @@ async function getOrder(req, res) {
   // Vendors reading their own order do not get it — none of it is theirs.
   if (!ownsAsCustomer) return res.json({ ...order, items });
 
-  const [openReturn, review] = await Promise.all([
+  const [openReturn, review, cancellationPolicy] = await Promise.all([
     pool.query(
-      `SELECT id, status, reason_code FROM order_returns
-       WHERE order_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      `SELECT id, status, reason_code, resolution FROM order_returns
+       WHERE order_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1`,
       [order.id]
     ),
-    pool.query('SELECT id, rating FROM vendor_reviews WHERE order_id = $1', [order.id]),
+    pool.query("SELECT id, rating, status FROM vendor_reviews WHERE order_id = $1 AND target = 'vendor'", [order.id]),
+    cancellations.customerPolicy(order),
   ]);
 
   res.json({
     ...order,
     items,
-    can_cancel: order.status === 'pending',
-    return_eligibility: returnEligibility(order, await deliveredAtFor(order.id)),
+    // Kept meaning "cancels at once" for app builds that show a plain Cancel
+    // button; cancellation_policy says when a request to an admin is possible.
+    can_cancel: cancellationPolicy.instant,
+    cancellation_policy: cancellationPolicy,
+    return_eligibility: returnEligibility(order, await deliveredAtFor(order.id), openReturn.rows[0] ?? null),
     latest_return: openReturn.rows[0] ?? null,
     my_review: review.rows[0] ?? null,
   });
@@ -579,9 +673,26 @@ async function updateStatus(req, res) {
   const order = rows[0];
   if (!order) return res.status(404).json({ message: 'Order not found' });
 
+  // The shop cancelling goes through the stage rules like everyone else's:
+  // straight through where vendors are allowed, a request to the admins where not.
+  if (status === 'cancelled') {
+    try {
+      const result = await cancellations.requestCancellation({
+        orderId: order.id,
+        by: 'vendor',
+        userId: req.user.id,
+        body: req.body,
+        owns: (o) => o.vendor_id === vendorId,
+      });
+      return sendCancellation(res, result, (r) => r.order);
+    } catch (err) {
+      return cancellationFailed(res, err);
+    }
+  }
+
   const currentIdx = STATUS_FLOW.indexOf(order.status);
   const nextIdx = STATUS_FLOW.indexOf(status);
-  if (status !== 'cancelled' && (nextIdx === -1 || nextIdx !== currentIdx + 1)) {
+  if (nextIdx === -1 || nextIdx !== currentIdx + 1) {
     return res.status(400).json({ message: `Cannot transition from ${order.status} to ${status}` });
   }
 
@@ -617,6 +728,7 @@ async function updateStatus(req, res) {
       (Date.now() - new Date(order.created_at).getTime()) / 60000
     );
     if (deltas) await bumpMetrics(client, order.vendor_id, deltas);
+    await shipments.onOrderStatusChanged(client, updatedOrder, status, { actorRole: 'vendor', userId: req.user.id });
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -627,143 +739,75 @@ async function updateStatus(req, res) {
 
   if (status === 'delivered') {
     await creditWalletForOrder(updatedOrder);
-  }
-  // Stock comes back whether it was still held or already counted as sold.
-  // Runs after the commit, on its own connection: a failure here leaves the
-  // reservation for the next attempt rather than undoing a real cancellation.
-  if (status === 'cancelled') {
-    await settleStockForOrder(updatedOrder.id, 'release', {
-      userId: req.user.id,
-      note: 'Order cancelled by the vendor',
-    });
-  }
-  // Cancellations matter too: cancelling the last live order settles the
-  // purchase's COD payment as cancelled rather than leaving it owed forever.
-  if (status === 'delivered' || status === 'cancelled') {
+    await issueAfterDelivery(updatedOrder.id);
     await settleCodForOrder(updatedOrder.id);
   }
 
   res.json(updatedOrder);
 }
 
+/** Turns a cancellation outcome into the response both the customer and vendor routes give. */
+function sendCancellation(res, result, orderJson) {
+  if (result.immediate) return res.json(orderJson(result));
+  const c = result.cancellation;
+  res.status(202).json({
+    pendingApproval: true,
+    cancellation: { id: c.id, reference: c.reference, status: c.status, eligible: c.eligible },
+    message: c.eligible
+      ? `Cancellation request ${c.reference} sent — an admin will confirm it.`
+      : `This order can't normally be cancelled at this stage. Request ${c.reference} was sent to an admin to decide.`,
+  });
+}
+
+function cancellationFailed(res, err) {
+  if (err instanceof CancellationError) return res.status(err.status).json({ message: err.message, ...err.extra });
+  throw err;
+}
+
 /**
- * The customer cancelling one shop's order.
- *
- * Deliberately separate from updateStatus rather than a role branch inside it:
- * that handler is the vendor's fulfilment path, keyed on their vendor_profile,
- * and it credits the vendor's cancellation metric — which would be wrong here,
- * since the shop did nothing. Only `open_orders` moves.
+ * The customer cancelling one shop's order, under the rule for the stage it
+ * has reached (services/cancellations.js). 200 with the cancelled order when it
+ * goes through at once, 202 when it waits for an admin.
  *
  * Orders are per shop, so a purchase spanning three shops cancels one at a
  * time; the group's status is derived and follows on its own.
  */
 async function cancelOrder(req, res) {
-  const { reason } = req.body || {};
+  try {
+    const result = await cancellations.requestCancellation({
+      orderId: req.params.id,
+      by: 'customer',
+      userId: req.user.id,
+      body: req.body,
+      owns: (order) => order.user_id === req.user.id,
+    });
+    sendCancellation(res, result, (r) => ({ ...r.order, refund: r.refund, cancellation_fee_cents: r.feeCents }));
+  } catch (err) {
+    cancellationFailed(res, err);
+  }
+}
 
-  const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1 AND user_id = $2', [
+/** The customer's latest cancellation request on their order, or null. */
+async function getCancellation(req, res) {
+  const { rows: orderRows } = await pool.query('SELECT * FROM orders WHERE id = $1 AND user_id = $2', [
     req.params.id,
     req.user.id,
   ]);
-  const order = rows[0];
-  if (!order) return res.status(404).json({ message: 'Order not found' });
-
-  if (order.status === 'cancelled') {
-    return res.status(409).json({ message: 'This order is already cancelled.' });
-  }
-  // The window closes the moment the shop confirms: past that they have
-  // committed stock and effort, and cancelling is a conversation, not a button.
-  if (order.status !== 'pending') {
-    return res.status(409).json({
-      message: 'This shop has already started preparing your order, so it can no longer be cancelled.',
-    });
-  }
-
-  const client = await pool.connect();
-  let cancelled;
-  try {
-    await client.query('BEGIN');
-    const { rows: updated } = await client.query(
-      "UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1 RETURNING *",
-      [order.id]
-    );
-    cancelled = updated[0];
-    await recordStatusChange(client, {
-      orderId: order.id,
-      fromStatus: order.status,
-      toStatus: 'cancelled',
-      userId: req.user.id,
-      actorRole: 'customer',
-      note: reason || 'Cancelled by the customer',
-    });
-    // No ordersCancelled: that metric ranks shops on cancellations they caused.
-    await bumpMetrics(client, order.vendor_id, { openOrders: -1 });
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-
-  // Both run after the commit on their own connections, matching the vendor
-  // path: a failure here leaves work for the next attempt rather than undoing
-  // a cancellation the customer has already been told about.
-  await settleStockForOrder(cancelled.id, 'release', {
-    userId: req.user.id,
-    note: 'Order cancelled by the customer',
-  });
-  await settleCodForOrder(cancelled.id);
-
-  const refund = await requestRefundForCancelledOrder(cancelled, req.user.id);
-  res.json({ ...cancelled, refund });
+  if (!orderRows[0]) return res.status(404).json({ message: 'Order not found' });
+  const { rows } = await pool.query(
+    `SELECT id, reference, status, reason_code, reason_note, order_status_at_request, fee_cents, refund_cents,
+            decision_note, created_at, decided_at
+     FROM order_cancellations WHERE order_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [req.params.id]
+  );
+  res.json({ latest: rows[0] ?? null, policy: await cancellations.customerPolicy(orderRows[0]) });
 }
 
-/**
- * Raises a refund request for money already captured on a cancelled order.
- *
- * Only requests it — the row lands as 'pending' and payment totals are left
- * alone. Marking the payment refunded is the admin's act of actually sending
- * the money back, and claiming it here would record a refund that never
- * happened. COD and unpaid orders have nothing captured and return null.
- */
-async function requestRefundForCancelledOrder(order, userId) {
-  if (!order.checkout_group_id) return null;
-
-  const { rows } = await pool.query(
-    `SELECT id, amount_captured_cents, amount_refunded_cents
-     FROM payments WHERE checkout_group_id = $1 AND method <> 'cod'`,
-    [order.checkout_group_id]
-  );
-  const payment = rows[0];
-  if (!payment || payment.amount_captured_cents <= 0) return null;
-
-  // Never ask for more than is still refundable on the purchase — other shops
-  // in the same group may already have refunds raised against it.
-  const remaining = payment.amount_captured_cents - payment.amount_refunded_cents;
-  const amountCents = Math.min(order.total_cents, remaining);
-  if (amountCents <= 0) return null;
-
-  const client = await pool.connect();
+async function withdrawCancellation(req, res) {
   try {
-    await client.query('BEGIN');
-    const { rows: refundRows } = await client.query(
-      `INSERT INTO refunds (payment_id, order_id, amount_cents, reason, requested_by_user_id)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [payment.id, order.id, amountCents, 'Order cancelled by the customer', userId]
-    );
-    const refund = refundRows[0];
-    await client.query(
-      `INSERT INTO refund_transactions (refund_id, event, amount_cents, actor_role, changed_by_user_id, note)
-       VALUES ($1, 'requested', $2, 'customer', $3, $4)`,
-      [refund.id, amountCents, userId, 'Order cancelled by the customer']
-    );
-    await client.query('COMMIT');
-    return refund;
+    res.json(await cancellations.withdraw({ orderId: req.params.id, userId: req.user.id }));
   } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
+    cancellationFailed(res, err);
   }
 }
 
@@ -777,6 +821,8 @@ module.exports = {
   getOrder,
   updateStatus,
   cancelOrder,
+  getCancellation,
+  withdrawCancellation,
   STATUS_FLOW,
   deriveGroupStatus,
   recordStatusChange,

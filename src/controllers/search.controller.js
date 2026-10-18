@@ -12,7 +12,7 @@ const pool = require('../config/db');
 const AVERAGE_SPEED_KMPH = 20;
 const DEFAULT_PREPARATION_MINUTES = 30;
 
-const SORTS = ['relevance', 'price_asc', 'price_desc', 'newest', 'discount', 'nearest', 'fastest', 'rating'];
+const SORTS = ['relevance', 'price_asc', 'price_desc', 'newest', 'discount', 'nearest', 'fastest', 'rating', 'popular'];
 
 /**
  * Derived columns every listing row needs, as SQL.
@@ -98,6 +98,8 @@ function buildFilters(query) {
     conditions.push(`p.category = (SELECT c.name FROM categories c WHERE c.id = ${push(Number(query.categoryId))})`);
   }
   if (query.vendorId) conditions.push(`p.vendor_id = ${push(Number(query.vendorId))}`);
+  // Sub-category within the category (Men / Women / Mobiles …), any case.
+  if (query.subcategory) conditions.push(`lower(p.subcategory) = lower(${push(String(query.subcategory))})`);
 
   // Dynamic attribute filters, e.g. attr[3]=7 -> "has a variant with
   // attribute_value_id 7 from attribute 3". Vendor-agnostic and category-
@@ -182,6 +184,9 @@ function orderBy(sort, hasQuery) {
       return 'eta_minutes ASC NULLS LAST, p.created_at DESC';
     case 'rating':
       return 'vendor_rating DESC NULLS LAST, p.created_at DESC';
+    case 'popular':
+      // Units sold across the product's stock rows; newest first among equals.
+      return '(SELECT COALESCE(SUM(i.sold_qty), 0) FROM inventory i WHERE i.product_id = p.id) DESC, p.created_at DESC';
     case 'relevance':
     default:
       // Nothing to be relevant to without a search term, so recency stands in.
@@ -262,6 +267,20 @@ async function loadFacets(query) {
   delete priceScope.maxPriceCents;
   const priceRangeScope = buildFilters(priceScope);
 
+  // Sub-categories belong to a category, so they are offered once one is
+  // chosen; counted without the sub-category filter itself.
+  const withoutSubcategory = { ...query };
+  delete withoutSubcategory.subcategory;
+  const subcategoryScope = buildFilters(withoutSubcategory);
+  const subcategoriesPromise = query.category || query.categoryId
+    ? pool.query(
+        `SELECT p.subcategory AS name, COUNT(*)::int AS count
+         FROM products p ${JOINS} ${subcategoryScope.where} AND p.subcategory IS NOT NULL AND p.subcategory <> ''
+         GROUP BY p.subcategory ORDER BY count DESC, p.subcategory ASC`,
+        subcategoryScope.params
+      )
+    : Promise.resolve({ rows: [] });
+
   // Attribute facets (RAM, size, fabric, ...) only make sense once the
   // customer has narrowed to one category — a mixed catalogue has no shared
   // attribute set to offer chips for. Scoped to the full current filter set
@@ -285,7 +304,7 @@ async function loadFacets(query) {
       )
     : Promise.resolve({ rows: [] });
 
-  const [brands, categories, price, attributeRows] = await Promise.all([
+  const [brands, categories, price, attributeRows, subcategories] = await Promise.all([
     pool.query(
       `SELECT b.id, b.name, COUNT(*)::int AS count
        FROM products p ${JOINS} ${brandScope.where} AND p.brand_id IS NOT NULL
@@ -304,6 +323,7 @@ async function loadFacets(query) {
       priceRangeScope.params
     ),
     attributesPromise,
+    subcategoriesPromise,
   ]);
 
   // Group the flat value rows back into one entry per attribute, in the
@@ -319,6 +339,7 @@ async function loadFacets(query) {
   return {
     brands: brands.rows,
     categories: categories.rows,
+    subcategories: subcategories.rows,
     priceRange: {
       minPriceCents: price.rows[0]?.min_price_cents ?? 0,
       maxPriceCents: price.rows[0]?.max_price_cents ?? 0,

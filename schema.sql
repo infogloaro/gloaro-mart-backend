@@ -298,6 +298,8 @@ CREATE TABLE IF NOT EXISTS categories (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_categories_active_sort ON categories(is_active, sort_order);
+-- Optional picture for the app's category tiles (scripts/migrate-category-images.js).
+ALTER TABLE categories ADD COLUMN IF NOT EXISTS image_url TEXT;
 
 INSERT INTO categories (name, icon_key, sort_order) VALUES
   ('Gadgets', 'devices', 0),
@@ -1447,3 +1449,1883 @@ CREATE TABLE IF NOT EXISTS admin_password_otps (
 );
 
 CREATE INDEX IF NOT EXISTS idx_admin_password_otps_user ON admin_password_otps(user_id, created_at DESC);
+
+-- ===== PLATFORM REGISTRY (PHASE 27) =====
+--
+-- Super admin's catalogue of e-commerce capabilities: integrations, sales
+-- channels, campaigns and so on. Categories and entries are data, so adding
+-- "Marketing Platforms → Google Ads" needs no code change.
+--
+-- An entry here is a record, not a connection. integration_method says how it
+-- is meant to work; connector_key names the server code that actually talks
+-- to the provider, and stays NULL until such a connector exists. Nothing may
+-- be shown as "connected" on the strength of a row in this table alone.
+CREATE TABLE IF NOT EXISTS platform_categories (
+  id SERIAL PRIMARY KEY,
+  slug VARCHAR(60) NOT NULL UNIQUE,
+  name VARCHAR(120) NOT NULL,
+  description TEXT,
+  icon_key VARCHAR(40) NOT NULL DEFAULT 'puzzle',
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  -- Seeded categories can be renamed or hidden but not deleted: later phases
+  -- hang permissions and management screens off their slugs.
+  is_system BOOLEAN NOT NULL DEFAULT FALSE,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS platforms (
+  id SERIAL PRIMARY KEY,
+  category_id INTEGER NOT NULL REFERENCES platform_categories(id) ON DELETE RESTRICT,
+  slug VARCHAR(80) NOT NULL UNIQUE,
+  name VARCHAR(120) NOT NULL,
+  description TEXT,
+  logo_url TEXT,
+  integration_method VARCHAR(20) NOT NULL DEFAULT 'manual'
+    CHECK (integration_method IN ('api', 'webhook', 'connector', 'manual')),
+  connector_key VARCHAR(60),
+  status VARCHAR(20) NOT NULL DEFAULT 'inactive'
+    CHECK (status IN ('draft', 'inactive', 'active')),
+  capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_platforms_category ON platforms(category_id, sort_order, name);
+CREATE INDEX IF NOT EXISTS idx_platforms_status ON platforms(status);
+
+INSERT INTO platform_categories (slug, name, description, icon_key, sort_order, is_system) VALUES
+  ('integrations', 'Integrations', 'Payment gateways, shipping APIs, ERP, CRM, WhatsApp, email and analytics.', 'puzzle', 10, TRUE),
+  ('sales_channels', 'Sales Channels', 'Website, mobile app, marketplaces, social commerce and POS.', 'store', 20, TRUE),
+  ('campaigns', 'Campaigns & Promotions', 'Discount campaigns, coupons, flash sales, loyalty and referral programs.', 'megaphone', 30, TRUE),
+  ('marketplaces', 'Marketplace Platforms', 'Multi-vendor marketplace connections, external storefronts and product synchronization.', 'globe', 40, TRUE),
+  ('fulfilment', 'Delivery & Fulfillment', 'Delivery partners, shipping providers, warehouse systems and tracking services.', 'truck', 50, TRUE),
+  ('finance', 'Payments & Finance', 'Payment providers, settlement systems, commissions, billing and reconciliation.', 'wallet', 60, TRUE),
+  ('engagement', 'Customer Engagement', 'WhatsApp, SMS, email, push notifications, loyalty and customer engagement tools.', 'bell', 70, TRUE),
+  ('catalog_services', 'Product & Catalog Services', 'Product feeds, catalog synchronization, inventory connections and pricing services.', 'box', 80, TRUE),
+  ('analytics', 'Analytics & Tracking', 'Analytics providers, conversion tracking, attribution and reporting.', 'chart', 90, TRUE),
+  ('custom', 'Custom Platforms', 'New platform categories and custom capabilities as business needs change.', 'sparkles', 100, TRUE)
+ON CONFLICT (slug) DO NOTHING;
+
+-- ===== PLATFORM CONNECTIONS (PHASE 28) =====
+--
+-- config_schema lists the settings a platform needs (key, label, type,
+-- required, secret), so its settings form is generated rather than built per
+-- provider. Each platform keeps one connection per environment; the one named
+-- by platforms.environment is the one in use.
+--
+-- Secret values live only in secrets_encrypted: AES-256-GCM, keyed by
+-- PLATFORM_SECRETS_KEY from the server environment. The API never sends them
+-- back, only which keys are set. status stays 'not_connected' until a real
+-- connector has tested the credentials (Phase 4); saving them changes nothing.
+ALTER TABLE platforms ADD COLUMN IF NOT EXISTS config_schema JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE platforms ADD COLUMN IF NOT EXISTS environment VARCHAR(10) NOT NULL DEFAULT 'test';
+DO $$ BEGIN
+  ALTER TABLE platforms ADD CONSTRAINT platforms_environment_check CHECK (environment IN ('test', 'live'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+CREATE TABLE IF NOT EXISTS platform_connections (
+  id SERIAL PRIMARY KEY,
+  platform_id INTEGER NOT NULL REFERENCES platforms(id) ON DELETE CASCADE,
+  environment VARCHAR(10) NOT NULL CHECK (environment IN ('test', 'live')),
+  config JSONB NOT NULL DEFAULT '{}'::jsonb,
+  secrets_encrypted TEXT,
+  status VARCHAR(20) NOT NULL DEFAULT 'not_connected'
+    CHECK (status IN ('not_connected', 'connected', 'error')),
+  last_tested_at TIMESTAMPTZ,
+  last_error TEXT,
+  updated_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (platform_id, environment)
+);
+-- Names of the secrets that are set (never their values), so the panel can show
+-- "API key: set" without decrypting anything just to render a page.
+ALTER TABLE platform_connections ADD COLUMN IF NOT EXISTS secret_keys JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- ===== PLATFORM CONNECTORS (PHASE 29) =====
+--
+-- Every exchange a connector has with its provider — a connection test, an
+-- incoming webhook, a sync run — leaves a row here, so the panel can show what
+-- happened without anyone reading server logs. Rows never hold credentials;
+-- detail is a short, already-redacted summary.
+CREATE TABLE IF NOT EXISTS platform_sync_logs (
+  id BIGSERIAL PRIMARY KEY,
+  platform_id INTEGER NOT NULL REFERENCES platforms(id) ON DELETE CASCADE,
+  environment VARCHAR(10) NOT NULL CHECK (environment IN ('test', 'live')),
+  kind VARCHAR(20) NOT NULL CHECK (kind IN ('test', 'webhook', 'sync')),
+  status VARCHAR(10) NOT NULL CHECK (status IN ('ok', 'error', 'rejected')),
+  event VARCHAR(120),
+  message TEXT,
+  detail JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_platform_sync_logs_platform ON platform_sync_logs(platform_id, created_at DESC);
+
+-- ===== APPROVAL WORKFLOWS (PHASE 30) =====
+--
+-- Sensitive admin actions can be set to wait for a super admin's sign-off.
+-- A rule switches that on per action. While on, the same request from staff
+-- who are not super admin is stored as a pending approval instead of applied;
+-- approving replays it through the normal code path, so it is validated again
+-- against the state at that moment. Super admins act directly: they are the
+-- approvers, and requiring a second one could lock out a solo super admin.
+--
+-- payload holds the request minus anything secret; payload_encrypted holds the
+-- full request (secretBox) when it carries credentials, such as Live settings.
+CREATE TABLE IF NOT EXISTS approval_rules (
+  action VARCHAR(60) PRIMARY KEY,
+  label VARCHAR(160) NOT NULL,
+  description TEXT,
+  requires_approval BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO approval_rules (action, label, description, requires_approval) VALUES
+  ('platform.go_live', 'Turn on a platform with Live settings',
+   'Enabling a platform that uses its Live settings, or switching an enabled platform to Live.', TRUE),
+  ('platform.live_settings', 'Save Live settings',
+   'Saving or changing the Live credentials of a platform.', TRUE),
+  ('role.permissions', 'Change a role''s permissions',
+   'Creating a role with permissions, or changing what an existing role may do.', FALSE)
+ON CONFLICT (action) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS approval_requests (
+  id SERIAL PRIMARY KEY,
+  action VARCHAR(60) NOT NULL REFERENCES approval_rules(action),
+  entity_type VARCHAR(40) NOT NULL,
+  entity_id VARCHAR(40),
+  summary TEXT NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  payload_encrypted TEXT,
+  status VARCHAR(12) NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled', 'failed')),
+  requested_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  decided_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  decision_note TEXT,
+  result_message TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  decided_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status, created_at DESC);
+-- One open request per action and thing, so the queue can't fill with duplicates.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_requests_one_pending
+  ON approval_requests(action, entity_type, COALESCE(entity_id, '')) WHERE status = 'pending';
+
+-- ===== PLATFORM MONITORING & CHANNELS (PHASE 31) =====
+--
+-- Which sales channel an order came through: a Platform Registry entry with
+-- the "orders" capability (website, mobile app, a marketplace...). Set at
+-- checkout from the X-Sales-Channel header; NULL for orders placed before
+-- channels existed or from a client that doesn't say. A channel deleted from
+-- the registry leaves its orders unattributed rather than blocking the delete.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS sales_channel_id INTEGER REFERENCES platforms(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_sales_channel ON orders(sales_channel_id, created_at DESC);
+
+-- ===== HOME SECTIONS (PHASE 32) =====
+--
+-- The app's home screen as an ordered list of sections. Each section has a
+-- type that fixes what it holds; hand-picked sections keep their items in
+-- home_section_items (ref_id points at a category, shop, product or banner
+-- depending on the type), "local_deals" fills itself from live discounts.
+-- A section is on screen only when switched on, inside its optional window
+-- and not empty.
+CREATE TABLE IF NOT EXISTS home_sections (
+  id SERIAL PRIMARY KEY,
+  type VARCHAR(30) NOT NULL CHECK (type IN
+    ('featured_categories', 'featured_vendors', 'local_deals', 'b2b_promotions', 'product_carousel', 'banner_strip')),
+  title VARCHAR(120) NOT NULL,
+  subtitle VARCHAR(200),
+  audience VARCHAR(10) NOT NULL DEFAULT 'all' CHECK (audience IN ('all', 'b2c', 'b2b')),
+  layout VARCHAR(10) NOT NULL DEFAULT 'carousel' CHECK (layout IN ('grid', 'carousel', 'list')),
+  max_items INTEGER NOT NULL DEFAULT 10 CHECK (max_items BETWEEN 1 AND 50),
+  is_active BOOLEAN NOT NULL DEFAULT FALSE,
+  starts_at TIMESTAMPTZ,
+  ends_at TIMESTAMPTZ,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  updated_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS home_section_items (
+  id SERIAL PRIMARY KEY,
+  section_id INTEGER NOT NULL REFERENCES home_sections(id) ON DELETE CASCADE,
+  ref_id INTEGER NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (section_id, ref_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_home_sections_order ON home_sections(sort_order, id);
+
+-- ===== CAMPAIGNS (PHASE 33) =====
+--
+-- Marketplace discount campaigns. state is what an admin set (draft, active,
+-- paused, ended); the status shown — scheduled / running / ended — is worked
+-- out from state, the dates and the budget. Spend is never stored: it is the
+-- sum of campaign discounts on orders that weren't cancelled, so a cancelled
+-- order hands its discount back to the budget by itself.
+--
+-- Who pays decides who takes part: a platform-funded campaign runs for every
+-- matching order; vendor- or shared-funded ones run only for shops that opted
+-- in (campaign_participants.opted_in).
+CREATE TABLE IF NOT EXISTS campaigns (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  description TEXT,
+  scope VARCHAR(10) NOT NULL CHECK (scope IN ('platform', 'category', 'vendor')),
+  discount_type VARCHAR(15) NOT NULL CHECK (discount_type IN ('percentage', 'flat', 'free_delivery')),
+  -- Percent for 'percentage', cents for 'flat', unused for 'free_delivery'.
+  discount_value INTEGER NOT NULL DEFAULT 0 CHECK (discount_value >= 0),
+  max_discount_cents INTEGER CHECK (max_discount_cents IS NULL OR max_discount_cents > 0),
+  min_order_cents INTEGER NOT NULL DEFAULT 0 CHECK (min_order_cents >= 0),
+  starts_at TIMESTAMPTZ NOT NULL,
+  ends_at TIMESTAMPTZ NOT NULL,
+  funded_by VARCHAR(10) NOT NULL CHECK (funded_by IN ('platform', 'vendor', 'shared')),
+  platform_share_percent INTEGER CHECK (platform_share_percent IS NULL OR platform_share_percent BETWEEN 0 AND 100),
+  budget_cents INTEGER CHECK (budget_cents IS NULL OR budget_cents > 0),
+  banner_url TEXT,
+  state VARCHAR(10) NOT NULL DEFAULT 'draft' CHECK (state IN ('draft', 'active', 'paused', 'ended')),
+  ended_at TIMESTAMPTZ,
+  created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (ends_at > starts_at)
+);
+
+CREATE TABLE IF NOT EXISTS campaign_participants (
+  id SERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+  type VARCHAR(10) NOT NULL CHECK (type IN ('vendor', 'category')),
+  ref_id INTEGER NOT NULL,
+  opted_in BOOLEAN NOT NULL DEFAULT FALSE,
+  joined_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (campaign_id, type, ref_id)
+);
+
+-- One campaign per order at most; the discount and who funds it, frozen at checkout.
+CREATE TABLE IF NOT EXISTS order_campaigns (
+  order_id INTEGER PRIMARY KEY REFERENCES orders(id) ON DELETE CASCADE,
+  campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,
+  discount_cents INTEGER NOT NULL CHECK (discount_cents > 0),
+  platform_cents INTEGER NOT NULL,
+  vendor_cents INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_order_campaigns_campaign ON order_campaigns(campaign_id);
+
+-- orders.discount_cents stays the total discount (coupon + campaign), so totals,
+-- groups and payments need no change; this column is the campaign's part of it.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS campaign_discount_cents INTEGER NOT NULL DEFAULT 0;
+
+-- ===== REVIEWS & RATINGS (PHASE 34) =====
+--
+-- Phase 13's shop ratings grow into product reviews with moderation. The table
+-- keeps its Phase 13 name so that block can still be re-run; `target` says
+-- whether a row is about the shop or about one product.
+--
+-- Verified = tied to a delivered order. Shop reviews always are. A product
+-- review is verified when the author has a delivered order containing it, and
+-- goes live at once; an unverified one waits in the admin queue (pending).
+-- 'flagged' is not stored: it is a published review with open reports.
+-- Only published reviews count towards the shop and product averages.
+ALTER TABLE vendor_reviews ADD COLUMN IF NOT EXISTS target VARCHAR(10) NOT NULL DEFAULT 'vendor';
+ALTER TABLE vendor_reviews ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id) ON DELETE CASCADE;
+ALTER TABLE vendor_reviews ADD COLUMN IF NOT EXISTS title VARCHAR(120);
+ALTER TABLE vendor_reviews ADD COLUMN IF NOT EXISTS photos JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE vendor_reviews ADD COLUMN IF NOT EXISTS status VARCHAR(10) NOT NULL DEFAULT 'published';
+ALTER TABLE vendor_reviews ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
+ALTER TABLE vendor_reviews ADD COLUMN IF NOT EXISTS moderated_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE vendor_reviews ADD COLUMN IF NOT EXISTS moderated_at TIMESTAMPTZ;
+ALTER TABLE vendor_reviews ADD COLUMN IF NOT EXISTS vendor_reply TEXT;
+ALTER TABLE vendor_reviews ADD COLUMN IF NOT EXISTS vendor_replied_at TIMESTAMPTZ;
+
+-- An unverified product review has no order behind it.
+ALTER TABLE vendor_reviews ALTER COLUMN order_id DROP NOT NULL;
+-- One shop review per order still holds, but only for shop reviews: an order
+-- of three products can earn three product reviews as well.
+ALTER TABLE vendor_reviews DROP CONSTRAINT IF EXISTS vendor_reviews_order_id_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vendor_reviews_shop_order
+  ON vendor_reviews (order_id) WHERE target = 'vendor';
+-- One review per customer per product; buying it again updates that review.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vendor_reviews_product_author
+  ON vendor_reviews (product_id, user_id) WHERE target = 'product';
+CREATE INDEX IF NOT EXISTS idx_vendor_reviews_status ON vendor_reviews (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_vendor_reviews_product
+  ON vendor_reviews (product_id, created_at DESC) WHERE target = 'product';
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'vendor_reviews_target_check') THEN
+    ALTER TABLE vendor_reviews ADD CONSTRAINT vendor_reviews_target_check CHECK (
+      (target = 'vendor' AND product_id IS NULL AND order_id IS NOT NULL)
+      OR (target = 'product' AND product_id IS NOT NULL)
+    );
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'vendor_reviews_status_check') THEN
+    ALTER TABLE vendor_reviews ADD CONSTRAINT vendor_reviews_status_check
+      CHECK (status IN ('pending', 'published', 'rejected'));
+  END IF;
+END $$;
+
+-- A customer telling the admins a published review breaks the rules. Open
+-- until an admin either takes the review down (upheld) or clears it (dismissed).
+CREATE TABLE IF NOT EXISTS review_reports (
+  id SERIAL PRIMARY KEY,
+  review_id INTEGER NOT NULL REFERENCES vendor_reviews(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  reason VARCHAR(500) NOT NULL,
+  resolution VARCHAR(10) CHECK (resolution IN ('dismissed', 'upheld')),
+  resolved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  resolved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (review_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_reports_open ON review_reports (review_id) WHERE resolved_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS review_helpful (
+  review_id INTEGER NOT NULL REFERENCES vendor_reviews(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (review_id, user_id)
+);
+
+-- The product's published rating, kept on the row so listings show stars
+-- without a join. Rebuilt from the reviews whenever one changes.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS rating_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS rating_average NUMERIC(3,2);
+
+-- Sub-category within the category (Fashion → Men / Women, Gadgets → Mobiles …);
+-- search filters by it and returns facets.subcategories (scripts/migrate-subcategories.js).
+ALTER TABLE products ADD COLUMN IF NOT EXISTS subcategory TEXT;
+CREATE INDEX IF NOT EXISTS idx_products_category_subcategory ON products(category, lower(subcategory));
+
+-- Both aggregates rebuilt from published reviews only.
+UPDATE vendor_performance_metrics m
+SET rating_sum = COALESCE(r.total, 0), rating_count = COALESCE(r.count, 0), updated_at = now()
+FROM vendor_performance_metrics m2
+LEFT JOIN (
+  SELECT vendor_id, SUM(rating)::numeric AS total, COUNT(*)::int AS count
+  FROM vendor_reviews WHERE target = 'vendor' AND status = 'published' GROUP BY vendor_id
+) r ON r.vendor_id = m2.vendor_id
+WHERE m.vendor_id = m2.vendor_id;
+
+UPDATE products p
+SET rating_count = COALESCE(r.count, 0), rating_average = r.average
+FROM products p2
+LEFT JOIN (
+  SELECT product_id, COUNT(*)::int AS count, ROUND(AVG(rating), 2) AS average
+  FROM vendor_reviews WHERE target = 'product' AND status = 'published' GROUP BY product_id
+) r ON r.product_id = p2.id
+WHERE p.id = p2.id;
+
+-- ===== CANCELLATIONS (PHASE 35) =====
+--
+-- What can still be called off depends on how far the order has travelled:
+-- one rule per stage (delivered is a return, not a cancellation). A customer
+-- or vendor allowed at that stage cancels straight away when auto_approve is
+-- on (a vendor allowed always does — holding a shop's "I can't fill this" in a
+-- queue doesn't get the order delivered); otherwise the request waits for an
+-- admin. Asking where the rules say no is still recorded, as ineligible, so an
+-- admin can override.
+--
+-- The fee is the customer's: charged only on cancellations they asked for,
+-- only out of money actually paid, and an admin can waive it. Every cancelled
+-- order gets a row here, whoever cancelled it, so this is the full record.
+CREATE TABLE IF NOT EXISTS cancellation_rules (
+  order_status VARCHAR(20) PRIMARY KEY
+    CHECK (order_status IN ('pending', 'confirmed', 'packed', 'out_for_delivery')),
+  customer_allowed BOOLEAN NOT NULL,
+  vendor_allowed BOOLEAN NOT NULL,
+  auto_approve BOOLEAN NOT NULL,
+  fee_percent NUMERIC(5,2) NOT NULL DEFAULT 0 CHECK (fee_percent BETWEEN 0 AND 100),
+  restock BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ
+);
+
+-- Defaults keep today's behaviour where it existed (customer cancels a
+-- pending order at once; a shop can cancel before it ships) and send the rest
+-- to the queue.
+INSERT INTO cancellation_rules (order_status, customer_allowed, vendor_allowed, auto_approve, fee_percent, restock) VALUES
+  ('pending',          TRUE,  TRUE,  TRUE,  0, TRUE),
+  ('confirmed',        TRUE,  TRUE,  FALSE, 0, TRUE),
+  ('packed',           TRUE,  TRUE,  FALSE, 5, TRUE),
+  ('out_for_delivery', FALSE, FALSE, FALSE, 10, FALSE)
+ON CONFLICT (order_status) DO NOTHING;
+
+-- CXL-2026-00001, from a sequence for the same reason checkout groups use one.
+CREATE SEQUENCE IF NOT EXISTS order_cancellation_ref_seq;
+
+CREATE TABLE IF NOT EXISTS order_cancellations (
+  id SERIAL PRIMARY KEY,
+  reference TEXT NOT NULL UNIQUE,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  requested_by VARCHAR(10) NOT NULL CHECK (requested_by IN ('customer', 'vendor', 'admin', 'system')),
+  requested_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  order_status_at_request VARCHAR(20) NOT NULL,
+  reason_code VARCHAR(30) NOT NULL,
+  reason_note TEXT,
+  status VARCHAR(15) NOT NULL
+    CHECK (status IN ('requested', 'approved', 'auto_approved', 'rejected', 'withdrawn')),
+  -- Whether the rules allowed it when asked; approving an ineligible one is an override.
+  eligible BOOLEAN NOT NULL,
+  -- The terms it was raised under; later rule changes don't touch them.
+  fee_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+  restock BOOLEAN NOT NULL DEFAULT TRUE,
+  -- Settled when the order is actually cancelled.
+  fee_cents INTEGER NOT NULL DEFAULT 0,
+  refund_cents INTEGER NOT NULL DEFAULT 0,
+  refund_id INTEGER REFERENCES refunds(id) ON DELETE SET NULL,
+  decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  decided_at TIMESTAMPTZ,
+  decision_note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_order_cancellations_one_open
+  ON order_cancellations (order_id) WHERE status = 'requested';
+CREATE INDEX IF NOT EXISTS idx_order_cancellations_status ON order_cancellations (status, created_at);
+
+-- ===== SUPPORT TICKETS (PHASE 36) =====
+--
+-- A conversation with a clock on it. Customers and vendors open tickets from
+-- the app; staff answer them in the admin panel. The first reply and the
+-- resolution each have a deadline set from the priority (services/support.js);
+-- changing the priority moves both, counted from when the ticket was opened.
+--
+-- Internal messages are staff notes: never sent to or listed for the requester.
+-- 'pending_customer' / 'pending_vendor' mean we are waiting on someone else; a
+-- reply from the requester puts the ticket back to 'open'. 'closed' is final.
+CREATE SEQUENCE IF NOT EXISTS support_ticket_ref_seq;
+
+CREATE TABLE IF NOT EXISTS support_tickets (
+  id SERIAL PRIMARY KEY,
+  reference TEXT NOT NULL UNIQUE,
+  requester_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  requester_type VARCHAR(10) NOT NULL CHECK (requester_type IN ('customer', 'vendor')),
+  -- The shop involved: the requester's own for a vendor, the order's for a customer.
+  vendor_id INTEGER REFERENCES vendor_profiles(id) ON DELETE SET NULL,
+  order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+  subject VARCHAR(160) NOT NULL,
+  category VARCHAR(10) NOT NULL
+    CHECK (category IN ('order', 'payment', 'delivery', 'vendor', 'product', 'account', 'other')),
+  priority VARCHAR(10) NOT NULL DEFAULT 'normal' CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+  status VARCHAR(20) NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open', 'pending_customer', 'pending_vendor', 'resolved', 'closed')),
+  assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  first_response_due_at TIMESTAMPTZ,
+  first_responded_at TIMESTAMPTZ,
+  resolution_due_at TIMESTAMPTZ,
+  resolved_at TIMESTAMPTZ,
+  last_message_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_message_from VARCHAR(10) NOT NULL DEFAULT 'customer'
+    CHECK (last_message_from IN ('customer', 'vendor', 'admin', 'system')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets (status, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_support_tickets_requester ON support_tickets (requester_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_support_tickets_assignee ON support_tickets (assignee_id) WHERE status NOT IN ('resolved', 'closed');
+
+CREATE TABLE IF NOT EXISTS support_ticket_messages (
+  id SERIAL PRIMARY KEY,
+  ticket_id INTEGER NOT NULL REFERENCES support_tickets(id) ON DELETE CASCADE,
+  author_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  author_role VARCHAR(10) NOT NULL CHECK (author_role IN ('customer', 'vendor', 'admin', 'system')),
+  body TEXT NOT NULL,
+  internal BOOLEAN NOT NULL DEFAULT FALSE,
+  attachments JSONB NOT NULL DEFAULT '[]',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (NOT internal OR author_role IN ('admin', 'system'))
+);
+CREATE INDEX IF NOT EXISTS idx_support_ticket_messages_ticket ON support_ticket_messages (ticket_id, created_at);
+
+-- ===== SHIPMENTS (PHASE 37) =====
+--
+-- The physical movement of one shop order's goods, tracked apart from the
+-- order. A shipment is opened when the order is packed and follows the order
+-- from then on (services/shipments.js); scans recorded by staff move the order
+-- forward in turn (out for delivery, delivered).
+--
+-- A failed delivery closes its shipment and opens the next attempt for the
+-- same order (attempt_count + 1, previous_shipment_id), so every attempt keeps
+-- its own trail. A parcel returned to the shop cancels the order and restocks.
+-- Events are append-only: a wrong scan is corrected by adding the right one.
+CREATE SEQUENCE IF NOT EXISTS shipment_tracking_seq;
+
+CREATE TABLE IF NOT EXISTS shipments (
+  id SERIAL PRIMARY KEY,
+  tracking_number TEXT NOT NULL UNIQUE,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  status VARCHAR(20) NOT NULL DEFAULT 'created'
+    CHECK (status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery', 'delivered', 'failed', 'returned', 'cancelled')),
+  -- Who carries it. Free text until delivery partners have their own records.
+  partner_name TEXT,
+  partner_phone TEXT,
+  external_tracking_id TEXT,
+  tracking_url TEXT,
+  package_count INTEGER NOT NULL DEFAULT 1 CHECK (package_count >= 1),
+  weight_grams INTEGER CHECK (weight_grams IS NULL OR weight_grams > 0),
+  -- Cash the rider collects; NULL when paid online.
+  cod_amount_cents INTEGER,
+  dispatched_at TIMESTAMPTZ,
+  estimated_delivery_at TIMESTAMPTZ,
+  delivered_at TIMESTAMPTZ,
+  attempt_count INTEGER NOT NULL DEFAULT 1,
+  previous_shipment_id INTEGER REFERENCES shipments(id) ON DELETE SET NULL,
+  failure_reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- At most one shipment on the road per order.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shipments_one_open ON shipments (order_id)
+  WHERE status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery');
+CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments (status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS shipment_events (
+  id SERIAL PRIMARY KEY,
+  shipment_id INTEGER NOT NULL REFERENCES shipments(id) ON DELETE CASCADE,
+  status VARCHAR(20) NOT NULL,
+  description TEXT,
+  location TEXT,
+  actor_role VARCHAR(10) CHECK (actor_role IN ('customer', 'vendor', 'partner', 'admin', 'system')),
+  actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_shipment_events_shipment ON shipment_events (shipment_id, occurred_at DESC);
+
+-- Backfill: orders already packed, on the road or delivered get the shipment
+-- they would have had, with one event per step the order history records.
+INSERT INTO shipments (tracking_number, order_id, vendor_id, status, partner_name, partner_phone,
+                       cod_amount_cents, dispatched_at, estimated_delivery_at, delivered_at, created_at)
+SELECT 'GMS-' || to_char(o.created_at, 'YYYY') || '-' || lpad(nextval('shipment_tracking_seq')::text, 6, '0'),
+       -- 'packed' is the order's word for a shipment that was just created.
+       o.id, o.vendor_id, CASE o.status WHEN 'packed' THEN 'created' ELSE o.status END,
+       o.delivery_partner_name, o.delivery_partner_phone,
+       CASE WHEN COALESCE(p.method, 'cod') = 'cod' THEN o.total_cents END,
+       (SELECT MIN(h.created_at) FROM order_status_history h WHERE h.order_id = o.id AND h.to_status = 'out_for_delivery'),
+       o.estimated_delivery_at,
+       CASE WHEN o.status = 'delivered' THEN COALESCE(
+         (SELECT MAX(h.created_at) FROM order_status_history h WHERE h.order_id = o.id AND h.to_status = 'delivered'), o.updated_at) END,
+       COALESCE((SELECT MIN(h.created_at) FROM order_status_history h WHERE h.order_id = o.id AND h.to_status = 'packed'), o.updated_at)
+FROM orders o
+LEFT JOIN payments p ON p.checkout_group_id = o.checkout_group_id
+WHERE o.status IN ('packed', 'out_for_delivery', 'delivered')
+  AND NOT EXISTS (SELECT 1 FROM shipments s WHERE s.order_id = o.id);
+
+INSERT INTO shipment_events (shipment_id, status, description, actor_role, occurred_at)
+SELECT s.id, CASE h.to_status WHEN 'packed' THEN 'created' ELSE h.to_status END,
+       'From the order history', 'system', h.created_at
+FROM shipments s
+JOIN order_status_history h ON h.order_id = s.order_id AND h.to_status IN ('packed', 'out_for_delivery', 'delivered')
+WHERE NOT EXISTS (SELECT 1 FROM shipment_events e WHERE e.shipment_id = s.id);
+
+-- ===== DELIVERY PARTNERS (PHASE 38) =====
+--
+-- Riders and courier agencies, added and onboarded by staff (there is no rider
+-- app yet, so "online" is set by staff too). Two things gate giving one work:
+-- paperwork on file and in date (licence and ID proof), and capacity left
+-- today. A shipment is assigned to a partner; its delivered COD shipments are
+-- cash the partner holds until a handover is recorded.
+CREATE TABLE IF NOT EXISTS delivery_partners (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  type VARCHAR(10) NOT NULL DEFAULT 'rider' CHECK (type IN ('rider', 'agency')),
+  phone VARCHAR(20) NOT NULL UNIQUE,
+  email VARCHAR(160),
+  status VARCHAR(10) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'active', 'suspended', 'rejected')),
+  status_reason TEXT,
+  vehicle_type VARCHAR(30),
+  vehicle_number VARCHAR(20),
+  service_areas TEXT[] NOT NULL DEFAULT '{}',
+  is_online BOOLEAN NOT NULL DEFAULT FALSE,
+  daily_capacity INTEGER NOT NULL DEFAULT 20 CHECK (daily_capacity >= 0),
+  onboarded_at TIMESTAMPTZ,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_partners_status ON delivery_partners (status, created_at);
+
+CREATE TABLE IF NOT EXISTS delivery_partner_documents (
+  id SERIAL PRIMARY KEY,
+  partner_id INTEGER NOT NULL REFERENCES delivery_partners(id) ON DELETE CASCADE,
+  type VARCHAR(10) NOT NULL CHECK (type IN ('licence', 'rc', 'insurance', 'id_proof', 'other')),
+  file_url TEXT NOT NULL,
+  status VARCHAR(10) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  expires_at DATE,
+  reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  reviewed_at TIMESTAMPTZ,
+  uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_partner_documents_partner ON delivery_partner_documents (partner_id, uploaded_at DESC);
+
+-- Cash a partner handed over. What they still hold = COD on their delivered
+-- shipments minus these.
+CREATE TABLE IF NOT EXISTS delivery_partner_cod_handovers (
+  id SERIAL PRIMARY KEY,
+  partner_id INTEGER NOT NULL REFERENCES delivery_partners(id) ON DELETE CASCADE,
+  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+  note TEXT,
+  recorded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE shipments ADD COLUMN IF NOT EXISTS partner_id INTEGER REFERENCES delivery_partners(id) ON DELETE SET NULL;
+ALTER TABLE shipments ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_shipments_partner ON shipments (partner_id, status);
+
+-- ===== VENDOR MATCHING RULES (PHASE 39) =====
+--
+-- The admin page's matching rules, enforced: a factor can be switched off
+-- without losing its weight, a vendor beyond the radius is never a candidate,
+-- a shop that hasn't accepted within the window is re-routed (services/
+-- reroute.js, swept every minute by server.js), re-routes can wait for an
+-- admin instead of happening on their own, and an order stops being re-routed
+-- after a set number of attempts.
+--
+-- The accept window only applies to orders placed after it was introduced
+-- (accept_window_since), so switching it on never re-routes old orders.
+ALTER TABLE vendor_matching_weights ADD COLUMN IF NOT EXISTS disabled_factors TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE vendor_matching_weights ADD COLUMN IF NOT EXISTS max_radius_km NUMERIC(6,1) NOT NULL DEFAULT 15 CHECK (max_radius_km > 0);
+ALTER TABLE vendor_matching_weights ADD COLUMN IF NOT EXISTS accept_window_minutes INTEGER NOT NULL DEFAULT 15 CHECK (accept_window_minutes > 0);
+ALTER TABLE vendor_matching_weights ADD COLUMN IF NOT EXISTS auto_reassign BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE vendor_matching_weights ADD COLUMN IF NOT EXISTS max_reassign_attempts INTEGER NOT NULL DEFAULT 2 CHECK (max_reassign_attempts >= 0);
+ALTER TABLE vendor_matching_weights ADD COLUMN IF NOT EXISTS accept_window_since TIMESTAMPTZ NOT NULL DEFAULT now();
+
+-- A run made for an order (re-routing) says which order, which try, and how it ended.
+ALTER TABLE vendor_matching_logs ADD COLUMN IF NOT EXISTS order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL;
+ALTER TABLE vendor_matching_logs ADD COLUMN IF NOT EXISTS attempt INTEGER;
+ALTER TABLE vendor_matching_logs ADD COLUMN IF NOT EXISTS outcome VARCHAR(12)
+  CHECK (outcome IS NULL OR outcome IN ('matched', 'no_vendor', 'reassigned', 'expired'));
+ALTER TABLE vendor_matching_logs ADD COLUMN IF NOT EXISTS reason TEXT;
+ALTER TABLE vendor_matching_logs ADD COLUMN IF NOT EXISTS duration_ms INTEGER;
+CREATE INDEX IF NOT EXISTS idx_vendor_matching_logs_order ON vendor_matching_logs (order_id) WHERE order_id IS NOT NULL;
+
+-- Re-routes waiting for an admin, and the ones an admin turned down.
+ALTER TABLE order_assignment_history DROP CONSTRAINT IF EXISTS order_assignment_history_status_check;
+ALTER TABLE order_assignment_history ADD CONSTRAINT order_assignment_history_status_check
+  CHECK (status IN ('assigned', 'pending_customer', 'pending_admin', 'accepted', 'declined', 'admin_rejected', 'no_alternative'));
+-- Why it started: the shop said no, or let the accept window run out.
+ALTER TABLE order_assignment_history ADD COLUMN IF NOT EXISTS trigger VARCHAR(10) NOT NULL DEFAULT 'rejected'
+  CHECK (trigger IN ('rejected', 'expired'));
+ALTER TABLE order_assignment_history ADD COLUMN IF NOT EXISTS resolved_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE order_assignment_history ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_order_assignment_from_order ON order_assignment_history (from_order_id);
+
+-- ===== INVOICES & GST (PHASE 40) =====
+--
+-- A tax invoice per delivered shop order, issued when the order is delivered
+-- (services/invoices.js) and never edited afterwards: every amount is copied
+-- in at issue. A mistake is cancelled (with a reason) or credit-noted.
+--
+-- Numbering is gapless per Indian financial year (April–March) and never
+-- reused: <invoice_prefix>/<FY>/<n>, e.g. GLM/2026-27/000001, from a counter
+-- row taken under lock — a sequence can skip numbers on rollback.
+--
+-- Place of supply is the delivery state; same state as the shop = CGST + SGST
+-- split in half, different state = IGST. The amounts are what checkout charged:
+-- GST on each line's value, discount taken off after tax, delivery as a 0% line.
+CREATE TABLE IF NOT EXISTS invoice_series (
+  financial_year VARCHAR(7) PRIMARY KEY,
+  last_number INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS invoices (
+  id SERIAL PRIMARY KEY,
+  invoice_number TEXT NOT NULL UNIQUE,
+  invoice_date TIMESTAMPTZ NOT NULL,
+  financial_year VARCHAR(7) NOT NULL,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE RESTRICT,
+  vendor_name TEXT NOT NULL,
+  vendor_gstin TEXT,
+  vendor_state TEXT,
+  vendor_address TEXT,
+  buyer_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  buyer_name TEXT NOT NULL,
+  -- Set for a registered business buyer (B2B); NULL is a B2C sale.
+  buyer_gstin TEXT,
+  billing_address TEXT,
+  shipping_address TEXT,
+  place_of_supply TEXT NOT NULL,
+  supply_type VARCHAR(12) NOT NULL CHECK (supply_type IN ('intra_state', 'inter_state')),
+  taxable_cents INTEGER NOT NULL,
+  cgst_cents INTEGER NOT NULL DEFAULT 0,
+  sgst_cents INTEGER NOT NULL DEFAULT 0,
+  igst_cents INTEGER NOT NULL DEFAULT 0,
+  cess_cents INTEGER NOT NULL DEFAULT 0,
+  discount_cents INTEGER NOT NULL DEFAULT 0,
+  round_off_cents INTEGER NOT NULL DEFAULT 0,
+  total_cents INTEGER NOT NULL,
+  status VARCHAR(10) NOT NULL DEFAULT 'issued' CHECK (status IN ('issued', 'cancelled')),
+  cancelled_at TIMESTAMPTZ,
+  cancel_reason TEXT,
+  cancelled_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  -- Filled by the credit-notes step when one is raised against this invoice.
+  credit_note_number TEXT,
+  pdf_url TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- One live invoice per order; a cancelled one doesn't block re-issuing.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_one_per_order ON invoices (order_id) WHERE status = 'issued';
+CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices (invoice_date DESC);
+
+CREATE TABLE IF NOT EXISTS invoice_lines (
+  id SERIAL PRIMARY KEY,
+  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+  description TEXT NOT NULL,
+  hsn_code TEXT,
+  quantity INTEGER NOT NULL,
+  unit_price_cents INTEGER NOT NULL,
+  discount_cents INTEGER NOT NULL DEFAULT 0,
+  taxable_cents INTEGER NOT NULL,
+  gst_rate_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+  cgst_cents INTEGER NOT NULL DEFAULT 0,
+  sgst_cents INTEGER NOT NULL DEFAULT 0,
+  igst_cents INTEGER NOT NULL DEFAULT 0,
+  cess_cents INTEGER NOT NULL DEFAULT 0,
+  total_cents INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_invoice_lines_invoice ON invoice_lines (invoice_id);
+
+-- ===== CREDIT NOTES (PHASE 41) =====
+--
+-- The only way to reverse an issued invoice: its own gapless number series per
+-- financial year (<prefix>-CN/<FY>/<n>, the counter row keyed 'CN:<FY>' in
+-- invoice_series), lines that point at the invoice lines they reverse, and no
+-- edits once raised — a wrong one is cancelled, which puts the invoice back in full.
+--
+-- Amounts are pro rata on the invoice line (taxable, each tax, the discount), and
+-- crediting the last of a line takes exactly what is left, so a line can never be
+-- credited for more than it was invoiced. The money side: an online payment gets
+-- a refund (an existing unlinked refund on the order is reused — an approved
+-- return's, for instance); COD is settled off-platform, as returns already are.
+-- The counter key now carries a series name ('CN:2026-27'), not just a year.
+ALTER TABLE invoice_series ALTER COLUMN financial_year TYPE VARCHAR(20);
+
+CREATE TABLE IF NOT EXISTS credit_notes (
+  id SERIAL PRIMARY KEY,
+  credit_note_number TEXT NOT NULL UNIQUE,
+  credit_note_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  financial_year VARCHAR(7) NOT NULL,
+  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+  reason VARCHAR(20) NOT NULL CHECK (reason IN ('return', 'cancellation', 'price_adjustment', 'deficiency', 'other')),
+  reason_note TEXT,
+  taxable_cents INTEGER NOT NULL,
+  cgst_cents INTEGER NOT NULL DEFAULT 0,
+  sgst_cents INTEGER NOT NULL DEFAULT 0,
+  igst_cents INTEGER NOT NULL DEFAULT 0,
+  discount_cents INTEGER NOT NULL DEFAULT 0,
+  total_cents INTEGER NOT NULL,
+  status VARCHAR(10) NOT NULL DEFAULT 'issued' CHECK (status IN ('issued', 'cancelled')),
+  refund_id INTEGER REFERENCES refunds(id) ON DELETE SET NULL,
+  return_id INTEGER REFERENCES order_returns(id) ON DELETE SET NULL,
+  pdf_url TEXT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  cancelled_at TIMESTAMPTZ,
+  cancelled_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_credit_notes_invoice ON credit_notes (invoice_id);
+CREATE INDEX IF NOT EXISTS idx_credit_notes_date ON credit_notes (credit_note_date DESC);
+
+CREATE TABLE IF NOT EXISTS credit_note_lines (
+  id SERIAL PRIMARY KEY,
+  credit_note_id INTEGER NOT NULL REFERENCES credit_notes(id) ON DELETE CASCADE,
+  invoice_line_id INTEGER NOT NULL REFERENCES invoice_lines(id) ON DELETE RESTRICT,
+  description TEXT NOT NULL,
+  hsn_code TEXT,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  taxable_cents INTEGER NOT NULL,
+  gst_rate_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+  cgst_cents INTEGER NOT NULL DEFAULT 0,
+  sgst_cents INTEGER NOT NULL DEFAULT 0,
+  igst_cents INTEGER NOT NULL DEFAULT 0,
+  discount_cents INTEGER NOT NULL DEFAULT 0,
+  total_cents INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_credit_note_lines_invoice_line ON credit_note_lines (invoice_line_id);
+
+-- ===== SETTLEMENTS (PHASE 42) =====
+--
+-- What the platform owes each vendor for one weekly cycle (Monday–Sunday, India
+-- time), generated automatically once the week is over (services/settlements.js,
+-- run hourly by server.js and on demand). One settlement per vendor per cycle.
+--
+-- Per order: gross = what the customer paid + the platform-funded share of any
+-- campaign discount (the platform owes the shop that part); commission = the
+-- commission plan's percentage of the goods value (subtotal) + its flat fee.
+-- Deductions: refunds completed in the cycle on the vendor's orders, TDS
+-- (income tax, on gross) and TCS (GST, on the taxable value) at the rates in
+-- settlement_config, and anything a negative cycle carried forward.
+--
+-- pending_approval → approved → paid (UTR, one-way). Hold and fail are side
+-- states. A wrong payout is corrected by an adjustment on a later cycle.
+CREATE TABLE IF NOT EXISTS settlement_config (
+  id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  tds_percent NUMERIC(5,3) NOT NULL DEFAULT 0.1 CHECK (tds_percent BETWEEN 0 AND 10),
+  tcs_percent NUMERIC(5,3) NOT NULL DEFAULT 0.5 CHECK (tcs_percent BETWEEN 0 AND 10),
+  -- Cycles that ended before this are never generated, so switching settlements
+  -- on doesn't create payouts for years of history.
+  generate_from DATE NOT NULL DEFAULT (now() - interval '90 days')::date,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO settlement_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS vendor_bank_accounts (
+  vendor_id INTEGER PRIMARY KEY REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  account_holder VARCHAR(120) NOT NULL,
+  account_number VARCHAR(20) NOT NULL,
+  ifsc VARCHAR(11) NOT NULL,
+  bank_name VARCHAR(120),
+  added_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE SEQUENCE IF NOT EXISTS settlement_ref_seq;
+
+CREATE TABLE IF NOT EXISTS settlements (
+  id SERIAL PRIMARY KEY,
+  reference TEXT NOT NULL UNIQUE,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE RESTRICT,
+  period_start DATE NOT NULL,
+  period_end DATE NOT NULL,
+  order_count INTEGER NOT NULL DEFAULT 0,
+  gross_cents INTEGER NOT NULL DEFAULT 0,
+  commission_cents INTEGER NOT NULL DEFAULT 0,
+  deduction_cents INTEGER NOT NULL DEFAULT 0,
+  adjustment_cents INTEGER NOT NULL DEFAULT 0,
+  net_payable_cents INTEGER NOT NULL DEFAULT 0,
+  status VARCHAR(20) NOT NULL DEFAULT 'pending_approval'
+    CHECK (status IN ('draft', 'pending_approval', 'approved', 'paid', 'on_hold', 'failed')),
+  hold_reason TEXT,
+  failure_reason TEXT,
+  -- Copied at approval, so a later bank change can't redirect an approved payout.
+  bank_account_masked TEXT,
+  bank_account_number TEXT,
+  bank_ifsc TEXT,
+  payout_utr TEXT UNIQUE,
+  paid_at TIMESTAMPTZ,
+  -- A draft whose negative balance was taken into a later settlement.
+  carried_into INTEGER REFERENCES settlements(id) ON DELETE SET NULL,
+  approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  approved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (vendor_id, period_start)
+);
+CREATE INDEX IF NOT EXISTS idx_settlements_status ON settlements (status, period_start DESC);
+
+-- An order is settled once, ever.
+CREATE TABLE IF NOT EXISTS settlement_orders (
+  settlement_id INTEGER NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id) ON DELETE RESTRICT,
+  delivered_at TIMESTAMPTZ,
+  gross_cents INTEGER NOT NULL,
+  commission_cents INTEGER NOT NULL,
+  net_cents INTEGER NOT NULL,
+  PRIMARY KEY (settlement_id, order_id)
+);
+
+CREATE TABLE IF NOT EXISTS settlement_deductions (
+  id SERIAL PRIMARY KEY,
+  settlement_id INTEGER NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  kind VARCHAR(12) NOT NULL CHECK (kind IN ('commission', 'refund', 'tds', 'tcs', 'penalty', 'adjustment', 'other')),
+  label TEXT NOT NULL,
+  -- Positive = taken off the payout; an adjustment can be negative (paid to the vendor).
+  amount_cents INTEGER NOT NULL,
+  note TEXT,
+  -- A completed refund is deducted once, ever.
+  refund_id INTEGER UNIQUE REFERENCES refunds(id) ON DELETE SET NULL,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_deductions_settlement ON settlement_deductions (settlement_id);
+
+-- ===== RETURNS LIFECYCLE & REPLACEMENTS (PHASE 43) =====
+--
+-- Returns grow the steps the admin page works through: approve (with the refund
+-- to authorise; pickup is scheduled) → goods received and inspected → refund
+-- released. The customer picks a refund or a replacement when asking. A
+-- rejected return can be disputed by the customer and decided again.
+--
+-- A replacement is raised when a replacement-return is approved. Nothing ships
+-- until every line is in stock at the shop set to fulfil it (the original, or
+-- another shop selling the same item); approving creates a ₹0 order for the
+-- customer, in the same checkout group, with the stock held. From then on its
+-- status follows that order. The platform absorbs any price difference, and
+-- the replacement order carries no tax invoice (it is not a new sale).
+ALTER TABLE order_returns DROP CONSTRAINT IF EXISTS order_returns_status_check;
+ALTER TABLE order_returns ADD CONSTRAINT order_returns_status_check CHECK (status IN (
+  'requested', 'approved', 'rejected', 'pickup_scheduled', 'picked_up', 'received', 'refunded', 'disputed', 'cancelled'));
+ALTER TABLE order_returns ADD COLUMN IF NOT EXISTS resolution VARCHAR(12) NOT NULL DEFAULT 'refund'
+  CHECK (resolution IN ('refund', 'replacement'));
+ALTER TABLE order_returns ADD COLUMN IF NOT EXISTS approved_refund_cents INTEGER CHECK (approved_refund_cents IS NULL OR approved_refund_cents >= 0);
+ALTER TABLE order_returns ADD COLUMN IF NOT EXISTS pickup_scheduled_at TIMESTAMPTZ;
+ALTER TABLE order_returns ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ;
+ALTER TABLE order_returns ADD COLUMN IF NOT EXISTS condition VARCHAR(10)
+  CHECK (condition IS NULL OR condition IN ('unopened', 'opened', 'used', 'damaged', 'missing'));
+ALTER TABLE order_returns ADD COLUMN IF NOT EXISTS dispute_reason TEXT;
+
+-- The open-request index also covers the new in-progress states.
+DROP INDEX IF EXISTS idx_order_returns_one_open;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_order_returns_one_open
+  ON order_returns (order_id) WHERE status IN ('requested', 'approved', 'pickup_scheduled', 'picked_up', 'received', 'disputed');
+
+CREATE TABLE IF NOT EXISTS order_return_events (
+  id SERIAL PRIMARY KEY,
+  return_id INTEGER NOT NULL REFERENCES order_returns(id) ON DELETE CASCADE,
+  status VARCHAR(20) NOT NULL,
+  note TEXT,
+  actor_role VARCHAR(10) NOT NULL DEFAULT 'system' CHECK (actor_role IN ('customer', 'vendor', 'admin', 'system')),
+  actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_order_return_events_return ON order_return_events (return_id, created_at);
+
+-- Existing returns get the history they have, so the page's timeline isn't empty.
+INSERT INTO order_return_events (return_id, status, note, actor_role, actor_user_id, created_at)
+SELECT r.id, 'requested', r.comment, 'customer', r.user_id, r.created_at FROM order_returns r
+WHERE NOT EXISTS (SELECT 1 FROM order_return_events e WHERE e.return_id = r.id);
+INSERT INTO order_return_events (return_id, status, note, actor_role, actor_user_id, created_at)
+SELECT r.id, r.status, r.resolution_note, 'admin', r.reviewed_by_user_id, r.reviewed_at FROM order_returns r
+WHERE r.reviewed_at IS NOT NULL AND r.status IN ('approved', 'rejected')
+  AND NOT EXISTS (SELECT 1 FROM order_return_events e WHERE e.return_id = r.id AND e.status = r.status);
+
+-- A replacement order is ₹0 to the customer; this is what the platform owes the
+-- shop that fulfils it (picked up by settlements as part of the gross).
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS replacement_of_order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS platform_paid_cents INTEGER NOT NULL DEFAULT 0;
+
+CREATE SEQUENCE IF NOT EXISTS replacement_ref_seq;
+
+CREATE TABLE IF NOT EXISTS replacements (
+  id SERIAL PRIMARY KEY,
+  reference TEXT NOT NULL UNIQUE,
+  return_id INTEGER NOT NULL UNIQUE REFERENCES order_returns(id) ON DELETE CASCADE,
+  original_order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE RESTRICT,
+  -- Set when another shop fulfils instead of the original.
+  fulfil_vendor_id INTEGER REFERENCES vendor_profiles(id) ON DELETE SET NULL,
+  replacement_order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+  -- requested / awaiting_stock / cancelled are stored; once the order exists the
+  -- status shown follows it (order_created, shipped, delivered, failed).
+  status VARCHAR(16) NOT NULL DEFAULT 'requested'
+    CHECK (status IN ('requested', 'awaiting_stock', 'approved', 'cancelled')),
+  value_cents INTEGER NOT NULL,
+  price_difference_cents INTEGER NOT NULL DEFAULT 0,
+  blocked_reason TEXT,
+  cancel_reason TEXT,
+  approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  approved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Which product each original line is replaced with (the same one, or the
+-- equivalent at the shop fulfilling instead).
+CREATE TABLE IF NOT EXISTS replacement_items (
+  id SERIAL PRIMARY KEY,
+  replacement_id INTEGER NOT NULL REFERENCES replacements(id) ON DELETE CASCADE,
+  order_item_id INTEGER NOT NULL REFERENCES order_items(id) ON DELETE RESTRICT,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit_price_cents INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS replacement_events (
+  id SERIAL PRIMARY KEY,
+  replacement_id INTEGER NOT NULL REFERENCES replacements(id) ON DELETE CASCADE,
+  status VARCHAR(16) NOT NULL,
+  note TEXT,
+  actor_role VARCHAR(10) NOT NULL DEFAULT 'system' CHECK (actor_role IN ('customer', 'vendor', 'admin', 'system')),
+  actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_replacement_events ON replacement_events (replacement_id, created_at);
+
+-- ===== BUSINESS ACCOUNTS (PHASE 44) =====
+--
+-- A buying organisation, not a person: people order under one GSTIN, against
+-- one credit limit. Registered from the app (status pending), verified by an
+-- admin. Only a verified account can order as a business.
+--
+-- Credit: an order placed for the business can be paid 'credit' when the
+-- account has a limit, the order fits what's left, it's within the member's
+-- per-order limit, and nothing is overdue. Credit drawn = the business's credit
+-- orders that weren't cancelled − payments recorded against the account.
+-- Overdue = credit orders older than the payment terms not yet covered by
+-- payments (oldest first). Invoices of business orders carry the GSTIN (B2B).
+CREATE TABLE IF NOT EXISTS business_accounts (
+  id SERIAL PRIMARY KEY,
+  legal_name VARCHAR(200) NOT NULL,
+  trade_name VARCHAR(200),
+  gstin VARCHAR(15) NOT NULL UNIQUE,
+  pan VARCHAR(10),
+  state TEXT,
+  city TEXT,
+  status VARCHAR(10) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'verified', 'rejected', 'suspended')),
+  status_reason TEXT,
+  primary_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  contact_name VARCHAR(120),
+  contact_phone VARCHAR(20),
+  credit_limit_cents BIGINT NOT NULL DEFAULT 0 CHECK (credit_limit_cents >= 0),
+  payment_terms_days INTEGER NOT NULL DEFAULT 30 CHECK (payment_terms_days BETWEEN 0 AND 180),
+  verified_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  verified_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_business_accounts_status ON business_accounts (status, created_at);
+
+-- A person belongs to at most one business.
+CREATE TABLE IF NOT EXISTS business_members (
+  id SERIAL PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES business_accounts(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  role VARCHAR(10) NOT NULL CHECK (role IN ('owner', 'approver', 'buyer')),
+  order_limit_cents BIGINT CHECK (order_limit_cents IS NULL OR order_limit_cents > 0),
+  added_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS business_addresses (
+  id SERIAL PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES business_accounts(id) ON DELETE CASCADE,
+  label VARCHAR(80) NOT NULL,
+  line1 TEXT NOT NULL,
+  line2 TEXT,
+  city TEXT NOT NULL,
+  state TEXT NOT NULL,
+  pincode VARCHAR(6) NOT NULL,
+  -- A branch registered in another state files under its own GSTIN.
+  gstin VARCHAR(15),
+  is_default BOOLEAN NOT NULL DEFAULT FALSE,
+  contact_name VARCHAR(120),
+  contact_phone VARCHAR(20),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_business_addresses_default ON business_addresses (account_id) WHERE is_default;
+
+CREATE TABLE IF NOT EXISTS business_documents (
+  id SERIAL PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES business_accounts(id) ON DELETE CASCADE,
+  type VARCHAR(10) NOT NULL CHECK (type IN ('gstin', 'pan', 'bank', 'fssai', 'other')),
+  file_url TEXT NOT NULL,
+  status VARCHAR(10) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Money the business paid against its credit.
+CREATE TABLE IF NOT EXISTS business_credit_payments (
+  id SERIAL PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES business_accounts(id) ON DELETE CASCADE,
+  amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
+  reference VARCHAR(60) NOT NULL,
+  note TEXT,
+  recorded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (account_id, reference)
+);
+
+ALTER TABLE checkout_groups ADD COLUMN IF NOT EXISTS business_account_id INTEGER REFERENCES business_accounts(id) ON DELETE SET NULL;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS business_account_id INTEGER REFERENCES business_accounts(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_business ON orders (business_account_id) WHERE business_account_id IS NOT NULL;
+
+-- 'credit' joins the payment methods.
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_method_check;
+ALTER TABLE orders ADD CONSTRAINT orders_payment_method_check
+  CHECK (payment_method IN ('cod', 'upi', 'card', 'netbanking', 'wallet', 'credit'));
+ALTER TABLE checkout_groups DROP CONSTRAINT IF EXISTS checkout_groups_payment_method_check;
+ALTER TABLE checkout_groups ADD CONSTRAINT checkout_groups_payment_method_check
+  CHECK (payment_method IN ('cod', 'upi', 'card', 'netbanking', 'wallet', 'credit'));
+ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_method_check;
+ALTER TABLE payments ADD CONSTRAINT payments_method_check
+  CHECK (method IN ('cod', 'upi', 'card', 'netbanking', 'wallet', 'credit'));
+
+-- ===== RFQS & QUOTATIONS (PHASE 45) =====
+--
+-- A verified business asks for prices on a basket (catalogue items or described
+-- ones); shops are invited, not matched, and answer with quotations. A
+-- quotation is versioned, never edited: a new price is a new revision and the
+-- old one is marked 'revised', so the negotiation stays readable afterwards.
+-- An RFQ takes quotes until its closing time (then closed, or expired if nobody
+-- quoted), or until an admin closes it to compare.
+CREATE SEQUENCE IF NOT EXISTS rfq_ref_seq;
+CREATE SEQUENCE IF NOT EXISTS quotation_ref_seq;
+
+CREATE TABLE IF NOT EXISTS rfqs (
+  id SERIAL PRIMARY KEY,
+  reference TEXT NOT NULL UNIQUE,
+  business_account_id INTEGER NOT NULL REFERENCES business_accounts(id) ON DELETE RESTRICT,
+  created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  title VARCHAR(160) NOT NULL,
+  notes TEXT,
+  delivery_address TEXT,
+  delivery_city TEXT,
+  delivery_by DATE,
+  closes_at TIMESTAMPTZ NOT NULL,
+  status VARCHAR(10) NOT NULL DEFAULT 'open' CHECK (status IN ('draft', 'open', 'closed', 'awarded', 'cancelled', 'expired')),
+  cancel_reason TEXT,
+  awarded_quotation_id INTEGER,
+  awarded_at TIMESTAMPTZ,
+  closed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_rfqs_status ON rfqs (status, closes_at);
+CREATE INDEX IF NOT EXISTS idx_rfqs_business ON rfqs (business_account_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS rfq_items (
+  id SERIAL PRIMARY KEY,
+  rfq_id INTEGER NOT NULL REFERENCES rfqs(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+  product_name TEXT NOT NULL,
+  specification TEXT,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit VARCHAR(20) NOT NULL DEFAULT 'pcs',
+  target_price_cents INTEGER CHECK (target_price_cents IS NULL OR target_price_cents > 0)
+);
+CREATE INDEX IF NOT EXISTS idx_rfq_items_rfq ON rfq_items (rfq_id);
+
+CREATE TABLE IF NOT EXISTS rfq_vendors (
+  rfq_id INTEGER NOT NULL REFERENCES rfqs(id) ON DELETE CASCADE,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  status VARCHAR(10) NOT NULL DEFAULT 'invited' CHECK (status IN ('invited', 'viewed', 'quoted', 'declined')),
+  invited_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  invited_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  viewed_at TIMESTAMPTZ,
+  decline_reason TEXT,
+  PRIMARY KEY (rfq_id, vendor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rfq_vendors_vendor ON rfq_vendors (vendor_id, invited_at DESC);
+
+CREATE TABLE IF NOT EXISTS quotations (
+  id SERIAL PRIMARY KEY,
+  reference TEXT NOT NULL,
+  rfq_id INTEGER NOT NULL REFERENCES rfqs(id) ON DELETE CASCADE,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE RESTRICT,
+  revision INTEGER NOT NULL DEFAULT 1,
+  status VARCHAR(20) NOT NULL DEFAULT 'submitted'
+    CHECK (status IN ('submitted', 'revision_requested', 'revised', 'accepted', 'rejected', 'withdrawn', 'expired')),
+  subtotal_cents INTEGER NOT NULL,
+  tax_cents INTEGER NOT NULL,
+  delivery_cents INTEGER NOT NULL DEFAULT 0,
+  total_cents INTEGER NOT NULL,
+  valid_until DATE,
+  delivery_days INTEGER CHECK (delivery_days IS NULL OR delivery_days BETWEEN 0 AND 365),
+  payment_terms_days INTEGER CHECK (payment_terms_days IS NULL OR payment_terms_days BETWEEN 0 AND 180),
+  notes TEXT,
+  submitted_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  decided_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  decided_at TIMESTAMPTZ,
+  decision_note TEXT,
+  UNIQUE (rfq_id, vendor_id, revision)
+);
+-- One live quotation per shop per RFQ; older revisions are 'revised'.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_quotations_one_live ON quotations (rfq_id, vendor_id)
+  WHERE status IN ('submitted', 'revision_requested', 'accepted');
+CREATE INDEX IF NOT EXISTS idx_quotations_status ON quotations (status, submitted_at DESC);
+
+CREATE TABLE IF NOT EXISTS quotation_lines (
+  id SERIAL PRIMARY KEY,
+  quotation_id INTEGER NOT NULL REFERENCES quotations(id) ON DELETE CASCADE,
+  rfq_item_id INTEGER NOT NULL REFERENCES rfq_items(id) ON DELETE CASCADE,
+  unit_price_cents INTEGER NOT NULL DEFAULT 0 CHECK (unit_price_cents >= 0),
+  tax_percent NUMERIC(5,2) NOT NULL DEFAULT 0 CHECK (tax_percent BETWEEN 0 AND 28),
+  line_total_cents INTEGER NOT NULL DEFAULT 0,
+  unavailable BOOLEAN NOT NULL DEFAULT FALSE,
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_quotation_lines_quotation ON quotation_lines (quotation_id);
+
+-- The back-and-forth on a quotation (admin, vendor or buyer).
+CREATE TABLE IF NOT EXISTS quotation_messages (
+  id SERIAL PRIMARY KEY,
+  quotation_id INTEGER NOT NULL REFERENCES quotations(id) ON DELETE CASCADE,
+  author_role VARCHAR(10) NOT NULL CHECK (author_role IN ('admin', 'vendor', 'buyer')),
+  author_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  body TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_quotation_messages_quotation ON quotation_messages (quotation_id, created_at);
+
+-- ===== PURCHASE ORDERS (PHASE 46) =====
+--
+-- What an awarded quotation becomes: a commitment to buy at the agreed prices.
+-- Raised when a quotation is awarded (services/quotations.js), one per
+-- quotation, with a line per priced quotation line. Deliveries against it are
+-- recorded over time (purchase_order_deliveries), so a PO is finished only when
+-- everything has arrived and been paid.
+CREATE SEQUENCE IF NOT EXISTS purchase_order_seq;
+
+CREATE TABLE IF NOT EXISTS purchase_orders (
+  id SERIAL PRIMARY KEY,
+  po_number TEXT NOT NULL UNIQUE,
+  quotation_id INTEGER NOT NULL UNIQUE REFERENCES quotations(id) ON DELETE RESTRICT,
+  rfq_id INTEGER NOT NULL REFERENCES rfqs(id) ON DELETE RESTRICT,
+  business_account_id INTEGER NOT NULL REFERENCES business_accounts(id) ON DELETE RESTRICT,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE RESTRICT,
+  buyer_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'issued'
+    CHECK (status IN ('issued', 'acknowledged', 'in_progress', 'partially_delivered', 'delivered', 'closed', 'cancelled')),
+  subtotal_cents INTEGER NOT NULL,
+  tax_cents INTEGER NOT NULL,
+  delivery_cents INTEGER NOT NULL DEFAULT 0,
+  total_cents INTEGER NOT NULL,
+  payment_terms_days INTEGER NOT NULL DEFAULT 0,
+  expected_delivery_at TIMESTAMPTZ,
+  delivery_address TEXT,
+  notes TEXT,
+  issued_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  acknowledged_at TIMESTAMPTZ,
+  closed_at TIMESTAMPTZ,
+  cancel_reason TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_purchase_orders_status ON purchase_orders (status, issued_at DESC);
+
+CREATE TABLE IF NOT EXISTS purchase_order_lines (
+  id SERIAL PRIMARY KEY,
+  purchase_order_id INTEGER NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+  quotation_line_id INTEGER REFERENCES quotation_lines(id) ON DELETE SET NULL,
+  description TEXT NOT NULL,
+  hsn_code TEXT,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit VARCHAR(20) NOT NULL,
+  delivered_quantity INTEGER NOT NULL DEFAULT 0 CHECK (delivered_quantity >= 0),
+  unit_price_cents INTEGER NOT NULL,
+  tax_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+  line_total_cents INTEGER NOT NULL,
+  CHECK (delivered_quantity <= quantity)
+);
+CREATE INDEX IF NOT EXISTS idx_purchase_order_lines_po ON purchase_order_lines (purchase_order_id);
+
+ALTER TABLE rfqs DROP CONSTRAINT IF EXISTS rfqs_awarded_quotation_fk;
+ALTER TABLE rfqs ADD CONSTRAINT rfqs_awarded_quotation_fk FOREIGN KEY (awarded_quotation_id) REFERENCES quotations(id) ON DELETE SET NULL;
+
+-- ===== PURCHASE ORDER FULFILMENT (PHASE 47) =====
+--
+-- Deliveries against a PO and the payments for them. Each delivery is
+-- invoiced at its value (the delivered lines at the PO prices, with tax; the
+-- delivery that completes the PO carries the remainder, delivery charge
+-- included), so invoiced = sum of deliveries. Payments are confirmed by the
+-- vendor (the payee). Rules in services/purchaseOrders.js.
+ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS invoice_number TEXT;
+ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ;
+ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS resend_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
+ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS closed_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_purchase_orders_vendor ON purchase_orders (vendor_id, issued_at DESC);
+CREATE INDEX IF NOT EXISTS idx_purchase_orders_business ON purchase_orders (business_account_id, issued_at DESC);
+
+CREATE TABLE IF NOT EXISTS purchase_order_deliveries (
+  id SERIAL PRIMARY KEY,
+  purchase_order_id INTEGER NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+  delivered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  value_cents INTEGER NOT NULL CHECK (value_cents >= 0),
+  tracking_number TEXT,
+  shipment_id INTEGER,
+  note TEXT,
+  recorded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_po_deliveries_po ON purchase_order_deliveries (purchase_order_id, delivered_at);
+
+CREATE TABLE IF NOT EXISTS purchase_order_delivery_lines (
+  delivery_id INTEGER NOT NULL REFERENCES purchase_order_deliveries(id) ON DELETE CASCADE,
+  purchase_order_line_id INTEGER NOT NULL REFERENCES purchase_order_lines(id) ON DELETE CASCADE,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  PRIMARY KEY (delivery_id, purchase_order_line_id)
+);
+
+CREATE TABLE IF NOT EXISTS purchase_order_payments (
+  id SERIAL PRIMARY KEY,
+  purchase_order_id INTEGER NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+  method VARCHAR(20) NOT NULL DEFAULT 'bank_transfer' CHECK (method IN ('bank_transfer', 'upi', 'cheque', 'cash', 'other')),
+  reference TEXT,
+  paid_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  recorded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_po_payments_po ON purchase_order_payments (purchase_order_id);
+
+-- ===== ANALYTICS (PHASE 48) =====
+--
+-- What Admin → Analytics reads beyond orders: which app surface an order was
+-- placed from (Near Me vs the main shop; B2B is an order for a business
+-- account), and app sessions for conversion and the funnel. The app reports
+-- events in batches (POST /api/analytics/events); checkout itself records
+-- 'order_placed' for the session in the X-Session-Id header. Rules in
+-- controllers/analytics.controller.js.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS origin VARCHAR(10);
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_origin_check;
+ALTER TABLE orders ADD CONSTRAINT orders_origin_check CHECK (origin IS NULL OR origin IN ('shop', 'near_me'));
+CREATE INDEX IF NOT EXISTS idx_orders_created ON orders (created_at);
+
+CREATE TABLE IF NOT EXISTS analytics_events (
+  id BIGSERIAL PRIMARY KEY,
+  session_id VARCHAR(64) NOT NULL,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  event VARCHAR(20) NOT NULL CHECK (event IN ('session_start', 'product_view', 'add_to_cart', 'checkout_start', 'order_placed')),
+  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+  platform VARCHAR(20),
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_analytics_events_time ON analytics_events (occurred_at, event);
+CREATE INDEX IF NOT EXISTS idx_analytics_events_session ON analytics_events (session_id);
+
+-- ===== WHATSAPP (PHASE 49) =====
+--
+-- WhatsApp through Meta's Cloud API, configured as the 'whatsapp_cloud'
+-- platform in the Platform Registry (credentials stay there, encrypted).
+-- Templates are drafted here and submitted to Meta for approval; every
+-- message, out and in, is logged with Meta's id and delivery status. Sending
+-- goes through a queue (services/whatsapp.js) so Meta being slow or down never
+-- holds up an order. Plan: docs/whatsapp-plan.md.
+CREATE TABLE IF NOT EXISTS whatsapp_templates (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(512) NOT NULL,
+  language VARCHAR(10) NOT NULL DEFAULT 'en',
+  category VARCHAR(20) NOT NULL DEFAULT 'UTILITY' CHECK (category IN ('UTILITY', 'AUTHENTICATION', 'MARKETING')),
+  header_text VARCHAR(60),
+  body_text TEXT NOT NULL,
+  footer_text VARCHAR(60),
+  -- [{ type: 'URL'|'QUICK_REPLY'|'PHONE_NUMBER', text, url?, phone?, example? }]
+  buttons JSONB NOT NULL DEFAULT '[]'::jsonb,
+  -- Sample values for {{1}}, {{2}}… — Meta reviews the template with them.
+  body_examples JSONB NOT NULL DEFAULT '[]'::jsonb,
+  status VARCHAR(20) NOT NULL DEFAULT 'draft'
+    CHECK (status IN ('draft', 'pending', 'approved', 'rejected', 'paused', 'disabled')),
+  meta_template_id TEXT,
+  rejected_reason TEXT,
+  -- What the template is for (order_placed, vendor_new_order…), for the event rules later.
+  purpose VARCHAR(40),
+  submitted_at TIMESTAMPTZ,
+  last_synced_at TIMESTAMPTZ,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (name, language)
+);
+
+CREATE TABLE IF NOT EXISTS whatsapp_messages (
+  id BIGSERIAL PRIMARY KEY,
+  direction VARCHAR(3) NOT NULL CHECK (direction IN ('out', 'in')),
+  -- The other party's number, digits only with country code (919876543210).
+  phone VARCHAR(20) NOT NULL,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  kind VARCHAR(10) NOT NULL CHECK (kind IN ('template', 'text')),
+  template_id INTEGER REFERENCES whatsapp_templates(id) ON DELETE SET NULL,
+  template_name VARCHAR(512),
+  language VARCHAR(10),
+  variables JSONB NOT NULL DEFAULT '[]'::jsonb,
+  button_param TEXT,
+  -- The text as the recipient sees it (template filled in), for the log.
+  body TEXT,
+  status VARCHAR(10) NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'sending', 'sent', 'delivered', 'read', 'failed', 'received')),
+  meta_message_id TEXT UNIQUE,
+  error_code TEXT,
+  error_message TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  -- Why it was sent: 'test', or the event (order_placed…).
+  event VARCHAR(40),
+  environment VARCHAR(10),
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  sent_at TIMESTAMPTZ,
+  delivered_at TIMESTAMPTZ,
+  read_at TIMESTAMPTZ,
+  failed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_queue ON whatsapp_messages (next_attempt_at) WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_created ON whatsapp_messages (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_phone ON whatsapp_messages (phone, created_at DESC);
+
+-- Consent: Meta requires it, and nothing automatic is sent without it.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_in BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_in_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_out_at TIMESTAMPTZ;
+
+-- ===== WHATSAPP BOT ACCESS (PHASE 50) =====
+--
+-- The Gloaro bot owns the WhatsApp conversation; Gloaro Mart owns orders. The
+-- bot calls POST /api/bot/session with a service key and the customer's
+-- WhatsApp number (which Meta signs, so it can be trusted) and gets a short
+-- customer login, then uses the same cart, address, checkout and order APIs as
+-- the app. Keys are shown once and stored only as a SHA-256 hash.
+CREATE TABLE IF NOT EXISTS bot_api_keys (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(80) NOT NULL,
+  key_prefix VARCHAR(16) NOT NULL,
+  key_hash CHAR(64) NOT NULL UNIQUE,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_used_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ,
+  revoked_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- Which customer account a WhatsApp number is, once decided — a stored phone
+-- can be typed many ways, and two accounts can share one.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_phone VARCHAR(20);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_whatsapp_phone ON users (whatsapp_phone) WHERE whatsapp_phone IS NOT NULL;
+
+-- ===== WHATSAPP ORDER UPDATES (PHASE 51) =====
+--
+-- Automatic WhatsApp messages on order events (services/whatsappEvents.js).
+-- The sender sweeps recent events — status history, refunds, returns,
+-- invoices, new purchases — so every way an order moves is covered without
+-- touching the code that moves it, and only committed changes are seen.
+-- An event counts only if it happened after its rule was switched on, and is
+-- sent at most once (dedupe_key), so switching a rule on never floods old
+-- orders and a retry never sends twice.
+CREATE TABLE IF NOT EXISTS whatsapp_event_rules (
+  event VARCHAR(40) PRIMARY KEY,
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  template_name VARCHAR(512) NOT NULL,
+  language VARCHAR(10) NOT NULL DEFAULT 'en',
+  enabled_at TIMESTAMPTZ,
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL;
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS checkout_group_id INTEGER REFERENCES checkout_groups(id) ON DELETE SET NULL;
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS skip_reason TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_messages_dedupe ON whatsapp_messages (dedupe_key) WHERE dedupe_key IS NOT NULL;
+-- 'skipped': the event happened but nothing was sent (opted out, no number,
+-- template not approved…), kept so the log says why.
+ALTER TABLE whatsapp_messages DROP CONSTRAINT IF EXISTS whatsapp_messages_status_check;
+ALTER TABLE whatsapp_messages ADD CONSTRAINT whatsapp_messages_status_check
+  CHECK (status IN ('queued', 'sending', 'sent', 'delivered', 'read', 'failed', 'received', 'skipped'));
+ALTER TABLE whatsapp_messages ALTER COLUMN kind DROP NOT NULL;
+ALTER TABLE whatsapp_messages DROP CONSTRAINT IF EXISTS whatsapp_messages_kind_check;
+ALTER TABLE whatsapp_messages ADD CONSTRAINT whatsapp_messages_kind_check CHECK (kind IS NULL OR kind IN ('template', 'text'));
+ALTER TABLE whatsapp_messages ALTER COLUMN phone DROP NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_order_status_history_created ON order_status_history (created_at);
+CREATE INDEX IF NOT EXISTS idx_refunds_updated ON refunds (updated_at) WHERE status = 'completed';
+CREATE INDEX IF NOT EXISTS idx_order_return_events_created ON order_return_events (created_at);
+CREATE INDEX IF NOT EXISTS idx_checkout_groups_created ON checkout_groups (created_at);
+
+-- ===== AD PROMOTIONS — PRICING (PHASE 52) =====
+--
+-- Shops pay GLOARO to promote their shop, products and offers. This phase is
+-- the price list and the engine that reads it (services/adPricing.js); the
+-- campaigns, payments and serving come next. Every number here is set by the
+-- super admin — the seeds are the brief's sample values, to be changed.
+-- Plan: docs/ad-promotions-plan.md.
+
+-- One row: which pricing models are on, tax, limits, policies.
+CREATE TABLE IF NOT EXISTS ad_settings (
+  id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  model_fixed BOOLEAN NOT NULL DEFAULT TRUE,          -- A: rate card price
+  model_commission BOOLEAN NOT NULL DEFAULT FALSE,    -- B: % of orders the ad brings in, nothing upfront
+  model_fixed_commission BOOLEAN NOT NULL DEFAULT FALSE, -- C: rate card price + % of orders
+  model_package BOOLEAN NOT NULL DEFAULT TRUE,        -- D: Basic / Growth / Premium / Enterprise
+  commission_percent NUMERIC(5,2) NOT NULL DEFAULT 10 CHECK (commission_percent BETWEEN 0 AND 100),
+  fixed_commission_percent NUMERIC(5,2) NOT NULL DEFAULT 5 CHECK (fixed_commission_percent BETWEEN 0 AND 100),
+  attribution_days INTEGER NOT NULL DEFAULT 7 CHECK (attribution_days BETWEEN 1 AND 90),
+  tax_percent NUMERIC(5,2) NOT NULL DEFAULT 18 CHECK (tax_percent BETWEEN 0 AND 50),
+  tax_label VARCHAR(20) NOT NULL DEFAULT 'GST',
+  sac_code VARCHAR(10) NOT NULL DEFAULT '998365',
+  currency CHAR(3) NOT NULL DEFAULT 'INR',
+  home_country CHAR(2) NOT NULL DEFAULT 'IN',
+  min_charge_cents INTEGER NOT NULL DEFAULT 10000 CHECK (min_charge_cents >= 0),
+  min_budget_cents INTEGER NOT NULL DEFAULT 10000 CHECK (min_budget_cents >= 0),
+  max_budget_cents INTEGER NOT NULL DEFAULT 100000000 CHECK (max_budget_cents > 0),
+  max_hours INTEGER NOT NULL DEFAULT 8760 CHECK (max_hours BETWEEN 1 AND 87600),
+  cancellation_fee_percent NUMERIC(5,2) NOT NULL DEFAULT 10 CHECK (cancellation_fee_percent BETWEEN 0 AND 100),
+  prorata_refund BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (min_budget_cents <= max_budget_cents)
+);
+
+-- How far an ad reaches. Each level has its own duration prices.
+CREATE TABLE IF NOT EXISTS ad_levels (
+  key VARCHAR(15) PRIMARY KEY CHECK (key IN ('local', 'city', 'district', 'state', 'country', 'international')),
+  label VARCHAR(40) NOT NULL,
+  description TEXT,
+  min_hours INTEGER NOT NULL DEFAULT 1 CHECK (min_hours >= 1),
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  sort_order INTEGER NOT NULL DEFAULT 0
+);
+
+-- Duration packs per level: "24 hours of city reach costs ₹1,000". A booking
+-- is priced at the cheapest mix of packs that covers its hours.
+CREATE TABLE IF NOT EXISTS ad_rate_packs (
+  id SERIAL PRIMARY KEY,
+  level VARCHAR(15) NOT NULL REFERENCES ad_levels(key) ON DELETE CASCADE,
+  hours INTEGER NOT NULL CHECK (hours BETWEEN 1 AND 8760),
+  price_cents INTEGER NOT NULL CHECK (price_cents > 0),
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  UNIQUE (level, hours)
+);
+
+-- Where an ad can be aimed: country → state → district → city → locality.
+-- A region's multiplier scales its price (a metro costs more); the audience
+-- estimate is entered by the admin and shown as an estimate, never invented.
+CREATE TABLE IF NOT EXISTS ad_regions (
+  id SERIAL PRIMARY KEY,
+  level VARCHAR(10) NOT NULL CHECK (level IN ('country', 'state', 'district', 'city', 'locality')),
+  name VARCHAR(120) NOT NULL,
+  parent_id INTEGER REFERENCES ad_regions(id) ON DELETE RESTRICT,
+  country_code CHAR(2) NOT NULL DEFAULT 'IN',
+  latitude DOUBLE PRECISION,
+  longitude DOUBLE PRECISION,
+  radius_km NUMERIC(6,2) CHECK (radius_km IS NULL OR radius_km > 0),
+  audience_estimate INTEGER CHECK (audience_estimate IS NULL OR audience_estimate >= 0),
+  price_multiplier NUMERIC(6,3) NOT NULL DEFAULT 1 CHECK (price_multiplier > 0 AND price_multiplier <= 100),
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  -- A locality is a point and a radius.
+  CHECK (level <> 'locality' OR (latitude IS NOT NULL AND longitude IS NOT NULL AND radius_km IS NOT NULL)),
+  CHECK (level = 'country' OR parent_id IS NOT NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_regions_name ON ad_regions (COALESCE(parent_id, 0), level, lower(name));
+CREATE INDEX IF NOT EXISTS idx_ad_regions_parent ON ad_regions (parent_id);
+
+-- The slots in the app an ad can take.
+CREATE TABLE IF NOT EXISTS ad_placements (
+  key VARCHAR(30) PRIMARY KEY CHECK (key ~ '^[a-z][a-z0-9_]{1,29}$'),
+  name VARCHAR(80) NOT NULL,
+  description TEXT,
+  -- Image sizes it takes, e.g. ["1200x400"].
+  formats JSONB NOT NULL DEFAULT '[]'::jsonb,
+  allowed_levels JSONB NOT NULL DEFAULT '["local","city","district","state","country","international"]'::jsonb,
+  max_live_per_region INTEGER NOT NULL DEFAULT 5 CHECK (max_live_per_region BETWEEN 1 AND 100),
+  premium_percent NUMERIC(6,2) NOT NULL DEFAULT 0 CHECK (premium_percent BETWEEN -90 AND 1000),
+  premium_cents INTEGER NOT NULL DEFAULT 0 CHECK (premium_cents >= 0),
+  sponsored_label BOOLEAN NOT NULL DEFAULT TRUE,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  sort_order INTEGER NOT NULL DEFAULT 0
+);
+
+-- Adjustments on top of the rate card, in priority order.
+CREATE TABLE IF NOT EXISTS ad_pricing_rules (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(80) NOT NULL,
+  kind VARCHAR(15) NOT NULL CHECK (kind IN ('seasonal', 'peak', 'volume', 'category', 'enterprise', 'multi_region')),
+  -- seasonal: uses starts_at/ends_at · peak: {fromHour, toHour} (IST) · volume: {minHours}
+  -- category: {categoryIds} · enterprise: {vendorIds} · multi_region: {minRegions}
+  conditions JSONB NOT NULL DEFAULT '{}'::jsonb,
+  adjust_percent NUMERIC(6,2) NOT NULL DEFAULT 0 CHECK (adjust_percent BETWEEN -90 AND 500),
+  priority INTEGER NOT NULL DEFAULT 100,
+  starts_at TIMESTAMPTZ,
+  ends_at TIMESTAMPTZ,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (ends_at IS NULL OR starts_at IS NULL OR ends_at > starts_at)
+);
+
+-- Fixed-price bundles.
+CREATE TABLE IF NOT EXISTS ad_packages (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(60) NOT NULL UNIQUE,
+  tier VARCHAR(12) NOT NULL CHECK (tier IN ('basic', 'growth', 'premium', 'enterprise', 'custom')),
+  description TEXT,
+  level VARCHAR(15) NOT NULL REFERENCES ad_levels(key),
+  hours INTEGER NOT NULL CHECK (hours BETWEEN 1 AND 8760),
+  price_cents INTEGER NOT NULL CHECK (price_cents > 0),
+  placements JSONB NOT NULL DEFAULT '[]'::jsonb,
+  max_regions INTEGER NOT NULL DEFAULT 1 CHECK (max_regions BETWEEN 1 AND 100),
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  sort_order INTEGER NOT NULL DEFAULT 0
+);
+
+-- Discount codes for ad bookings — separate from shopping coupons.
+CREATE TABLE IF NOT EXISTS ad_coupons (
+  id SERIAL PRIMARY KEY,
+  code VARCHAR(30) NOT NULL,
+  kind VARCHAR(8) NOT NULL CHECK (kind IN ('percent', 'flat')),
+  value INTEGER NOT NULL CHECK (value > 0),
+  max_discount_cents INTEGER CHECK (max_discount_cents IS NULL OR max_discount_cents > 0),
+  min_spend_cents INTEGER NOT NULL DEFAULT 0 CHECK (min_spend_cents >= 0),
+  max_uses INTEGER CHECK (max_uses IS NULL OR max_uses > 0),
+  used_count INTEGER NOT NULL DEFAULT 0,
+  starts_at TIMESTAMPTZ,
+  ends_at TIMESTAMPTZ,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (kind <> 'percent' OR value <= 100)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_coupons_code ON ad_coupons (upper(code));
+
+-- ===== AD PROMOTIONS — CAMPAIGNS (PHASE 53) =====
+--
+-- A shop's booking: what it shows, where, when, and the price it was sold at
+-- (price_snapshot, from services/adPricing.js at payment — never recomputed).
+-- Lifecycle and money in services/adCampaigns.js.
+--
+-- draft → pending_payment (offline, waiting for the money) → pending_approval
+--   → scheduled → live → completed; paused from live; rejected / cancelled
+--   with a refund per the policy.
+CREATE SEQUENCE IF NOT EXISTS ad_campaign_ref_seq;
+
+CREATE TABLE IF NOT EXISTS ad_campaigns (
+  id SERIAL PRIMARY KEY,
+  reference TEXT NOT NULL UNIQUE,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE RESTRICT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_by_role VARCHAR(10) NOT NULL DEFAULT 'admin' CHECK (created_by_role IN ('admin', 'vendor')),
+  title VARCHAR(120) NOT NULL,
+  description TEXT,
+  offer_text VARCHAR(160),
+  cta_label VARCHAR(30),
+  cta_kind VARCHAR(10) NOT NULL DEFAULT 'shop' CHECK (cta_kind IN ('shop', 'product', 'url', 'call', 'whatsapp')),
+  cta_target TEXT,
+  -- The checkout discount campaign the ad advertises, for offer redemptions.
+  discount_campaign_id INTEGER REFERENCES campaigns(id) ON DELETE SET NULL,
+  category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+  model VARCHAR(20) NOT NULL CHECK (model IN ('fixed', 'commission', 'fixed_commission', 'package')),
+  package_id INTEGER REFERENCES ad_packages(id) ON DELETE SET NULL,
+  level VARCHAR(15) NOT NULL REFERENCES ad_levels(key),
+  placements JSONB NOT NULL DEFAULT '[]'::jsonb,
+  coupon_code VARCHAR(30),
+  starts_at TIMESTAMPTZ NOT NULL,
+  ends_at TIMESTAMPTZ NOT NULL,
+  hours INTEGER NOT NULL CHECK (hours > 0),
+  status VARCHAR(20) NOT NULL DEFAULT 'draft' CHECK (status IN
+    ('draft', 'pending_payment', 'pending_approval', 'scheduled', 'live', 'paused', 'completed', 'rejected', 'cancelled')),
+  payment_status VARCHAR(20) NOT NULL DEFAULT 'unpaid' CHECK (payment_status IN
+    ('unpaid', 'pending', 'paid', 'not_required', 'refunded', 'partially_refunded')),
+  -- The quote at payment (or, for a draft, the latest estimate).
+  price_snapshot JSONB,
+  subtotal_cents INTEGER NOT NULL DEFAULT 0,
+  discount_cents INTEGER NOT NULL DEFAULT 0,
+  taxable_cents INTEGER NOT NULL DEFAULT 0,
+  tax_cents INTEGER NOT NULL DEFAULT 0,
+  total_cents INTEGER NOT NULL DEFAULT 0,
+  commission_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+  rejection_reason TEXT,
+  cancel_reason TEXT,
+  approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  approved_at TIMESTAMPTZ,
+  paused_at TIMESTAMPTZ,
+  went_live_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (ends_at > starts_at)
+);
+CREATE INDEX IF NOT EXISTS idx_ad_campaigns_status ON ad_campaigns (status, starts_at);
+CREATE INDEX IF NOT EXISTS idx_ad_campaigns_vendor ON ad_campaigns (vendor_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ad_campaign_regions (
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE CASCADE,
+  region_id INTEGER NOT NULL REFERENCES ad_regions(id) ON DELETE RESTRICT,
+  PRIMARY KEY (campaign_id, region_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ad_campaign_regions_region ON ad_campaign_regions (region_id);
+
+CREATE TABLE IF NOT EXISTS ad_assets (
+  id SERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  kind VARCHAR(10) NOT NULL DEFAULT 'banner' CHECK (kind IN ('banner', 'card', 'square')),
+  width INTEGER CHECK (width IS NULL OR width > 0),
+  height INTEGER CHECK (height IS NULL OR height > 0),
+  bytes INTEGER,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ad_assets_campaign ON ad_assets (campaign_id, sort_order);
+
+-- What each campaign was charged and how. 'booking' is the original
+-- purchase; 'extension' buys more hours. Settlement payments are paid at once
+-- (the amount is taken from the shop's next payout); offline ones wait for the
+-- admin to confirm the money arrived. The idempotency key stops a double
+-- click or a repeated request from charging twice.
+CREATE TABLE IF NOT EXISTS ad_payments (
+  id SERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE RESTRICT,
+  purpose VARCHAR(10) NOT NULL DEFAULT 'booking' CHECK (purpose IN ('booking', 'extension')),
+  method VARCHAR(12) NOT NULL CHECK (method IN ('settlement', 'offline', 'online')),
+  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+  taxable_cents INTEGER NOT NULL,
+  tax_cents INTEGER NOT NULL,
+  status VARCHAR(10) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'cancelled', 'failed')),
+  reference TEXT,
+  extension_hours INTEGER CHECK (extension_hours IS NULL OR extension_hours > 0),
+  extension_snapshot JSONB,
+  idempotency_key VARCHAR(80) UNIQUE,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  confirmed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  paid_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ad_payments_campaign ON ad_payments (campaign_id);
+CREATE INDEX IF NOT EXISTS idx_ad_payments_status ON ad_payments (status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ad_refunds (
+  id SERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE RESTRICT,
+  payment_id INTEGER REFERENCES ad_payments(id) ON DELETE SET NULL,
+  method VARCHAR(12) NOT NULL CHECK (method IN ('settlement', 'offline', 'online')),
+  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+  taxable_cents INTEGER NOT NULL,
+  tax_cents INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  -- Settlement refunds are credited at once; offline ones until the admin has paid them back.
+  status VARCHAR(10) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
+  reference TEXT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  completed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ad_refunds_campaign ON ad_refunds (campaign_id);
+
+-- Money a shop owes GLOARO (positive) or is owed back (negative) outside its
+-- orders, taken into its next weekly settlement as one deduction or credit.
+CREATE TABLE IF NOT EXISTS vendor_charges (
+  id SERIAL PRIMARY KEY,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE RESTRICT,
+  kind VARCHAR(15) NOT NULL CHECK (kind IN ('advertising', 'ad_refund', 'ad_commission')),
+  label TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL CHECK (amount_cents <> 0),
+  ad_payment_id INTEGER REFERENCES ad_payments(id) ON DELETE SET NULL,
+  ad_refund_id INTEGER REFERENCES ad_refunds(id) ON DELETE SET NULL,
+  -- Set once it has gone into a settlement.
+  settlement_id INTEGER REFERENCES settlements(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_vendor_charges_open ON vendor_charges (vendor_id) WHERE settlement_id IS NULL;
+ALTER TABLE settlement_deductions ADD COLUMN IF NOT EXISTS vendor_charge_id INTEGER UNIQUE REFERENCES vendor_charges(id) ON DELETE SET NULL;
+ALTER TABLE settlement_deductions DROP CONSTRAINT IF EXISTS settlement_deductions_kind_check;
+ALTER TABLE settlement_deductions ADD CONSTRAINT settlement_deductions_kind_check
+  CHECK (kind IN ('commission', 'refund', 'tds', 'tcs', 'penalty', 'adjustment', 'other', 'advertising'));
+
+-- GST tax invoices for ad fees: GLOARO sells, the shop buys. Their own series.
+CREATE TABLE IF NOT EXISTS ad_invoice_series (
+  financial_year VARCHAR(20) PRIMARY KEY,
+  last_number INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ad_invoices (
+  id SERIAL PRIMARY KEY,
+  invoice_number TEXT NOT NULL UNIQUE,
+  invoice_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  financial_year VARCHAR(20) NOT NULL,
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE RESTRICT,
+  payment_id INTEGER NOT NULL UNIQUE REFERENCES ad_payments(id) ON DELETE RESTRICT,
+  seller_name TEXT NOT NULL,
+  seller_gstin TEXT,
+  seller_state TEXT,
+  buyer_vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE RESTRICT,
+  buyer_name TEXT NOT NULL,
+  buyer_gstin TEXT,
+  buyer_state TEXT,
+  buyer_address TEXT,
+  sac_code VARCHAR(10) NOT NULL,
+  description TEXT NOT NULL,
+  supply_type VARCHAR(12) NOT NULL CHECK (supply_type IN ('intra_state', 'inter_state')),
+  taxable_cents INTEGER NOT NULL,
+  cgst_cents INTEGER NOT NULL DEFAULT 0,
+  sgst_cents INTEGER NOT NULL DEFAULT 0,
+  igst_cents INTEGER NOT NULL DEFAULT 0,
+  total_cents INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Every rupee of ad money, by kind, so revenue, tax, discounts and refunds are
+-- never mixed. Revenue reports read this.
+CREATE TABLE IF NOT EXISTS ad_ledger (
+  id BIGSERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE RESTRICT,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE RESTRICT,
+  entry VARCHAR(15) NOT NULL CHECK (entry IN ('ad_revenue', 'ad_tax', 'ad_discount', 'ad_refund', 'ad_tax_refund', 'ad_commission')),
+  amount_cents INTEGER NOT NULL,
+  payment_id INTEGER REFERENCES ad_payments(id) ON DELETE SET NULL,
+  refund_id INTEGER REFERENCES ad_refunds(id) ON DELETE SET NULL,
+  note TEXT,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ad_ledger_time ON ad_ledger (occurred_at);
+CREATE INDEX IF NOT EXISTS idx_ad_ledger_campaign ON ad_ledger (campaign_id);
+
+CREATE TABLE IF NOT EXISTS ad_campaign_history (
+  id SERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE CASCADE,
+  from_status VARCHAR(20),
+  to_status VARCHAR(20) NOT NULL,
+  actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  actor_role VARCHAR(10) NOT NULL DEFAULT 'system' CHECK (actor_role IN ('admin', 'vendor', 'system')),
+  note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ad_campaign_history_campaign ON ad_campaign_history (campaign_id, created_at);
+
+-- ===== AD PROMOTIONS — SERVING & RESULTS (PHASE 54) =====
+--
+-- The app asks GET /api/ads for a slot and reports what it showed and what was
+-- tapped (POST /api/ads/events). An impression counts once per session, per
+-- campaign and slot, per hour; a click or enquiry once per minute — so a
+-- refreshing screen or a double tap doesn't inflate the numbers. Daily totals
+-- are kept as events arrive, so the dashboard never scans raw events.
+--
+-- An order is attributed to an ad when the same signed-in customer tapped one
+-- of that shop's ads within the attribution window before ordering. Delivered
+-- orders only; each order once. On the commission models (B, C) that order
+-- carries GLOARO's ad commission, taken from the shop's next payout.
+CREATE TABLE IF NOT EXISTS ad_events (
+  id BIGSERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE CASCADE,
+  event VARCHAR(10) NOT NULL CHECK (event IN ('impression', 'click', 'enquiry')),
+  placement VARCHAR(30) NOT NULL,
+  session_id VARCHAR(64) NOT NULL,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  bucket TIMESTAMPTZ NOT NULL,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_events_dedupe ON ad_events (campaign_id, placement, session_id, event, bucket);
+CREATE INDEX IF NOT EXISTS idx_ad_events_clicks ON ad_events (user_id, occurred_at DESC) WHERE event = 'click' AND user_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ad_stats_daily (
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE CASCADE,
+  day DATE NOT NULL,
+  placement VARCHAR(30) NOT NULL,
+  impressions INTEGER NOT NULL DEFAULT 0,
+  clicks INTEGER NOT NULL DEFAULT 0,
+  enquiries INTEGER NOT NULL DEFAULT 0,
+  orders INTEGER NOT NULL DEFAULT 0,
+  order_value_cents BIGINT NOT NULL DEFAULT 0,
+  commission_cents BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (campaign_id, day, placement)
+);
+CREATE INDEX IF NOT EXISTS idx_ad_stats_daily_day ON ad_stats_daily (day);
+
+CREATE TABLE IF NOT EXISTS ad_attributions (
+  order_id INTEGER PRIMARY KEY REFERENCES orders(id) ON DELETE CASCADE,
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE CASCADE,
+  click_event_id BIGINT REFERENCES ad_events(id) ON DELETE SET NULL,
+  placement VARCHAR(30) NOT NULL,
+  order_value_cents INTEGER NOT NULL,
+  commission_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+  commission_cents INTEGER NOT NULL DEFAULT 0,
+  vendor_charge_id INTEGER REFERENCES vendor_charges(id) ON DELETE SET NULL,
+  attributed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ad_attributions_campaign ON ad_attributions (campaign_id);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS ad_campaign_id INTEGER REFERENCES ad_campaigns(id) ON DELETE SET NULL;
