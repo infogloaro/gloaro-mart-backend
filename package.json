@@ -43,6 +43,7 @@
     "migrate:analytics": "node scripts/migrate-analytics.js",
     "migrate:whatsapp": "node scripts/migrate-whatsapp.js",
     "migrate:ads": "node scripts/migrate-ads.js",
+    "migrate:media-files": "node scripts/migrate-media-files.js",
     "seed:sprint1": "node scripts/seed-sprint1.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

@@ -20,8 +20,10 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Admin-uploaded images. File names are generated server-side, so a name never
-// changes content and can be cached hard.
+// Uploaded images: stored in the database (media_files); files saved to disk
+// before that are still served from there. Names are generated server-side,
+// so a name never changes content and can be cached hard.
+app.use("/uploads", require("./controllers/upload.controller").serveUpload);
 app.use(
   "/uploads",
   express.static(require("./controllers/upload.controller").UPLOAD_ROOT, {

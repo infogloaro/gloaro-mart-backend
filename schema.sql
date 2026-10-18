@@ -3420,3 +3420,16 @@ CREATE INDEX IF NOT EXISTS idx_customer_wallet_txns_wallet ON customer_wallet_tr
 -- A top-up can credit at most once, whatever the gateway replays.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_wallet_txns_one_credit_per_topup
   ON customer_wallet_transactions (topup_id) WHERE type = 'credit';
+
+-- ===== MEDIA FILES (UPLOADS STORED IN THE DATABASE) =====
+-- Every uploaded image (products, banners, brands, categories, shop logos, ads,
+-- reviews, support, business documents) lives here, keyed by the same
+-- /uploads/<folder>/<name> path the rest of the schema stores. Hosts with a
+-- throwaway disk keep every image across redeploys.
+CREATE TABLE IF NOT EXISTS media_files (
+  path TEXT PRIMARY KEY CHECK (path ~ '^/uploads/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$'),
+  mime TEXT NOT NULL CHECK (mime IN ('image/jpeg', 'image/png', 'image/webp')),
+  bytes BYTEA NOT NULL,
+  size INTEGER NOT NULL CHECK (size > 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

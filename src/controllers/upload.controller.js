@@ -1,19 +1,21 @@
 const crypto = require('crypto');
-const fs = require('fs/promises');
 const path = require('path');
 const multer = require('multer');
+const pool = require('../config/db');
 
 /**
- * Admin image uploads, saved as files under <backend>/uploads/<folder>/.
+ * Image uploads, stored in the database (table media_files) under a path such
+ * as /uploads/products/abc.webp. Rows keep only that path, and the admin panel
+ * and the app prefix their API base URL to show it, so moving the server never
+ * means rewriting rows — and hosts with a throwaway disk (Render's free plan,
+ * serverless) keep every image across redeploys.
  *
- * The database keeps only the relative path (/uploads/products/abc.webp), and
- * the admin panel and the app each prefix their API base URL to show it, so
- * moving the server never means rewriting rows.
- *
- * Needs a server with a writable, persistent disk (local, Render, a VPS). A
- * serverless host such as Vercel discards anything written here.
+ * Files saved to <backend>/uploads/ before this change are still served from
+ * disk (see serveUpload) until scripts/migrate-media-files.js copies them in.
  */
 const UPLOAD_ROOT = path.join(__dirname, '..', '..', 'uploads');
+
+const MIME = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp' };
 
 // The admin path segment the upload is posted under → the folder it lands in.
 // Posting under the module's own segment means the RBAC gate already asks for
@@ -34,7 +36,7 @@ const FOLDERS = {
 
 const MAX_BYTES = 5 * 1024 * 1024;
 
-// Kept in memory so the bytes can be checked before anything touches the disk.
+// Kept in memory so the bytes can be checked before anything is stored.
 const receive = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_BYTES, files: 1 },
@@ -74,15 +76,41 @@ function saveImage(folder, req, res, next) {
     if (!ext) return res.status(400).json({ message: 'Only JPG, PNG or WebP images are accepted' });
 
     try {
-      const dir = path.join(UPLOAD_ROOT, folder);
-      await fs.mkdir(dir, { recursive: true });
       const name = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${ext}`;
-      await fs.writeFile(path.join(dir, name), req.file.buffer);
-      res.status(201).json({ path: `/uploads/${folder}/${name}`, size: req.file.size });
+      const filePath = `/uploads/${folder}/${name}`;
+      await pool.query('INSERT INTO media_files (path, mime, bytes, size) VALUES ($1, $2, $3, $4)', [
+        filePath,
+        MIME[ext],
+        req.file.buffer,
+        req.file.size,
+      ]);
+      res.status(201).json({ path: filePath, size: req.file.size });
     } catch (e) {
       next(e);
     }
   });
 }
 
-module.exports = { UPLOAD_ROOT, uploadImage, uploadTo };
+/**
+ * GET /uploads/<folder>/<name> from media_files. Anything not there falls
+ * through to the old on-disk files. Names are generated server-side and never
+ * reused, so a path never changes content and can be cached hard.
+ */
+async function serveUpload(req, res, next) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+  if (!/^\/[\w-]+\/[\w.-]+$/.test(req.path)) return next();
+  try {
+    const { rows } = await pool.query('SELECT mime, bytes FROM media_files WHERE path = $1', [`/uploads${req.path}`]);
+    if (!rows[0]) return next();
+    res.set({
+      'Content-Type': rows[0].mime,
+      'Cache-Control': 'public, max-age=2592000, immutable',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.send(rows[0].bytes);
+  } catch (e) {
+    next(e);
+  }
+}
+
+module.exports = { UPLOAD_ROOT, uploadImage, uploadTo, serveUpload };
