@@ -1,14 +1,27 @@
+# Render Blueprint: New → Blueprint → pick this repo. Render creates the web
+# service from this file and asks for each `sync: false` value (copy them from
+# the backend's .env; DATABASE_URL is the Neon pooled connection string).
 services:
   - type: web
     name: gloaro-mart-backend
     runtime: node
+    # Next to the Neon database (AWS us-east-2).
+    region: ohio
     plan: free
+    branch: main
     buildCommand: npm install
-    startCommand: npm start
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeploy: true
     envVars:
+      - key: NODE_VERSION
+        value: 22.19.0
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET
+        sync: false
+      # Must equal the value already used to encrypt platform credentials in the database.
+      - key: PLATFORM_SECRETS_KEY
         sync: false
       - key: PAYMENTS_WEBHOOK_SECRET
         sync: false
@@ -16,5 +29,6 @@ services:
         sync: false
       - key: MAIL_FROM
         sync: false
-      - key: RESET_URL_BASE
+      # Optional: AI search falls back to keyword search without it.
+      - key: ANTHROPIC_API_KEY
         sync: false
