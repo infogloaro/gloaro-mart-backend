@@ -3,6 +3,7 @@ const { requireAuth, optionalAuth, requireRole } = require('../middleware/auth')
 const productController = require('../controllers/product.controller');
 const review = require('../controllers/review.controller');
 const { aiSearch } = require('../controllers/aiSearch.controller');
+const productReview = require('../controllers/productReview.controller');
 const search = require('../controllers/search.controller');
 
 const router = express.Router();
@@ -21,6 +22,8 @@ router.get('/:id/reviews', optionalAuth, review.listProductReviews);
 router.get('/:id/review', requireAuth, review.getMyProductReview);
 router.put('/:id/review', requireAuth, review.upsertProductReview);
 router.put('/:id/tiers', requireAuth, requireRole('vendor'), productController.setTiers);
+router.get('/:id/reviews', productReview.listProductReviews);
+router.put('/:id/review', requireAuth, requireRole('customer'), productReview.upsertProductReview);
 router.get('/:id', productController.getProduct);
 router.get('/', productController.listProducts);
 

@@ -6,6 +6,8 @@ const router = express.Router();
 router.use(requireAuth);
 
 router.get("/", notifications.listMine);
+router.post("/device-token", notifications.registerDeviceToken);
+router.delete("/device-token", notifications.removeDeviceToken);
 router.post("/read-all", notifications.markAllRead);
 router.patch("/:id/read", notifications.markRead);
 

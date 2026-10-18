@@ -15,7 +15,12 @@ const MAIL_FROM = process.env.MAIL_FROM || 'onboarding@resend.dev';
 
 async function sendMail({ to, subject, text, html }) {
   const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) throw new Error('RESEND_API_KEY must be set to send mail.');
+  if (!apiKey) {
+    console.log(`[mail:mock] Would have sent email to ${to}`);
+    console.log(`[mail:mock] Subject: ${subject}`);
+    console.log(`[mail:mock] Text: ${text}`);
+    return;
+  }
 
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',

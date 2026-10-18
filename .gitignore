@@ -10,7 +10,7 @@ uploads/
 # Dev scratch scripts, not part of the deployed app
 *.tmp.js
 
-# Stray copies, not part of the backend
+# Stray copies, not part of the backend (e.g. a Flutter app folder, macOS files)
 .DS_Store
-lib/
-lib.zip
+/lib/
+/lib.zip
