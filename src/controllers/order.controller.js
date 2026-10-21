@@ -5,7 +5,8 @@ const { creditWalletForOrder } = require('./wallet.controller');
 const { resolveCouponForCheckout } = require('./coupon.controller');
 const { findOwnedAddress, toSnapshot } = require('./address.controller');
 const { evaluate } = require('./serviceability.controller');
-const { createPaymentForGroup, settleCodForOrder } = require('./payment.controller');
+const { createPaymentForGroup, settleCodForOrder, recordPaymentEvent } = require('./payment.controller');
+const customerWallet = require('../services/payments/wallet');
 const { returnEligibility, deliveredAtFor } = require('./returns.controller');
 const { bestCampaignForOrder } = require('../services/campaigns');
 const {
@@ -110,7 +111,9 @@ async function checkout(req, res) {
     return res.status(400).json({ message: 'Credit is only for orders placed for a business account.' });
   }
   // Credit, like COD, needs nothing more from the buyer now; both commit the sale at once.
-  const isCod = paymentMethod === 'cod' || paymentMethod === 'credit';
+  // The customer wallet is paid in full inside this checkout, so it commits too.
+  const isWallet = paymentMethod === 'wallet';
+  const isCod = paymentMethod === 'cod' || paymentMethod === 'credit' || isWallet;
 
   let member = null;
   if (businessAccountId != null) {
@@ -422,12 +425,31 @@ async function checkout(req, res) {
         paymentMethod,
       });
     }
-    await createPaymentForGroup(client, {
+    const payment = await createPaymentForGroup(client, {
       groupId: group.id,
       userId: req.user.id,
       amountCents: groupTotals[0].total_cents,
       method: paymentMethod,
     });
+
+    // Wallet: the money is on the platform already, so it moves now, in this
+    // transaction. A short balance rolls the whole checkout back (402).
+    if (isWallet) {
+      const total = groupTotals[0].total_cents;
+      await customerWallet.debit(client, { userId: req.user.id, amountCents: total, groupReference: group.reference });
+      await client.query(
+        `UPDATE payments SET status = 'successful', amount_captured_cents = $2, updated_at = now() WHERE id = $1`,
+        [payment.id, total]
+      );
+      await recordPaymentEvent(client, {
+        paymentId: payment.id,
+        event: 'captured',
+        amountCents: total,
+        actorRole: 'customer',
+        userId: req.user.id,
+        note: 'Paid from the Gloaro wallet',
+      });
+    }
 
     // COD commits the sale the moment the order is placed — there is no gateway
     // to wait on, so the held units become sold ones now rather than sitting in

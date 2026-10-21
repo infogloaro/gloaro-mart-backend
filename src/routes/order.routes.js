@@ -6,6 +6,7 @@ const payment = require('../controllers/payment.controller');
 const returns = require('../controllers/returns.controller');
 const review = require('../controllers/review.controller');
 const shipment = require('../controllers/shipment.controller');
+const { uploadTo } = require('../controllers/upload.controller');
 
 const router = express.Router();
 
@@ -25,6 +26,9 @@ router.get('/groups', requireAuth, orderController.getOrderGroups);
 router.get('/groups/:id', requireAuth, orderController.getOrderGroup);
 router.get('/groups/:id/reassignments', requireAuth, reassignment.listForGroup);
 router.get('/', requireAuth, orderController.getMyOrders);
+// A photo for a return request (multipart 'file', JPG/PNG/WebP ≤ 5 MB) →
+// { path }, sent later in POST /:id/returns as `photos`. Above '/:id'.
+router.post('/returns/photos', requireAuth, uploadTo('returns'));
 router.get('/:id/history', requireAuth, orderController.getOrderHistory);
 // The customer's parcel tracking: every delivery attempt with its scans.
 router.get('/:id/shipments', requireAuth, shipment.listForOrder);

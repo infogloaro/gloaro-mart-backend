@@ -21,8 +21,9 @@
 const cod = require('./cod');
 const manual = require('./manual');
 const credit = require('./credit');
+const wallet = require('./wallet');
 
-const PROVIDERS = { cod, manual, credit };
+const PROVIDERS = { cod, manual, credit, wallet };
 
 /** The provider handling a payment, by name. Throws rather than guessing. */
 function getProvider(name) {
@@ -39,6 +40,8 @@ function getProvider(name) {
 function providerForMethod(method) {
   if (method === 'cod') return cod;
   if (method === 'credit') return credit;
+  // 'wallet' is the customer's Gloaro wallet, not a gateway wallet.
+  if (method === 'wallet') return wallet;
   return manual;
 }
 

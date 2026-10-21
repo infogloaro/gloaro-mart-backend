@@ -1314,6 +1314,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_order_returns_one_open
 
 CREATE INDEX IF NOT EXISTS idx_order_returns_status ON order_returns (status, created_at);
 CREATE INDEX IF NOT EXISTS idx_order_returns_user ON order_returns (user_id, created_at DESC);
+-- Photos the customer attached when asking (paths under /uploads/returns/),
+-- required since 2026-10-18 (scripts/migrate-return-photos.js).
+ALTER TABLE order_returns ADD COLUMN IF NOT EXISTS photos JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 -- A customer's rating of a shop, earned by a delivered order.
 --
@@ -3433,3 +3436,9 @@ CREATE TABLE IF NOT EXISTS media_files (
   size INTEGER NOT NULL CHECK (size > 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ===== USERNAMES =====
+-- Sign-in is by username (or a phone OTP) instead of email. Unique ignoring
+-- case; accounts made before this keep signing in with their email.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users (lower(username)) WHERE username IS NOT NULL;

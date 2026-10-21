@@ -27,6 +27,11 @@ const SETTLED_OR_OPEN = ['requested', 'approved', 'pickup_scheduled', 'picked_up
 const RETURN_WINDOW_DAYS = 7;
 const PAGE_SIZE = 25;
 
+// Evidence: only paths this server stored (POST /api/orders/returns/photos).
+const MAX_PHOTOS = 5;
+const PHOTO_PATH = /^\/uploads\/returns\/[\w.-]+$/;
+const MIN_COMMENT_LENGTH = 10;
+
 /**
  * When the order was actually delivered.
  *
@@ -91,12 +96,23 @@ async function addEvent(db, returnId, status, { note = null, actorRole = 'system
 }
 
 async function requestReturn(req, res) {
-  const { reasonCode, comment, resolution = 'refund' } = req.body || {};
+  const { reasonCode, comment, resolution = 'refund', photos = [] } = req.body || {};
   if (!REASON_CODES.includes(reasonCode)) {
     return res.status(400).json({ message: `reasonCode must be one of ${REASON_CODES.join(', ')}` });
   }
   if (!RESOLUTIONS.includes(resolution)) {
     return res.status(400).json({ message: "resolution must be 'refund' or 'replacement'" });
+  }
+  // The customer says in their own words what went wrong, and shows it: at
+  // least one photo of the item, uploaded first through POST /api/orders/returns/photos.
+  const words = typeof comment === 'string' ? comment.trim() : '';
+  if (words.length < MIN_COMMENT_LENGTH) {
+    return res.status(400).json({ message: `Tell us what went wrong (at least ${MIN_COMMENT_LENGTH} characters).` });
+  }
+  if (!Array.isArray(photos) || photos.length < 1 || photos.length > MAX_PHOTOS || !photos.every((p) => typeof p === 'string' && PHOTO_PATH.test(p))) {
+    return res.status(400).json({
+      message: photos?.length > MAX_PHOTOS ? `Up to ${MAX_PHOTOS} photos.` : 'Add at least one photo of the item you want to return.',
+    });
   }
 
   const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1 AND user_id = $2', [
@@ -117,11 +133,11 @@ async function requestReturn(req, res) {
       return res.status(409).json({ message: eligibility.reason });
     }
     const { rows: created } = await client.query(
-      `INSERT INTO order_returns (order_id, user_id, reason_code, comment, resolution)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [order.id, req.user.id, reasonCode, comment || null, resolution]
+      `INSERT INTO order_returns (order_id, user_id, reason_code, comment, resolution, photos)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING *`,
+      [order.id, req.user.id, reasonCode, words, resolution, JSON.stringify(photos)]
     );
-    await addEvent(client, created[0].id, 'requested', { note: comment || null, actorRole: 'customer', userId: req.user.id });
+    await addEvent(client, created[0].id, 'requested', { note: words, actorRole: 'customer', userId: req.user.id });
     await client.query('COMMIT');
     res.status(201).json(created[0]);
   } catch (err) {
@@ -143,7 +159,7 @@ async function listReturnsForOrder(req, res) {
 
   const { rows } = await pool.query(
     `SELECT r.id, r.order_id, r.reason_code, r.comment, r.status, r.resolution, r.resolution_note, r.refund_id,
-            r.approved_refund_cents, r.dispute_reason, r.created_at, r.reviewed_at, r.received_at,
+            r.approved_refund_cents, r.dispute_reason, r.created_at, r.reviewed_at, r.received_at, r.photos,
             rp.reference AS replacement_reference
      FROM order_returns r LEFT JOIN replacements rp ON rp.return_id = r.id
      WHERE r.order_id = $1 ORDER BY r.created_at DESC`,
@@ -225,8 +241,7 @@ function toJson(r) {
     refundStatus: r.refund_status,
     creditNoteNumber: r.credit_note_number,
     disputeReason: r.dispute_reason,
-    // Customers can't attach photos to a return yet.
-    evidenceCount: 0,
+    evidenceCount: Array.isArray(r.photos) ? r.photos.length : 0,
   };
 }
 
@@ -268,7 +283,15 @@ async function loadDetail(id) {
         condition: r.condition,
       };
     }),
-    evidence: [],
+    // Photos the customer attached when asking; the admin panel prefixes its
+    // API base to the path like any other upload.
+    evidence: (Array.isArray(r.photos) ? r.photos : []).map((p, i) => ({
+      id: i + 1,
+      url: p,
+      kind: 'image',
+      caption: null,
+      uploadedAt: r.created_at,
+    })),
     timeline: events.map((e) => ({
       id: e.id,
       status: e.status,

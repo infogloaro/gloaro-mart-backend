@@ -5,10 +5,13 @@ const pool = require('../config/db');
 const { JWT_SECRET } = require('../middleware/auth');
 const { revokeSessions } = require('../services/sessions');
 const { sendMail } = require('../services/mailer');
+const sms = require('../services/sms');
 
 const OTP_TTL_MS = 10 * 60 * 1000;
 const OTP_RESEND_MS = 60 * 1000;
 const OTP_MAX_ATTEMPTS = 5;
+/** login_otps.otp_hash of a code MSG91's OTP Widget sent: the prefix + its request id. */
+const WIDGET_PREFIX = 'msg91w:';
 const RESET_TTL_MS = 60 * 60 * 1000;
 
 // Only the hash is stored, so a leaked table can't be used to reset accounts.
@@ -26,31 +29,77 @@ function signToken(user) {
   );
 }
 
+// Starts with a letter so it can never be mistaken for a phone number, and
+// has no "@" so it can never be mistaken for an email.
+const USERNAME_RE = /^[A-Za-z][A-Za-z0-9._]{2,29}$/;
+
+/** A 10-digit Indian mobile number from "98765 43210", "+91 98765-43210" etc. */
+function normalizePhone(raw) {
+  const digits = String(raw ?? '').replace(/\D/g, '');
+  const ten = digits.length === 12 && digits.startsWith('91') ? digits.slice(2) : digits;
+  return /^\d{10}$/.test(ten) ? ten : null;
+}
+
+/** Finds the account for a username, or an email for accounts made before usernames. */
+async function findByLogin(identifier) {
+  const column = identifier.includes('@') ? 'email' : 'username';
+  const { rows } = await pool.query(
+    `SELECT * FROM users WHERE lower(${column}) = lower($1) ORDER BY (${column} = $1) DESC LIMIT 1`,
+    [identifier]
+  );
+  return rows[0];
+}
+
+/**
+ * Phone numbers aren't unique (one person may have a customer and a vendor
+ * account), so the role picked on the sign-in screen breaks the tie, then
+ * the newest account.
+ */
+async function findByPhone(phone, role) {
+  const { rows } = await pool.query(
+    `SELECT * FROM users
+      WHERE right(regexp_replace(coalesce(phone_number, ''), '\\D', '', 'g'), 10) = $1
+      ORDER BY (role = $2) DESC, created_at DESC LIMIT 1`,
+    [phone, VALID_ROLES.includes(role) ? role : 'customer']
+  );
+  return rows[0];
+}
+
 async function signup(req, res) {
-  const { fullName, email, phoneNumber, password, role } = req.body || {};
+  const { fullName, username, email, phoneNumber, password, role } = req.body || {};
   if (!email || !password || password.length < 8) {
     return res.status(400).json({ message: 'Invalid email or password' });
+  }
+  if (username != null && (typeof username !== 'string' || !USERNAME_RE.test(username))) {
+    return res.status(400).json({ message: 'Username must be 3-30 letters, numbers, dots or underscores, starting with a letter' });
   }
   const userRole = VALID_ROLES.includes(role) ? role : 'customer';
   const passwordHash = await bcrypt.hash(password, 10);
   try {
     await pool.query(
-      'INSERT INTO users (full_name, email, phone_number, password_hash, role) VALUES ($1, $2, $3, $4, $5)',
-      [fullName, email, phoneNumber, passwordHash, userRole]
+      'INSERT INTO users (full_name, username, email, phone_number, password_hash, role) VALUES ($1, $2, $3, $4, $5, $6)',
+      [fullName, username || null, email, phoneNumber, passwordHash, userRole]
     );
     res.status(201).json({ message: 'User created' });
   } catch (err) {
     if (err.code === '23505') {
-      return res.status(409).json({ message: 'User already exists' });
+      if (err.constraint === 'idx_users_username_lower') {
+        return res.status(409).json({ field: 'username', message: 'That username is taken' });
+      }
+      return res.status(409).json({ field: 'email', message: 'User already exists' });
     }
     throw err;
   }
 }
 
+/** Password sign-in with a username (or, for older accounts, an email). */
 async function login(req, res) {
-  const { email, password } = req.body || {};
-  const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-  const user = rows[0];
+  const { identifier, email, password } = req.body || {};
+  const login = String(identifier ?? email ?? '').trim();
+  if (!login || typeof password !== 'string') {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+  const user = await findByLogin(login);
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
     return res.status(401).json({ message: 'Invalid credentials' });
   }
@@ -107,12 +156,13 @@ async function resetPassword(req, res) {
   res.json({ message: 'Password updated. Please log in again.' });
 }
 
-const PROFILE_COLUMNS = 'id, full_name, email, phone_number, role, created_at';
+const PROFILE_COLUMNS = 'id, full_name, username, email, phone_number, role, created_at';
 
 function toProfile(row) {
   return {
     id: row.id,
     fullName: row.full_name,
+    username: row.username,
     email: row.email,
     phoneNumber: row.phone_number,
     role: row.role,
@@ -181,18 +231,58 @@ async function refresh(req, res) {
 }
 
 /**
- * Step 1 of passwordless login: mails a 6-digit code. The response is the same
- * whether or not the email has an account, so this can't be used to probe for
- * accounts. Email only for now; an SMS channel can slot in beside sendMail.
+ * Who an OTP request is for: `{phone, role}` texts the code, `{email}` mails
+ * it. Returns `{error}` (status + message) for a malformed request.
+ */
+async function otpTarget(body) {
+  const { email, phone, role } = body || {};
+  if (phone !== undefined) {
+    const ph = normalizePhone(phone);
+    if (!ph) return { error: [400, 'Enter a valid 10-digit mobile number'] };
+    return {
+      user: await findByPhone(ph, role),
+      // otp_length is in every reply, account or not, so it reveals nothing.
+      generic: { message: 'If that number has an account, an OTP has been sent', otp_length: sms.otpLength() },
+      // MSG91's OTP Widget makes and checks the code itself; we keep only
+      // its request id (prefixed, in otp_hash) to verify against later.
+      issue: sms.usesWidget()
+        ? async () => `${WIDGET_PREFIX}${await sms.sendWidgetOtp(`+91${ph}`)}`
+        : undefined,
+      deliver: (otp) => sms.sendSms({
+        to: `+91${ph}`,
+        otp,
+        expiryMinutes: OTP_TTL_MS / 60000,
+        text: `${otp} is your Gloaro Mart login OTP. It expires in 10 minutes. Do not share it with anyone.`,
+      }),
+    };
+  }
+  if (typeof email !== 'string' || !email.trim()) {
+    return { error: [400, 'Email or phone number is required'] };
+  }
+  const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email.trim()]);
+  return {
+    user: rows[0],
+    generic: { message: 'If that email has an account, an OTP has been sent' },
+    deliver: (otp) => sendMail({
+      to: email.trim(),
+      subject: 'Your Gloaro Mart login OTP',
+      text: `Your login OTP is ${otp}\n\nIt expires in 10 minutes. If you did not ask for this, ignore this email.`,
+    }),
+  };
+}
+
+/**
+ * Step 1 of passwordless login: texts (phone) or mails (email) a 6-digit
+ * code. The response is the same whether or not the number or email has an
+ * account, so this can't be used to probe for accounts.
  */
 async function sendLoginOtp(req, res) {
-  const { email } = req.body || {};
-  if (typeof email !== 'string' || !email.trim()) {
-    return res.status(400).json({ message: 'Email is required' });
+  if (req.body?.phone !== undefined && !sms.isAvailable()) {
+    return res.status(503).json({ message: 'Phone sign-in is not available yet. Please use your username and password.' });
   }
-  const generic = { message: 'If that email has an account, an OTP has been sent' };
-  const { rows } = await pool.query('SELECT id FROM users WHERE email = $1', [email.trim()]);
-  const user = rows[0];
+  const target = await otpTarget(req.body);
+  if (target.error) return res.status(target.error[0]).json({ message: target.error[1] });
+  const { user, generic } = target;
   if (!user) return res.json(generic);
 
   const recent = await pool.query(
@@ -203,16 +293,17 @@ async function sendLoginOtp(req, res) {
     return res.status(429).json({ message: 'Please wait a minute before requesting another OTP' });
   }
 
-  const otp = crypto.randomInt(100000, 1000000).toString();
-  const otpHash = await bcrypt.hash(otp, 10);
+  let otpHash;
   try {
-    await sendMail({
-      to: email.trim(),
-      subject: 'Your Gloaro Mart login OTP',
-      text: `Your login OTP is ${otp}\n\nIt expires in 10 minutes. If you did not ask for this, ignore this email.`,
-    });
+    if (target.issue) {
+      otpHash = await target.issue();
+    } else {
+      const otp = crypto.randomInt(100000, 1000000).toString();
+      otpHash = await bcrypt.hash(otp, 10);
+      await target.deliver(otp);
+    }
   } catch (err) {
-    console.error('[login-otp] mail failed:', err.message);
+    console.error('[login-otp] send failed:', err.message);
     return res.status(502).json({ message: 'Could not send the OTP. Please try again.' });
   }
   // A new code replaces any still-open one, so only the latest can be used.
@@ -226,14 +317,13 @@ async function sendLoginOtp(req, res) {
 
 /** Step 2: a correct, unexpired code signs the user in and returns a token. */
 async function verifyLoginOtp(req, res) {
-  const { email, otp } = req.body || {};
-  if (typeof email !== 'string' || !email.trim() || !otp) {
-    return res.status(400).json({ message: 'Email and OTP are required' });
-  }
+  const { otp } = req.body || {};
+  if (!otp) return res.status(400).json({ message: 'OTP is required' });
+  const target = await otpTarget(req.body);
+  if (target.error) return res.status(target.error[0]).json({ message: target.error[1] });
   const invalid = () => res.status(401).json({ message: 'Invalid or expired OTP' });
 
-  const { rows: users } = await pool.query('SELECT * FROM users WHERE email = $1', [email.trim()]);
-  const user = users[0];
+  const { user } = target;
   if (!user) return invalid();
 
   const { rows } = await pool.query(
@@ -245,7 +335,18 @@ async function verifyLoginOtp(req, res) {
   const pending = rows[0];
   if (!pending || pending.attempts >= OTP_MAX_ATTEMPTS) return invalid();
 
-  if (!(await bcrypt.compare(String(otp), pending.otp_hash))) {
+  let matches;
+  if (pending.otp_hash.startsWith(WIDGET_PREFIX)) {
+    try {
+      matches = await sms.verifyWidgetOtp(pending.otp_hash.slice(WIDGET_PREFIX.length), otp);
+    } catch (err) {
+      console.error('[login-otp] widget verify failed:', err.message);
+      return res.status(502).json({ message: 'Could not check the OTP. Please try again.' });
+    }
+  } else {
+    matches = await bcrypt.compare(String(otp), pending.otp_hash);
+  }
+  if (!matches) {
     await pool.query('UPDATE login_otps SET attempts = attempts + 1 WHERE id = $1', [pending.id]);
     return invalid();
   }
@@ -377,7 +478,7 @@ async function deleteMe(req, res) {
     );
     await client.query(
       `UPDATE users
-          SET full_name = NULL, phone_number = NULL,
+          SET full_name = NULL, username = NULL, phone_number = NULL,
               email = $2, password_hash = $3,
               token_version = token_version + 1
         WHERE id = $1`,

@@ -35,3 +35,13 @@ services:
       # Optional: AI search falls back to keyword search without it.
       - key: ANTHROPIC_API_KEY
         sync: false
+      # Phone-login OTP texts via MSG91 (see .env.example). Without these,
+      # production refuses phone sign-in instead of pretending to send.
+      - key: SMS_PROVIDER
+        value: msg91
+      - key: MSG91_AUTH_KEY
+        sync: false
+      - key: MSG91_OTP_TEMPLATE_ID
+        sync: false
+      - key: MSG91_SENDER_ID
+        sync: false

@@ -516,6 +516,9 @@ async function createRefund(req, res) {
 
     const provider = getProvider(payment.provider);
     const { providerRefundId, status: providerStatus } = provider.createRefund({ payment, refund });
+    // A provider that holds the money itself (the customer wallet) settles in
+    // this same transaction.
+    if (provider.settleRefund) await provider.settleRefund(client, { payment, refund });
     await client.query('UPDATE refunds SET provider_refund_id = $2, status = $3, updated_at = now() WHERE id = $1', [
       refund.id,
       providerRefundId,
@@ -626,6 +629,7 @@ async function approveRefund(req, res) {
 
     const provider = getProvider(payment.provider);
     const { providerRefundId, status: providerStatus } = provider.createRefund({ payment, refund });
+    if (provider.settleRefund) await provider.settleRefund(client, { payment, refund });
     await client.query('UPDATE refunds SET provider_refund_id = $2, status = $3, updated_at = now() WHERE id = $1', [
       refund.id,
       providerRefundId,
