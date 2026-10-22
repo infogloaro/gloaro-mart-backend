@@ -407,6 +407,8 @@ router.post("/whatsapp/messages/:id/retry", whatsappAdmin.retryMessage);
 router.post("/whatsapp/test-send", whatsappAdmin.testSend);
 
 // Ad Promotions pricing — guarded by the ad_promotions permission module.
+router.get("/rewards/settings", require("../controllers/rewards.controller").getSettings);
+router.patch("/rewards/settings", require("../controllers/rewards.controller").updateSettings);
 router.get("/ads/settings", adPricing.getSettings);
 router.patch("/ads/settings", adPricing.updateSettings);
 router.get("/ads/levels", adPricing.listLevels);

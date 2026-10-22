@@ -502,6 +502,12 @@ async function releaseRefund(req, res) {
       return res.status(409).json({ message: 'This return is for a replacement — it is handled on the Replacements page.' });
     }
     request.refund_id = await raiseRefund(client, request, req.user.id);
+    // SB11: the return's share of the points earned goes, of the points spent comes back.
+    await require('../services/rewards').onReturnRefunded(client, {
+      orderId: request.order_id,
+      returnId: request.id,
+      refundCents: request.approved_refund_cents ?? 0,
+    });
     await client.query(
       `UPDATE order_returns SET status = 'refunded', refund_id = $2, updated_at = now() WHERE id = $1`,
       [request.id, request.refund_id]

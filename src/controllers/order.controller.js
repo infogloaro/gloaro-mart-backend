@@ -23,6 +23,7 @@ const { issueAfterDelivery } = require('../services/invoices');
 const business = require('../services/business');
 const analytics = require('../services/analytics');
 const { notifyNewOrders } = require('../services/vendorNotify');
+const rewards = require('../services/rewards');
 const { CancellationError } = cancellations;
 
 const STATUS_FLOW = ['pending', 'confirmed', 'packed', 'out_for_delivery', 'delivered'];
@@ -95,6 +96,8 @@ async function checkout(req, res) {
     // Set to order for the caller's business (Business Accounts): its GSTIN goes
     // on the invoices, and it may pay 'credit'.
     businessAccountId = null,
+    // SB11: reward points to spend on this checkout (capped server-side).
+    redeemPoints = 0,
   } = req.body || {};
   // addressId is the current contract; deliveryAddress is the legacy free-text
   // field, still accepted while older app builds are in the field.
@@ -286,6 +289,25 @@ async function checkout(req, res) {
     );
     const group = groupRows[0];
 
+    // SB11: the points this checkout spends, split over the shops by what
+    // their items cost after coupons. Locks the customer's balance.
+    const rewardSettings = await rewards.getSettings(client);
+    const baseByVendor = new Map();
+    for (const [vendorId, vendorItems] of itemsByVendor) {
+      const subtotal = vendorItems.reduce(
+        (sum, it) => sum + resolveUnitPriceCents(it, it.quantity, tiersByProduct.get(it.product_id)) * it.quantity,
+        0
+      );
+      baseByVendor.set(vendorId, subtotal - (resolvedCoupons.get(vendorId)?.discountCents || 0));
+    }
+    const redemption = await rewards.planRedemption(client, {
+      userId: req.user.id,
+      requestedPoints: redeemPoints,
+      baseByVendor,
+      settings: rewardSettings,
+    });
+    const pointSpends = [];
+
     for (const [vendorId, vendorItems] of itemsByVendor) {
       const resolvedItems = vendorItems.map((it) => ({
         ...it,
@@ -309,8 +331,14 @@ async function checkout(req, res) {
         deliveryChargeCents,
       });
       const campaignDiscountCents = campaign?.discountCents || 0;
+      // Points come last, so they never take the items below zero.
+      const spend = rewards.pointsForOrder(
+        redemption.byVendor.get(vendorId) || 0,
+        subtotalCents - couponDiscountCents - campaignDiscountCents,
+        rewardSettings
+      );
       // discount_cents stays the whole discount, so totals and groups add up as before.
-      const discountCents = couponDiscountCents + campaignDiscountCents;
+      const discountCents = couponDiscountCents + campaignDiscountCents + spend.cents;
       const totalCents = subtotalCents - discountCents + gstCents + deliveryChargeCents;
 
       const { rows: orderRows } = await client.query(
@@ -318,8 +346,9 @@ async function checkout(req, res) {
           (user_id, vendor_id, status, payment_method, subtotal_cents, gst_cents, discount_cents, total_cents,
            delivery_address, coupon_id, coupon_code_snapshot,
            address_id, delivery_address_snapshot, delivery_charge_cents, delivery_method, checkout_group_id,
-           sales_channel_id, campaign_discount_cents, business_account_id, origin)
-         VALUES ($1, $2, 'pending', $15, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $16, $17, $18, $19)
+           sales_channel_id, campaign_discount_cents, business_account_id, origin,
+           points_redeemed, points_discount_cents)
+         VALUES ($1, $2, 'pending', $15, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $16, $17, $18, $19, $20, $21)
          RETURNING *`,
         [
           req.user.id,
@@ -343,9 +372,12 @@ async function checkout(req, res) {
           campaignDiscountCents,
           businessAccountId,
           origin,
+          spend.points,
+          spend.cents,
         ]
       );
       const order = orderRows[0];
+      pointSpends.push({ order, ...spend });
       if (campaign) {
         await client.query(
           `INSERT INTO order_campaigns (order_id, campaign_id, discount_cents, platform_cents, vendor_cents)
@@ -378,6 +410,13 @@ async function checkout(req, res) {
           ]
         );
       }
+      // Points on what the customer pays for the items; spendable once delivered.
+      await rewards.earnOnOrder(client, {
+        order,
+        items: resolvedItems,
+        eligibleCents: subtotalCents - discountCents,
+        settings: rewardSettings,
+      });
 
       // Stock is held only now that the order exists to hold it against. The
       // rows were locked above, so this is the check that decides the checkout.
@@ -398,6 +437,7 @@ async function checkout(req, res) {
 
       createdOrders.push({ ...order, checkout_group_reference: group.reference });
     }
+    if (redemption.points > 0) await rewards.spendPoints(client, { userId: req.user.id, spends: pointSpends });
 
     // Roll the group total up from the vendor orders, so the customer sees one
     // figure without the app having to add up N orders itself.
@@ -552,7 +592,9 @@ async function getOrderGroup(req, res) {
   if (group.user_id !== req.user.id) return res.status(403).json({ message: 'Forbidden' });
 
   const { rows: orders } = await pool.query(
-    `SELECT o.id, o.vendor_id, o.status, o.total_cents, vp.business_name AS vendor_name
+    `SELECT o.id, o.vendor_id, o.status, o.total_cents, vp.business_name AS vendor_name,
+            o.points_redeemed, o.points_discount_cents,
+            (SELECT t.points FROM reward_transactions t WHERE t.order_id = o.id AND t.type = 'earn' AND t.status <> 'void') AS points_earned
      FROM orders o
      JOIN vendor_profiles vp ON vp.id = o.vendor_id
      WHERE o.checkout_group_id = $1
@@ -587,6 +629,10 @@ async function getOrderGroup(req, res) {
     discountCents: group.discount_cents,
     deliveryChargeCents: group.delivery_charge_cents,
     totalCents: group.total_cents,
+    // SB11: points spent on this purchase (inside discountCents) and earned on it.
+    pointsRedeemed: orders.reduce((s, o) => s + o.points_redeemed, 0),
+    pointsDiscountCents: orders.reduce((s, o) => s + o.points_discount_cents, 0),
+    pointsEarned: orders.reduce((s, o) => s + (o.points_earned || 0), 0),
     paymentMethod: group.payment_method,
     paymentStatus: group.payment_status,
     createdAt: group.created_at,
@@ -768,6 +814,7 @@ async function updateStatus(req, res) {
     await creditWalletForOrder(updatedOrder);
     await issueAfterDelivery(updatedOrder.id);
     await settleCodForOrder(updatedOrder.id);
+    await rewards.creditForOrder(updatedOrder.id);
   }
 
   res.json(updatedOrder);

@@ -3781,3 +3781,65 @@ ALTER TABLE coupons ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ;
 ALTER TABLE coupons ADD COLUMN IF NOT EXISTS hidden_reason TEXT;
 ALTER TABLE coupons ADD COLUMN IF NOT EXISTS hidden_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_coupons_public_shop ON coupons (created_at DESC) WHERE vendor_id IS NOT NULL AND (is_public OR hidden_at IS NOT NULL);
+-- ===== REWARD POINTS (SB11) =====
+-- Customers earn points on what they pay for items and spend them as a
+-- discount at checkout. Gloaro Mart funds the discount: the shop is paid as if
+-- the customer had paid it (settlements.grossFor, creditWalletForOrder).
+-- Earned points are 'pending' until the order is delivered, then 'credited';
+-- a cancelled order voids them. Rules in services/rewards.js. Plan: G_mart
+-- docs/WORK_PLAN.md (RW).
+CREATE TABLE IF NOT EXISTS reward_settings (
+  id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  enabled BOOLEAN NOT NULL DEFAULT true,
+  -- Earn [earn_points] for every [earn_per_rupees] paid for items.
+  earn_points INTEGER NOT NULL DEFAULT 1 CHECK (earn_points BETWEEN 0 AND 1000),
+  earn_per_rupees INTEGER NOT NULL DEFAULT 10 CHECK (earn_per_rupees BETWEEN 1 AND 100000),
+  -- [points_per_rupee] points take ₹1 off.
+  points_per_rupee INTEGER NOT NULL DEFAULT 10 CHECK (points_per_rupee BETWEEN 1 AND 1000),
+  -- Points pay at most this share of the items (after coupons and campaigns).
+  max_redeem_percent INTEGER NOT NULL DEFAULT 20 CHECK (max_redeem_percent BETWEEN 0 AND 100),
+  min_redeem_points INTEGER NOT NULL DEFAULT 10 CHECK (min_redeem_points >= 0),
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO reward_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS reward_accounts (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  balance_points INTEGER NOT NULL DEFAULT 0 CHECK (balance_points >= 0),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Append-only, except an 'earn' row's status (pending → credited | void).
+--   earn          +points on an order (items: the per-product split)
+--   redeem        -points spent on an order at checkout
+--   redeem_refund +points spent on an order that was cancelled or refunded
+--   earn_reversal -points taken back when a delivered order is refunded on a return
+--   adjustment    ±points by an admin
+CREATE TABLE IF NOT EXISTS reward_transactions (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+  return_id INTEGER REFERENCES order_returns(id) ON DELETE SET NULL,
+  type TEXT NOT NULL CHECK (type IN ('earn', 'redeem', 'redeem_refund', 'earn_reversal', 'adjustment')),
+  status TEXT NOT NULL DEFAULT 'credited' CHECK (status IN ('pending', 'credited', 'void')),
+  -- Signed: what the row does to the balance once credited.
+  points INTEGER NOT NULL CHECK (points <> 0),
+  balance_after INTEGER,
+  value_cents INTEGER NOT NULL DEFAULT 0,
+  items JSONB NOT NULL DEFAULT '[]'::jsonb,
+  description TEXT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  credited_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_reward_txns_user ON reward_transactions (user_id, created_at DESC, id DESC);
+-- An order earns and spends once; a cancellation (return_id NULL) or a return gives back once.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reward_txns_one_earn ON reward_transactions (order_id) WHERE type = 'earn';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reward_txns_one_redeem ON reward_transactions (order_id) WHERE type = 'redeem';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reward_txns_one_refund
+  ON reward_transactions (order_id, type, COALESCE(return_id, 0)) WHERE type IN ('redeem_refund', 'earn_reversal') AND order_id IS NOT NULL;
+
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS points_redeemed INTEGER NOT NULL DEFAULT 0;
+-- Part of discount_cents (so totals add up as before), funded by Gloaro Mart.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS points_discount_cents INTEGER NOT NULL DEFAULT 0;

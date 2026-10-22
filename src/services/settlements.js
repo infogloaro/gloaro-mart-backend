@@ -56,8 +56,10 @@ async function grossFor(client, order) {
   );
   // A replacement's "discount" is the whole price, given free; the platform pays only what platform_paid_cents says.
   if (order.replacement_of_order_id) return order.total_cents + order.platform_paid_cents;
-  const couponPart = order.discount_cents - order.campaign_discount_cents;
-  return order.total_cents + rows[0].campaign_platform + (rows[0].platform_coupon ? couponPart : 0);
+  // Reward points (SB11) sit inside discount_cents and are always Gloaro Mart's.
+  const pointsPart = order.points_discount_cents || 0;
+  const couponPart = order.discount_cents - order.campaign_discount_cents - pointsPart;
+  return order.total_cents + rows[0].campaign_platform + pointsPart + (rows[0].platform_coupon ? couponPart : 0);
 }
 
 const rupees = (c) => `₹${(c / 100).toFixed(2)}`;

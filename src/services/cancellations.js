@@ -118,6 +118,7 @@ async function cancelInTxn(client, { order, cancellation, actorRole, userId, fee
   }
 
   await onOrderStatusChanged(client, rows[0], 'cancelled', { actorRole, userId });
+  await require('./rewards').onOrderCancelled(client, rows[0]);
 
   const paid = await refundableFor(client, order);
   const money =

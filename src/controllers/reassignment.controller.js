@@ -166,6 +166,8 @@ async function cancelOriginal(client, order, { note, userId, actorRole }) {
     note,
   });
   await bumpMetrics(client, order.vendor_id, { ordersRejected: 1, openOrders: -1 });
+  // The re-routed order carries no discount, so the points come back.
+  await require('../services/rewards').onOrderCancelled(client, order);
 }
 
 const proposedTotalOf = (replacement) => replacement.lines.reduce((sum, l) => sum + l.lineTotalCents, 0);

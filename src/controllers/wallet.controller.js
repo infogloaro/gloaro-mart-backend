@@ -17,14 +17,17 @@ async function creditWalletForOrder(order) {
   // A free replacement (₹0) earns nothing at delivery; what the platform owes for
   // it, if anything, comes through settlements.
   if (order.total_cents <= 0) return null;
+  // Reward points (SB11) are Gloaro Mart's discount: the shop is paid as if
+  // the customer had paid that part.
+  const amountCents = order.total_cents + (order.points_discount_cents || 0);
   const wallet = await getOrCreateWallet(order.vendor_id);
-  const newBalance = wallet.balance_cents + order.total_cents;
+  const newBalance = wallet.balance_cents + amountCents;
   const { rows: txnRows } = await pool.query(
     `INSERT INTO wallet_transactions (vendor_wallet_id, order_id, type, amount_cents, balance_after_cents, description)
      VALUES ($1, $2, 'credit', $3, $4, $5)
      ON CONFLICT (order_id) WHERE type = 'credit' DO NOTHING
      RETURNING *`,
-    [wallet.id, order.id, order.total_cents, newBalance, `Order #${order.id} delivered`]
+    [wallet.id, order.id, amountCents, newBalance, `Order #${order.id} delivered`]
   );
   if (txnRows[0]) {
     await pool.query('UPDATE vendor_wallets SET balance_cents = $2, updated_at = now() WHERE id = $1', [

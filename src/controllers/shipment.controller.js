@@ -239,6 +239,7 @@ async function recordEvent(req, res) {
     await creditWalletForOrder(order);
     await require('../services/invoices').issueAfterDelivery(order.id);
     await settleCodForOrder(order.id);
+    await require('../services/rewards').creditForOrder(order.id);
   }
   if (status === 'returned' && !['cancelled', 'delivered'].includes(order.status)) {
     await cancellations.adminCancel({

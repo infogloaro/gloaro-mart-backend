@@ -373,7 +373,10 @@ async function releaseExpiredHolds(client, { now = null } = {}) {
        RETURNING id, vendor_id`,
       [orderId]
     );
-    if (rows[0]) cancelled.push(rows[0]);
+    if (rows[0]) {
+      cancelled.push(rows[0]);
+      await require('./rewards').onOrderCancelled(client, rows[0]);
+    }
   }
 
   return { released: expired.length, cancelledOrders: cancelled };

@@ -456,6 +456,7 @@ async function updateOrderStatus(req, res) {
   if (status === 'delivered') {
     await creditWalletForOrder(order);
     await issueAfterDelivery(order.id);
+    await require('../services/rewards').creditForOrder(order.id);
   }
   // Same rule as the vendor endpoint: a cancellation puts the stock back,
   // whether it was still held or already counted as sold.

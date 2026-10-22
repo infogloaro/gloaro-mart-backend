@@ -45,6 +45,7 @@ app.use("/api/reviews", require("./routes/review.routes"));
 app.use("/api/support", require("./routes/support.routes"));
 app.use("/api/business", require("./routes/business.routes"));
 app.use("/api/wallet", require("./routes/wallet.routes"));
+app.use("/api/rewards", require("./routes/rewards.routes"));
 app.use("/api/coupons", require("./routes/coupon.routes"));
 app.use("/api/org", require("./routes/org.routes"));
 app.use("/api/referrals", require("./routes/referral.routes"));

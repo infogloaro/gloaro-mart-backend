@@ -99,6 +99,7 @@ const MODULES = [
   { key: "home_sections", label: "Home Sections", group: "Marketing & CMS", routes: ["home-sections"] },
   { key: "campaigns", label: "Campaigns", group: "Marketing & CMS", routes: ["campaigns"] },
   { key: "ad_promotions", label: "Ad Promotions", group: "Marketing & CMS", routes: ["ads"] },
+  { key: "rewards", label: "Reward Points", group: "Marketing & CMS", routes: ["rewards"] },
 
   // ----- Customers & Network -----
   { key: "users", label: "Users", group: "Customers & Network", routes: ["users"] },
