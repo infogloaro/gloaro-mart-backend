@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const shopBranding = require('../services/shopBranding');
 
 const BUSINESS_TYPES = ['b2b', 'b2c', 'both'];
 const VENDOR_SORTS = ['rating', 'newest', 'nearest', 'name'];
@@ -41,6 +42,14 @@ async function getMyProfile(req, res) {
 async function updateMyProfile(req, res) {
   const { businessName, businessType, gstNumber, addressLine, city, state, pincode, latitude, longitude } =
     req.body || {};
+  // Description, logo and cover (SB1): only the ones sent change; '' clears.
+  let branding;
+  try {
+    branding = shopBranding.brandingSet(shopBranding.readBranding(req.body || {}), 11);
+  } catch (err) {
+    if (err instanceof shopBranding.BrandingError) return res.status(err.status).json({ message: err.message });
+    throw err;
+  }
   const { rows } = await pool.query(
     `UPDATE vendor_profiles SET
       business_name = COALESCE($2, business_name),
@@ -51,14 +60,48 @@ async function updateMyProfile(req, res) {
       state = COALESCE($7, state),
       pincode = COALESCE($8, pincode),
       latitude = COALESCE($9, latitude),
-      longitude = COALESCE($10, longitude)
+      longitude = COALESCE($10, longitude)${branding.sql.map((s) => `,\n      ${s}`).join('')}
      WHERE user_id = $1
      RETURNING *`,
-    [req.user.id, businessName, businessType, gstNumber, addressLine, city, state, pincode, latitude, longitude]
+    [req.user.id, businessName, businessType, gstNumber, addressLine, city, state, pincode, latitude, longitude, ...branding.values]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Vendor profile not found' });
   res.json(rows[0]);
 }
+
+async function myVendorId(userId) {
+  const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [userId]);
+  return rows[0]?.id ?? null;
+}
+
+/** The shop's own gallery handlers (SB1): every photo with its status. */
+const gallery = (fn) => async (req, res) => {
+  const vendorId = await myVendorId(req.user.id);
+  if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
+  try {
+    await fn(vendorId, req, res);
+  } catch (err) {
+    if (err instanceof shopBranding.BrandingError) return res.status(err.status).json({ message: err.message });
+    throw err;
+  }
+};
+
+const getMyGallery = gallery(async (vendorId, req, res) => {
+  res.json({ items: await shopBranding.fullGallery(vendorId), max: shopBranding.MAX_PHOTOS });
+});
+
+const addGalleryPhoto = gallery(async (vendorId, req, res) => {
+  res.status(201).json(await shopBranding.addPhoto(vendorId, req.body));
+});
+
+const updateGalleryPhoto = gallery(async (vendorId, req, res) => {
+  res.json(await shopBranding.updatePhoto(vendorId, req.params.photoId, req.body));
+});
+
+const removeGalleryPhoto = gallery(async (vendorId, req, res) => {
+  await shopBranding.removePhoto(vendorId, req.params.photoId);
+  res.status(204).send();
+});
 
 async function getPublicProfile(req, res) {
   const { rows } = await pool.query(
@@ -75,7 +118,12 @@ async function getPublicProfile(req, res) {
   );
   if (!rows[0]) return res.status(404).json({ message: 'Vendor not found' });
   const vendor = rows[0];
-  res.json({ ...vendor, rating: vendor.rating == null ? null : Number(vendor.rating) });
+  res.json({
+    ...vendor,
+    rating: vendor.rating == null ? null : Number(vendor.rating),
+    // Visible photos only (SB1); hidden ones never reach customers.
+    gallery: await shopBranding.publicGallery(vendor.id),
+  });
 }
 
 /**
@@ -183,4 +231,14 @@ async function listVendors(req, res) {
   });
 }
 
-module.exports = { createProfile, getMyProfile, updateMyProfile, getPublicProfile, listVendors };
+module.exports = {
+  createProfile,
+  getMyProfile,
+  updateMyProfile,
+  getPublicProfile,
+  listVendors,
+  getMyGallery,
+  addGalleryPhoto,
+  updateGalleryPhoto,
+  removeGalleryPhoto,
+};

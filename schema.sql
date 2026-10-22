@@ -3442,3 +3442,26 @@ CREATE TABLE IF NOT EXISTS media_files (
 -- case; accounts made before this keep signing in with their email.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users (lower(username)) WHERE username IS NOT NULL;
+
+-- ===== SHOP BRANDING & GALLERY (SB1) =====
+-- Shops set their own description, logo and cover (vendor_profiles already
+-- has the columns; nothing wrote them before) and keep a small photo gallery
+-- that customers see on the shop page. Photos show at once; an admin can hide
+-- one with a reason. Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB1).
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS logo_url TEXT;
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS cover_image_url TEXT;
+
+CREATE TABLE IF NOT EXISTS vendor_gallery (
+  id SERIAL PRIMARY KEY,
+  vendor_id INT NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  caption VARCHAR(140),
+  sort_order INT NOT NULL DEFAULT 0,
+  status VARCHAR(16) NOT NULL DEFAULT 'visible' CHECK (status IN ('visible', 'hidden')),
+  hidden_reason VARCHAR(300),
+  hidden_by INT REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_vendor_gallery_vendor ON vendor_gallery (vendor_id, sort_order, id);

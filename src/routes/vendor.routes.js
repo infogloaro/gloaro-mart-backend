@@ -4,6 +4,7 @@ const vendorController = require('../controllers/vendor.controller');
 const delivery = require('../controllers/deliverySettings.controller');
 const { getVendorProducts } = require('../controllers/product.controller');
 const review = require('../controllers/review.controller');
+const { uploadTo } = require('../controllers/upload.controller');
 
 const router = express.Router();
 
@@ -18,6 +19,14 @@ router.put('/delivery-settings', requireAuth, requireRole('vendor'), delivery.up
 router.get('/service-areas', requireAuth, requireRole('vendor'), delivery.getMyAreas);
 router.post('/service-areas', requireAuth, requireRole('vendor'), delivery.addMyArea);
 router.delete('/service-areas/:id', requireAuth, requireRole('vendor'), delivery.deleteMyArea);
+
+// Shop branding & gallery (SB1). Pictures upload to /uploads/vendors first;
+// the profile and gallery only accept paths from there.
+router.post('/uploads', requireAuth, requireRole('vendor'), uploadTo('vendors'));
+router.get('/gallery', requireAuth, requireRole('vendor'), vendorController.getMyGallery);
+router.post('/gallery', requireAuth, requireRole('vendor'), vendorController.addGalleryPhoto);
+router.patch('/gallery/:photoId', requireAuth, requireRole('vendor'), vendorController.updateGalleryPhoto);
+router.delete('/gallery/:photoId', requireAuth, requireRole('vendor'), vendorController.removeGalleryPhoto);
 
 // Public: the Mart tab's shop-discovery grid. Must stay above '/:id' for the
 // same reason 'delivery-settings' does.

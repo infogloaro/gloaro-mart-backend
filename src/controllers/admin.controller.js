@@ -9,6 +9,7 @@ const { recordAudit } = require('../services/auditLog');
 const cancellations = require('../services/cancellations');
 const shipments = require('../services/shipments');
 const { issueAfterDelivery } = require('../services/invoices');
+const shopBranding = require('../services/shopBranding');
 
 const ALL_ORDER_STATUSES = [...STATUS_FLOW, 'cancelled'];
 const USER_ROLES = ['customer', 'vendor', 'admin'];
@@ -143,6 +144,18 @@ async function updateVendor(req, res) {
   if ((latitude == null) !== (longitude == null)) {
     return res.status(400).json({ message: 'latitude and longitude must be set together' });
   }
+  // Description, logo and cover (SB1): an admin can correct what a shop shows.
+  let fields;
+  try {
+    fields = shopBranding.readBranding(req.body || {});
+  } catch (err) {
+    if (err instanceof shopBranding.BrandingError) return res.status(err.status).json({ message: err.message });
+    throw err;
+  }
+  const branding = shopBranding.brandingSet(fields, 11);
+  const { rows: before } = Object.keys(fields).length
+    ? await pool.query('SELECT description, logo_url, cover_image_url FROM vendor_profiles WHERE id = $1', [req.params.id])
+    : { rows: [] };
   const { rows } = await pool.query(
     `UPDATE vendor_profiles SET
       business_name = COALESCE($2, business_name),
@@ -153,12 +166,50 @@ async function updateVendor(req, res) {
       state = COALESCE($7, state),
       pincode = COALESCE($8, pincode),
       latitude = COALESCE($9, latitude),
-      longitude = COALESCE($10, longitude)
+      longitude = COALESCE($10, longitude)${branding.sql.map((s) => `,\n      ${s}`).join('')}
      WHERE id = $1 RETURNING *`,
-    [req.params.id, businessName, businessType, gstNumber, addressLine, city, state, pincode, latitude, longitude]
+    [req.params.id, businessName, businessType, gstNumber, addressLine, city, state, pincode, latitude, longitude, ...branding.values]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Vendor not found' });
+  if (before[0]) {
+    await recordAudit({
+      actorUserId: req.user.id,
+      action: 'vendor.branding_changed',
+      module: 'vendors',
+      entityType: 'vendor',
+      entityId: rows[0].id,
+      previousValue: Object.fromEntries(Object.keys(fields).map((k) => [k, before[0][k]])),
+      newValue: fields,
+    });
+  }
   res.json(rows[0]);
+}
+
+/** A shop's gallery with each photo's status (SB1). */
+async function getVendorGallery(req, res) {
+  const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = $1', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ message: 'Vendor not found' });
+  res.json({ items: await shopBranding.fullGallery(rows[0].id), max: shopBranding.MAX_PHOTOS });
+}
+
+/** Hide a gallery photo (the shop sees the reason) or show it again. */
+async function setVendorGalleryPhotoStatus(req, res) {
+  try {
+    const { before, after } = await shopBranding.setPhotoStatus(Number(req.params.id), req.params.photoId, req.body || {}, req.user.id);
+    await recordAudit({
+      actorUserId: req.user.id,
+      action: after.status === 'hidden' ? 'vendor.gallery_photo_hidden' : 'vendor.gallery_photo_shown',
+      module: 'vendors',
+      entityType: 'vendor_gallery',
+      entityId: after.id,
+      previousValue: { status: before.status, hiddenReason: before.hiddenReason },
+      newValue: { status: after.status, hiddenReason: after.hiddenReason },
+    });
+    res.json(after);
+  } catch (err) {
+    if (err instanceof shopBranding.BrandingError) return res.status(err.status).json({ message: err.message });
+    throw err;
+  }
 }
 
 // ── Orders (read-only, platform-wide) ──
@@ -847,6 +898,8 @@ module.exports = {
   listVendors,
   updateVendorStatus,
   updateVendor,
+  getVendorGallery,
+  setVendorGalleryPhotoStatus,
   listAllOrders,
   getAnyOrder,
   updateOrderStatus,

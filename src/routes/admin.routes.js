@@ -222,6 +222,9 @@ router.get("/vendors/:id/documents", kyc.listVendorDocuments);
 router.post("/vendors/:id/documents", kyc.createDocument);
 router.patch("/vendors/:id/status", admin.updateVendorStatus);
 router.patch("/vendors/:id", admin.updateVendor);
+// Shop gallery (SB1): every photo with its status; hide one with a reason.
+router.get("/vendors/:id/gallery", admin.getVendorGallery);
+router.patch("/vendors/:id/gallery/:photoId", admin.setVendorGalleryPhotoStatus);
 
 // Sprint 5 — the weights every vendor is ranked by, and the log of what those
 // weights decided.
