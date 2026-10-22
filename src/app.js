@@ -75,6 +75,19 @@ app.get("/api/platform/public", require("./controllers/platformPublic.controller
 // from the public vendor profiles under /api/vendors/:id.
 app.use("/api/vendor", require("./routes/vendorPortal.routes"));
 
+// The admin console, served from here so it needs no host of its own:
+// https://<backend>/admin. admin_console/ is the gloaro_mart_admin repo built
+// with ADMIN_BASE=/admin/ and VITE_API_URL=<this backend> (see its README).
+// File names under assets/ change with every build, so they cache for long;
+// index.html never does, so a new build shows up on the next visit.
+const ADMIN_DIR = require("path").join(__dirname, "..", "admin_console");
+app.use("/admin/assets", express.static(require("path").join(ADMIN_DIR, "assets"), { maxAge: "30d", immutable: true }));
+app.use("/admin", express.static(ADMIN_DIR, { index: false, maxAge: "1h" }));
+app.get(/^\/admin(\/.*)?$/, (req, res) => {
+  res.set("Cache-Control", "no-cache");
+  res.sendFile(require("path").join(ADMIN_DIR, "index.html"));
+});
+
 app.use(errorHandler);
 
 module.exports = app;
