@@ -16,6 +16,7 @@ const rfq = require('../controllers/rfq.controller');
 const quotation = require('../controllers/quotation.controller');
 const purchaseOrder = require('../controllers/purchaseOrder.controller');
 const vendorAds = require('../controllers/vendorAds.controller');
+const enquiries = require('../controllers/shopEnquiries.controller');
 const { uploadTo } = require('../controllers/upload.controller');
 
 /**
@@ -86,6 +87,12 @@ router.post('/ads/campaigns/:id/resume', vendorAds.resume);
 router.post('/ads/campaigns/:id/cancel', vendorAds.cancel);
 router.post('/ads/campaigns/:id/extend', vendorAds.extend);
 router.post('/ads/campaigns/:id/renew', vendorAds.renew);
+
+// Customers' questions to the shop ("Ask the shop", SB9).
+router.get('/enquiries', enquiries.vendorList);
+router.get('/enquiries/:id', enquiries.vendorGet);
+router.post('/enquiries/:id/messages', enquiries.vendorReply);
+router.post('/enquiries/:id/close', enquiries.vendorClose);
 
 // Read-only: attributes are platform-owned, so there is no POST here.
 router.get('/attributes', portal.listAttributes);

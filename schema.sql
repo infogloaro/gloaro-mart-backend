@@ -3684,3 +3684,46 @@ CREATE INDEX IF NOT EXISTS idx_orders_coupon ON orders (coupon_id) WHERE coupon_
 -- A free-delivery coupon has no amount of its own (it is the delivery charge).
 ALTER TABLE coupons DROP CONSTRAINT IF EXISTS coupons_discount_value_check;
 ALTER TABLE coupons ADD CONSTRAINT coupons_discount_value_check CHECK (discount_value > 0 OR discount_type = 'free_delivery');
+
+-- ===== SHOP ENQUIRIES (SB9) =====
+-- "Ask the shop": a customer asks a shop about stock, a variant, a wholesale
+-- quantity, delivery or anything else, optionally about one product, and the
+-- shop answers in a thread. Status: open (waiting for the shop), answered
+-- (the shop replied last), closed (either side closed it; a new question is a
+-- new enquiry). Each side's last read time drives its unread count. An
+-- enquiry started from a shop's ad keeps the campaign and counts as that ad's
+-- 'enquiry'. Rules in services/shopEnquiries.js.
+-- Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB9).
+CREATE SEQUENCE IF NOT EXISTS shop_enquiry_ref_seq;
+
+CREATE TABLE IF NOT EXISTS shop_enquiries (
+  id SERIAL PRIMARY KEY,
+  reference TEXT NOT NULL UNIQUE,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  topic VARCHAR(10) NOT NULL CHECK (topic IN ('stock', 'variant', 'wholesale', 'delivery', 'other')),
+  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+  product_name TEXT,
+  quantity INTEGER CHECK (quantity IS NULL OR quantity > 0),
+  status VARCHAR(10) NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'answered', 'closed')),
+  ad_campaign_id INTEGER REFERENCES ad_campaigns(id) ON DELETE SET NULL,
+  last_message_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_message_from VARCHAR(10) NOT NULL DEFAULT 'customer' CHECK (last_message_from IN ('customer', 'vendor')),
+  customer_read_at TIMESTAMPTZ,
+  vendor_read_at TIMESTAMPTZ,
+  closed_at TIMESTAMPTZ,
+  closed_by VARCHAR(10) CHECK (closed_by IS NULL OR closed_by IN ('customer', 'vendor')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_shop_enquiries_vendor ON shop_enquiries (vendor_id, status, last_message_at DESC);
+CREATE INDEX IF NOT EXISTS idx_shop_enquiries_user ON shop_enquiries (user_id, last_message_at DESC);
+
+CREATE TABLE IF NOT EXISTS shop_enquiry_messages (
+  id SERIAL PRIMARY KEY,
+  enquiry_id INTEGER NOT NULL REFERENCES shop_enquiries(id) ON DELETE CASCADE,
+  author_role VARCHAR(10) NOT NULL CHECK (author_role IN ('customer', 'vendor')),
+  author_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  body VARCHAR(2000) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_shop_enquiry_messages_enquiry ON shop_enquiry_messages (enquiry_id, created_at);
