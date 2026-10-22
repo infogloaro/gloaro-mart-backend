@@ -5,6 +5,7 @@ const delivery = require('../controllers/deliverySettings.controller');
 const { getVendorProducts } = require('../controllers/product.controller');
 const review = require('../controllers/review.controller');
 const { uploadTo } = require('../controllers/upload.controller');
+const shopReports = require('../controllers/shopReports.controller');
 
 const router = express.Router();
 
@@ -60,6 +61,11 @@ router.post('/views', optionalAuth, (req, res, next) => {
   if (tooManyViews(req.ip)) return res.status(429).json({ message: 'Too many view reports — batch them.' });
   next();
 }, vendorController.recordShopViews);
+
+// Reports of wrong shop details (SB7). The reasons list is above '/:id'.
+router.get('/report-reasons', shopReports.listReasons);
+router.post('/:id/report', requireAuth, shopReports.reportShop);
+router.get('/:id/report', requireAuth, shopReports.getMyReport);
 
 // Public: the Mart tab's shop-discovery grid. Must stay above '/:id' for the
 // same reason 'delivery-settings' does.

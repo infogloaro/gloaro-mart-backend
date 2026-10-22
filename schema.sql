@@ -3604,3 +3604,28 @@ CREATE TABLE IF NOT EXISTS shop_visit_daily (
   PRIMARY KEY (vendor_id, day)
 );
 CREATE INDEX IF NOT EXISTS idx_shop_visit_daily_day ON shop_visit_daily (day);
+-- ===== SHOP REPORTS (SB7) =====
+-- Customers report wrong shop details (closed for good, wrong hours, address,
+-- phone, map pin, category, not a real shop, other). Admins work the queue
+-- under Vendors: resolved (the details were fixed) or dismissed (they were
+-- right). The reporter is told either way; the admin's note stays internal.
+-- One open report per customer per shop; at most 10 new reports a day per
+-- customer. Rules in services/shopReports.js.
+-- Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB7).
+CREATE TABLE IF NOT EXISTS shop_reports (
+  id SERIAL PRIMARY KEY,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  reason VARCHAR(20) NOT NULL CHECK (reason IN (
+    'closed_permanently', 'wrong_hours', 'wrong_address', 'wrong_phone', 'wrong_location',
+    'wrong_category', 'not_real', 'other')),
+  note VARCHAR(500),
+  status VARCHAR(10) NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved', 'dismissed')),
+  resolution_note VARCHAR(500),
+  resolved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  resolved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shop_reports_one_open ON shop_reports (vendor_id, user_id) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_shop_reports_queue ON shop_reports (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_shop_reports_user ON shop_reports (user_id, created_at DESC);

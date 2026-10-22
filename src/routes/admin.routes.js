@@ -48,6 +48,7 @@ const adPricing = require("../controllers/adPricing.controller");
 const adCampaign = require("../controllers/adCampaign.controller");
 const adDashboard = require("../controllers/adDashboard.controller");
 const platformHealthController = require("../controllers/platformHealth.controller");
+const shopReports = require("../controllers/shopReports.controller");
 const { requirePermission } = require("../middleware/rbac");
 
 const router = express.Router();
@@ -217,6 +218,10 @@ router.get("/vendors", admin.listVendors);
 // Above every '/vendors/:id' form so 'performance' is not read as a vendor id.
 router.get("/vendors/performance", matching.listVendorPerformance);
 router.get("/vendors/kyc-summary", kyc.listKycSummary);
+// Wrong-shop-details reports (SB7), under the vendors permission; above '/vendors/:id'.
+router.get("/vendors/reports", shopReports.adminListReports);
+router.get("/vendors/reports/:reportId", shopReports.adminGetReport);
+router.patch("/vendors/reports/:reportId", shopReports.adminCloseReport);
 router.get("/vendors/:id/performance", matching.getVendorPerformance);
 router.get("/vendors/:id/documents", kyc.listVendorDocuments);
 router.post("/vendors/:id/documents", kyc.createDocument);
