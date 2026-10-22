@@ -40,6 +40,27 @@ router.get('/following/ids', requireAuth, vendorController.listFollowedShopIds);
 router.post('/:id/follow', requireAuth, vendorController.followShop);
 router.delete('/:id/follow', requireAuth, vendorController.unfollowShop);
 
+// Shop-page views (SB5), public; a signed-in viewer counts once across devices.
+// A plain per-address limit, as for ad and analytics reports.
+const VIEW_WINDOW_MS = 60000;
+const MAX_VIEW_REPORTS = 60;
+const viewHits = new Map();
+function tooManyViews(ip) {
+  const now = Date.now();
+  const h = viewHits.get(ip);
+  if (!h || now - h.start > VIEW_WINDOW_MS) {
+    viewHits.set(ip, { start: now, n: 1 });
+    if (viewHits.size > 10000) for (const [k, v] of viewHits) if (now - v.start > VIEW_WINDOW_MS) viewHits.delete(k);
+    return false;
+  }
+  h.n += 1;
+  return h.n > MAX_VIEW_REPORTS;
+}
+router.post('/views', optionalAuth, (req, res, next) => {
+  if (tooManyViews(req.ip)) return res.status(429).json({ message: 'Too many view reports — batch them.' });
+  next();
+}, vendorController.recordShopViews);
+
 // Public: the Mart tab's shop-discovery grid. Must stay above '/:id' for the
 // same reason 'delivery-settings' does.
 router.get('/', vendorController.listVendors);

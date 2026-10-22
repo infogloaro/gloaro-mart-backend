@@ -3,10 +3,13 @@ const shopBranding = require('../services/shopBranding');
 const shopTrust = require('../services/shopTrust');
 const shopHours = require('../services/shopHours');
 const shopFollows = require('../services/shopFollows');
+const shopVisits = require('../services/shopVisits');
 
 const BUSINESS_TYPES = ['b2b', 'b2c', 'both'];
-// approved = newly approved shops first (SB2).
-const VENDOR_SORTS = ['rating', 'newest', 'nearest', 'name', 'approved'];
+// approved = newly approved shops first (SB2); visited / trending / ordered
+// rank by popularity (SB5).
+const VENDOR_SORTS = ['rating', 'newest', 'nearest', 'name', 'approved', 'visited', 'trending', 'ordered'];
+const POPULARITY_SORTS = ['visited', 'trending', 'ordered'];
 
 function toNumber(value) {
   if (value == null || value === '') return null;
@@ -170,6 +173,23 @@ const listFollowedShopIds = follows(async (req, res) => {
   res.json({ items: await shopFollows.followedIds(req.user.id) });
 });
 
+/** Shop-page views from the app (SB5); counted once per visitor per shop per day. */
+async function recordShopViews(req, res) {
+  try {
+    const result = await shopVisits.recordViews({
+      sessionId: req.body?.sessionId,
+      events: req.body?.events,
+      userId: req.user?.id,
+      role: req.user?.role,
+      userAgent: req.get('user-agent'),
+    });
+    res.status(202).json(result);
+  } catch (err) {
+    if (err instanceof shopVisits.VisitError) return res.status(err.status).json({ message: err.message });
+    throw err;
+  }
+}
+
 async function getPublicProfile(req, res) {
   const { rows } = await pool.query(
     `SELECT vp.id, vp.business_name, vp.business_type, vp.gst_number, vp.address_line,
@@ -244,6 +264,13 @@ async function listVendors(req, res) {
   if (req.query.pickup === 'true') conditions.push('dr.supports_pickup IS TRUE');
   if (req.query.freeDelivery === 'true') conditions.push('(dr.supports_delivery IS TRUE AND dr.delivery_charge_cents = 0)');
   if (req.query.wholesale === 'true') conditions.push("vp.business_type IN ('b2b', 'both')");
+  // SB5: a locality ("Popular in your area"); exact, ignoring case and spaces.
+  for (const field of ['city', 'district', 'pincode']) {
+    const value = typeof req.query[field] === 'string' ? req.query[field].trim() : '';
+    if (value) conditions.push(`lower(trim(vp.${field})) = lower(${push(value)})`);
+  }
+  // SB5: Trending lists only shops whose visits are growing.
+  if (sort === 'trending') conditions.push(shopVisits.TRENDING_CONDITION);
   if (req.query.businessType && BUSINESS_TYPES.includes(req.query.businessType)) {
     conditions.push(`vp.business_type = ${push(req.query.businessType)}`);
   }
@@ -272,11 +299,16 @@ async function listVendors(req, res) {
     approved: 'vp.approved_at DESC NULLS LAST, vp.created_at DESC',
     nearest: 'distance_km ASC NULLS LAST, vp.business_name ASC',
     name: 'vp.business_name ASC',
+    visited: 'sv.visits_30d DESC, rating DESC NULLS LAST, vp.business_name ASC',
+    trending: `${shopVisits.TREND_SCORE_SQL} DESC, sv.visits_7d DESC, vp.business_name ASC`,
+    ordered: 'so.orders_30d DESC, rating DESC NULLS LAST, vp.business_name ASC',
   }[sort];
+  // SB5: visit and order counts, only for the sorts that rank by them.
+  const popular = POPULARITY_SORTS.includes(sort);
 
   const JOINS = `
     LEFT JOIN vendor_performance_metrics pm ON pm.vendor_id = vp.id
-    LEFT JOIN vendor_delivery_rules dr ON dr.vendor_id = vp.id`;
+    LEFT JOIN vendor_delivery_rules dr ON dr.vendor_id = vp.id${popular ? shopVisits.popularityJoinSql('vp') : ''}`;
 
   const [{ rows }, { rows: countRows }, { rows: categoryRows }] = await Promise.all([
     pool.query(
@@ -294,7 +326,7 @@ async function listVendors(req, res) {
               CASE WHEN vp.latitude IS NOT NULL AND vp.longitude IS NOT NULL
                         AND $1::float8 IS NOT NULL AND $2::float8 IS NOT NULL
                    THEN earth_distance(ll_to_earth($1, $2), ll_to_earth(vp.latitude, vp.longitude)) / 1000
-              END AS distance_km
+              END AS distance_km${popular ? `, ${shopVisits.POPULARITY_FIELDS}` : ''}
        FROM vendor_profiles vp ${JOINS}
        ${where}
        ORDER BY ${orderBy}
@@ -347,4 +379,5 @@ module.exports = {
   unfollowShop,
   listFollowedShops,
   listFollowedShopIds,
+  recordShopViews,
 };

@@ -1,5 +1,6 @@
 const pool = require('../config/db');
 const shopFollows = require('../services/shopFollows');
+const shopVisits = require('../services/shopVisits');
 
 /**
  * The vendor's own operating view.
@@ -20,7 +21,7 @@ const shopFollows = require('../services/shopFollows');
 async function getDashboard(req, res) {
   const vendorId = req.vendorId;
 
-  const [{ rows: today }, { rows: orders }, { rows: stock }, { rows: lowRows }, followers] = await Promise.all([
+  const [{ rows: today }, { rows: orders }, { rows: stock }, { rows: lowRows }, followers, visits] = await Promise.all([
     pool.query(
       `SELECT COUNT(*)::int AS order_count,
               COALESCE(SUM(total_cents), 0)::int AS revenue_cents
@@ -67,6 +68,11 @@ async function getDashboard(req, res) {
       if (err.code === '42P01') return null;
       throw err;
     }),
+    // SB5: shop-page visitors; left out before the migration, like followers.
+    shopVisits.visitStats(vendorId).catch((err) => {
+      if (err.code === '42P01') return null;
+      throw err;
+    }),
   ]);
 
   res.json({
@@ -94,6 +100,7 @@ async function getDashboard(req, res) {
       lowStockThreshold: r.low_stock_threshold,
     })),
     ...(followers ? { followers } : {}),
+    ...(visits ? { visits } : {}),
   });
 }
 

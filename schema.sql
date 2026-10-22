@@ -3574,3 +3574,33 @@ CREATE TABLE IF NOT EXISTS shop_follows (
   PRIMARY KEY (user_id, vendor_id)
 );
 CREATE INDEX IF NOT EXISTS idx_shop_follows_vendor ON shop_follows (vendor_id, created_at DESC);
+
+-- ===== SHOP VISITS (SB5) =====
+-- Shop-page visits for "Most visited", "Trending" and the shop's own count.
+-- One row per visitor per shop per India day: 'u:<user id>' when signed in,
+-- else 's:<app session id>' (a guest who signs in the same day isn't counted
+-- twice). Each new row adds 1 to shop_visit_daily, the roll-up that sorts read.
+-- Not counted: the shop's own owner, admins, bots, views that came from an ad
+-- tap (paid placement never moves these lists), more than 60 shops per
+-- visitor per day, and views of shops that aren't approved. Visitor rows are
+-- only needed for de-duplication, so they are pruned after 35 days; the
+-- daily totals stay. Rules in services/shopVisits.js.
+-- Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB5).
+CREATE TABLE IF NOT EXISTS shop_views (
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  day DATE NOT NULL,
+  visitor VARCHAR(70) NOT NULL,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (vendor_id, day, visitor)
+);
+CREATE INDEX IF NOT EXISTS idx_shop_views_visitor_day ON shop_views (visitor, day);
+CREATE INDEX IF NOT EXISTS idx_shop_views_day ON shop_views (day);
+
+CREATE TABLE IF NOT EXISTS shop_visit_daily (
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  day DATE NOT NULL,
+  visitors INTEGER NOT NULL DEFAULT 0 CHECK (visitors >= 0),
+  PRIMARY KEY (vendor_id, day)
+);
+CREATE INDEX IF NOT EXISTS idx_shop_visit_daily_day ON shop_visit_daily (day);

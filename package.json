@@ -48,6 +48,7 @@
     "migrate:shop-trust": "node scripts/migrate-shop-trust.js",
     "migrate:shop-hours": "node scripts/migrate-shop-hours.js",
     "migrate:shop-follows": "node scripts/migrate-shop-follows.js",
+    "migrate:shop-visits": "node scripts/migrate-shop-visits.js",
     "seed:sprint1": "node scripts/seed-sprint1.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

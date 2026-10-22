@@ -6,6 +6,7 @@ const { processQueue: processWhatsappQueue } = require('./src/services/whatsapp'
 const { dispatch: dispatchWhatsappEvents } = require('./src/services/whatsappEvents');
 const { sweep: sweepAdCampaigns } = require('./src/services/adCampaigns');
 const { attributeOrders: attributeAdOrders } = require('./src/services/adServing');
+const { pruneViews: pruneShopViews } = require('./src/services/shopVisits');
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
@@ -62,6 +63,17 @@ if (adSeconds > 0) {
       sweeping = false;
     }
   }, adSeconds * 1000).unref();
+}
+
+// Drops shop-visit rows past the de-duplication window; the daily totals
+// stay (SB5). SHOP_VISITS_PRUNE_HOURS=0 turns it off.
+const pruneHours = Number(process.env.SHOP_VISITS_PRUNE_HOURS ?? 6);
+if (pruneHours > 0) {
+  setInterval(() => {
+    pruneShopViews()
+      .then((n) => n && console.log(`[shop visits] pruned ${n} old visitor rows`))
+      .catch((err) => err.code !== '42P01' && console.error(`[shop visits] prune failed: ${err.message}`));
+  }, pruneHours * 3600000).unref();
 }
 
 // Sends queued WhatsApp messages and retries ones that failed for a reason
