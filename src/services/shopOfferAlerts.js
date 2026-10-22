@@ -82,7 +82,7 @@ function couponText(c) {
 
 /** Announces a shop coupon if it is public and live right now; anything else is left alone. */
 async function announceCoupon(c) {
-  if (!c?.vendor_id || !c.is_public || !c.is_active) return { sent: 0, alreadySent: false };
+  if (!c?.vendor_id || !c.is_public || !c.is_active || c.hidden_at) return { sent: 0, alreadySent: false };
   const now = Date.now();
   if (c.starts_at && new Date(c.starts_at).getTime() > now) return { sent: 0, alreadySent: false };
   if (c.expires_at && new Date(c.expires_at).getTime() <= now) return { sent: 0, alreadySent: false };
@@ -109,7 +109,7 @@ async function announceDue() {
   let sent = 0;
   const { rows: coupons } = await pool.query(
     `SELECT c.* FROM coupons c
-     WHERE c.vendor_id IS NOT NULL AND c.is_public AND c.is_active
+     WHERE c.vendor_id IS NOT NULL AND c.is_public AND c.is_active AND c.hidden_at IS NULL
        AND c.starts_at > now() - interval '1 day' AND c.starts_at <= now()
        AND (c.expires_at IS NULL OR c.expires_at > now())
        AND NOT EXISTS (SELECT 1 FROM shop_offer_alerts a WHERE a.vendor_id = c.vendor_id AND a.offer_key = 'coupon:' || c.id)`

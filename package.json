@@ -53,6 +53,7 @@
     "migrate:notification-prefs": "node scripts/migrate-notification-prefs.js",
     "migrate:shop-enquiries": "node scripts/migrate-shop-enquiries.js",
     "migrate:ad-fixes": "node scripts/migrate-ad-fixes.js",
+    "migrate:offer-moderation": "node scripts/migrate-offer-moderation.js",
     "migrate:public-offers": "node scripts/migrate-public-offers.js",
     "seed:sprint1": "node scripts/seed-sprint1.js",
     "test": "echo \"Error: no test specified\" && exit 1"

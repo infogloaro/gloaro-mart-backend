@@ -144,7 +144,7 @@ async function listOffers(query = {}, { runningCampaigns }) {
               (SELECT COUNT(*)::int FROM orders o WHERE o.coupon_id = c.id AND o.status <> 'cancelled') AS used
        FROM coupons c
        LEFT JOIN vendor_profiles vp ON vp.id = c.vendor_id
-       WHERE c.is_public AND c.is_active
+       WHERE c.is_public AND c.is_active AND c.hidden_at IS NULL -- SB6b: not taken out by an admin
          AND (c.starts_at IS NULL OR c.starts_at <= now())
          AND (c.expires_at IS NULL OR c.expires_at > now())
          AND (c.vendor_id IS NULL OR vp.status = 'approved')

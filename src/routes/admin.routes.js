@@ -48,6 +48,7 @@ const adPricing = require("../controllers/adPricing.controller");
 const adCampaign = require("../controllers/adCampaign.controller");
 const adDashboard = require("../controllers/adDashboard.controller");
 const adFixes = require("../controllers/adFixes.controller");
+const offerModeration = require("../controllers/offerModeration.controller");
 const platformHealthController = require("../controllers/platformHealth.controller");
 const shopReports = require("../controllers/shopReports.controller");
 const { requirePermission } = require("../middleware/rbac");
@@ -339,6 +340,9 @@ router.delete("/brands/:id", brand.deleteBrand);
 router.get("/settings", settings.getSettings);
 router.put("/settings", settings.updateSettings);
 
+// SB6b: shops' public coupons, and hiding one from the offers list.
+router.get("/coupons/shop", offerModeration.listShopCoupons);
+router.patch("/coupons/shop/:id", offerModeration.setShopCouponHidden);
 router.get("/coupons", admin.listPlatformCoupons);
 router.post("/coupons", admin.createPlatformCoupon);
 router.patch("/coupons/:id", admin.updatePlatformCoupon);

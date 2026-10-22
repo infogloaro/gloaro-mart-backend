@@ -59,7 +59,8 @@ async function getMyCoupons(req, res) {
   ]);
   // SB6: how often each was used (orders not cancelled).
   const used = await publicOffers.useCounts(rows.map((r) => r.id));
-  res.json(rows.map((r) => ({ ...r, uses_count: used.get(r.id) ?? 0 })));
+  // SB6b: hidden_at / hidden_reason tell the shop an admin took it out of the offers list; not who.
+  res.json(rows.map(({ hidden_by: _by, ...r }) => ({ ...r, uses_count: used.get(r.id) ?? 0 })));
 }
 
 const updateCoupon = offers(async (req, res) => {

@@ -3770,3 +3770,14 @@ ALTER TABLE vendor_charges ADD CONSTRAINT vendor_charges_kind_check
 ALTER TABLE ad_ledger DROP CONSTRAINT IF EXISTS ad_ledger_entry_check;
 ALTER TABLE ad_ledger ADD CONSTRAINT ad_ledger_entry_check
   CHECK (entry IN ('ad_revenue', 'ad_tax', 'ad_discount', 'ad_refund', 'ad_tax_refund', 'ad_commission', 'ad_reversal'));
+-- ===== PUBLIC OFFER MODERATION (SB6b) =====
+-- Admin → Offers & Coupons → Shop offers: an admin can take a shop's public
+-- coupon out of the Gloaro Mart offers list (misleading, wrong, abusive) with a
+-- reason the shop sees. A hidden coupon is not listed, not announced to
+-- followers, and the shop can't list it again until the admin shows it; its
+-- code still works for anyone who has it, like a private coupon. Rules in
+-- services/offerModeration.js. Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB6).
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ;
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS hidden_reason TEXT;
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS hidden_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_coupons_public_shop ON coupons (created_at DESC) WHERE vendor_id IS NOT NULL AND (is_public OR hidden_at IS NOT NULL);
