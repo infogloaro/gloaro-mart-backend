@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const shopBranding = require('../services/shopBranding');
 const shopTrust = require('../services/shopTrust');
 const shopHours = require('../services/shopHours');
+const shopFollows = require('../services/shopFollows');
 
 const BUSINESS_TYPES = ['b2b', 'b2c', 'both'];
 // approved = newly approved shops first (SB2).
@@ -37,7 +38,11 @@ async function createProfile(req, res) {
 }
 
 async function getMyProfile(req, res) {
-  const { rows } = await pool.query(`SELECT vp.*, ${shopTrust.verifiedSql('vp')} AS verified FROM vendor_profiles vp WHERE vp.user_id = $1`, [req.user.id]);
+  const { rows } = await pool.query(
+    `SELECT vp.*, ${shopTrust.verifiedSql('vp')} AS verified, ${shopFollows.followerCountSql('vp')} AS follower_count
+     FROM vendor_profiles vp WHERE vp.user_id = $1`,
+    [req.user.id]
+  );
   if (!rows[0]) return res.status(404).json({ message: 'Vendor profile not found' });
   res.json(rows[0]);
 }
@@ -138,6 +143,33 @@ const removeMyHoliday = hours(async (vendorId, req, res) => {
   res.status(204).send();
 });
 
+/** Customer follows (SB4): follow / opt in to offers, unfollow, and my list. */
+const follows = (fn) => async (req, res) => {
+  try {
+    await fn(req, res);
+  } catch (err) {
+    if (err instanceof shopFollows.FollowError) return res.status(err.status).json({ message: err.message });
+    throw err;
+  }
+};
+
+const followShop = follows(async (req, res) => {
+  const { created, ...result } = await shopFollows.follow(req.user.id, req.params.id, req.body || {});
+  res.status(created ? 201 : 200).json(result);
+});
+
+const unfollowShop = follows(async (req, res) => {
+  res.json(await shopFollows.unfollow(req.user.id, req.params.id));
+});
+
+const listFollowedShops = follows(async (req, res) => {
+  res.json({ items: await shopFollows.followedShops(req.user.id) });
+});
+
+const listFollowedShopIds = follows(async (req, res) => {
+  res.json({ items: await shopFollows.followedIds(req.user.id) });
+});
+
 async function getPublicProfile(req, res) {
   const { rows } = await pool.query(
     `SELECT vp.id, vp.business_name, vp.business_type, vp.gst_number, vp.address_line,
@@ -153,12 +185,16 @@ async function getPublicProfile(req, res) {
             (SELECT MAX(sa.radius_km) FROM vendor_service_areas sa
               WHERE sa.vendor_id = vp.id AND sa.is_active AND sa.area_type = 'radius') AS service_radius_km,
             -- SB3: open now on the shop's clock, and today's hours.
-            vp.timezone, ${shopHours.openNowSql('vp')} AS open_now, ${shopHours.todaySql('vp')} AS hours_today
+            vp.timezone, ${shopHours.openNowSql('vp')} AS open_now, ${shopHours.todaySql('vp')} AS hours_today,
+            -- SB4: followers, and whether the signed-in viewer is one.
+            ${shopFollows.followerCountSql('vp')} AS follower_count,
+            CASE WHEN $2::int IS NULL THEN NULL
+                 ELSE EXISTS (SELECT 1 FROM shop_follows f WHERE f.vendor_id = vp.id AND f.user_id = $2::int) END AS following
      FROM vendor_profiles vp
      LEFT JOIN vendor_delivery_rules dr ON dr.vendor_id = vp.id
      LEFT JOIN vendor_performance_metrics pm ON pm.vendor_id = vp.id
      WHERE vp.id = $1 AND vp.status = 'approved'`,
-    [req.params.id]
+    [req.params.id, req.user?.id ?? null]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Vendor not found' });
   const vendor = rows[0];
@@ -250,6 +286,7 @@ async function listVendors(req, res) {
               dr.supports_delivery, dr.supports_pickup, dr.opens_at, dr.closes_at,
               dr.delivery_charge_cents, dr.free_delivery_above_cents,
               ${shopHours.openNowSql('vp')} AS open_now, ${shopHours.todaySql('vp')} AS hours_today,
+              ${shopFollows.followerCountSql('vp')} AS follower_count,
               CASE WHEN pm.rating_count > 0 THEN ROUND(pm.rating_sum / pm.rating_count, 2) END AS rating,
               COALESCE(pm.rating_count, 0) AS review_count,
               (SELECT COUNT(*)::int FROM products p
@@ -306,4 +343,8 @@ module.exports = {
   updateMyHours,
   addMyHoliday,
   removeMyHoliday,
+  followShop,
+  unfollowShop,
+  listFollowedShops,
+  listFollowedShopIds,
 };

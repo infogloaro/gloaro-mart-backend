@@ -3558,3 +3558,19 @@ RETURNS BOOLEAN LANGUAGE sql STABLE AS $fn$
 $fn$;
 
 CREATE INDEX IF NOT EXISTS idx_vendor_holidays_vendor_date ON vendor_holidays (vendor_id, holiday_date);
+
+-- ===== SHOP FOLLOWS (SB4) =====
+-- Customers follow (favourite) shops. notify_offers is the customer's opt-in
+-- to hear about a followed shop's new offers (sent from SB8); it is off unless
+-- they switch it on, and notify_offers_at records when they did. A follow of a
+-- shop that is later suspended stays, but only approved shops are listed.
+-- Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB4).
+CREATE TABLE IF NOT EXISTS shop_follows (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  notify_offers BOOLEAN NOT NULL DEFAULT false,
+  notify_offers_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, vendor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shop_follows_vendor ON shop_follows (vendor_id, created_at DESC);

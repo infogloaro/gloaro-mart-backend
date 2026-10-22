@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const shopFollows = require('../services/shopFollows');
 
 /**
  * The vendor's own operating view.
@@ -19,7 +20,7 @@ const pool = require('../config/db');
 async function getDashboard(req, res) {
   const vendorId = req.vendorId;
 
-  const [{ rows: today }, { rows: orders }, { rows: stock }, { rows: lowRows }] = await Promise.all([
+  const [{ rows: today }, { rows: orders }, { rows: stock }, { rows: lowRows }, followers] = await Promise.all([
     pool.query(
       `SELECT COUNT(*)::int AS order_count,
               COALESCE(SUM(total_cents), 0)::int AS revenue_cents
@@ -60,6 +61,12 @@ async function getDashboard(req, res) {
        LIMIT 10`,
       [vendorId]
     ),
+    // SB4: who follows the shop. Before the migration the table isn't there;
+    // the dashboard still answers, without this tile.
+    shopFollows.followerStats(vendorId).catch((err) => {
+      if (err.code === '42P01') return null;
+      throw err;
+    }),
   ]);
 
   res.json({
@@ -86,6 +93,7 @@ async function getDashboard(req, res) {
       availableQty: r.available_qty,
       lowStockThreshold: r.low_stock_threshold,
     })),
+    ...(followers ? { followers } : {}),
   });
 }
 

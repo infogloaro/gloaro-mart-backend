@@ -34,6 +34,12 @@ router.put('/hours', requireAuth, requireRole('vendor'), vendorController.update
 router.post('/holidays', requireAuth, requireRole('vendor'), vendorController.addMyHoliday);
 router.delete('/holidays/:holidayId', requireAuth, requireRole('vendor'), vendorController.removeMyHoliday);
 
+// Followed shops (SB4): the caller's own list; above '/:id' like the rest.
+router.get('/following', requireAuth, vendorController.listFollowedShops);
+router.get('/following/ids', requireAuth, vendorController.listFollowedShopIds);
+router.post('/:id/follow', requireAuth, vendorController.followShop);
+router.delete('/:id/follow', requireAuth, vendorController.unfollowShop);
+
 // Public: the Mart tab's shop-discovery grid. Must stay above '/:id' for the
 // same reason 'delivery-settings' does.
 router.get('/', vendorController.listVendors);
@@ -41,6 +47,7 @@ router.get('/', vendorController.listVendors);
 router.get('/:id/products', getVendorProducts);
 // Public: what a customer reads before deciding to buy from this shop.
 router.get('/:id/reviews', optionalAuth, review.listVendorReviews);
-router.get('/:id', vendorController.getPublicProfile);
+// optionalAuth: a signed-in viewer also learns whether they follow it (SB4).
+router.get('/:id', optionalAuth, vendorController.getPublicProfile);
 
 module.exports = router;
