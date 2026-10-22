@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const publicOffers = require('../services/publicOffers');
 const { runningCampaigns } = require('./campaign.controller');
+const offerAlerts = require('../services/shopOfferAlerts');
 
 async function getVendorProfileId(userId) {
   const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [userId]);
@@ -40,6 +41,8 @@ const createCoupon = offers(async (req, res) => {
       [vendorId, code.toUpperCase(), discount.discount_type, discount.discount_value, minOrderValueCents ?? 0, expiresAt || null, ...Object.values(rules)]
     );
     res.status(201).json({ ...rows[0], uses_count: 0 });
+    // SB8: followers who asked hear about a public coupon that is live now.
+    offerAlerts.later(offerAlerts.announceCoupon(rows[0]), `coupon ${rows[0].id}`);
   } catch (err) {
     if (err.code === '23505') {
       return res.status(409).json({ message: 'You already have a coupon with this code' });
@@ -76,6 +79,8 @@ const updateCoupon = offers(async (req, res) => {
   );
   if (!rows[0]) return res.status(404).json({ message: 'Coupon not found' });
   res.json(rows[0]);
+  // SB8: made public or switched back on; each coupon is announced once.
+  offerAlerts.later(offerAlerts.announceCoupon(rows[0]), `coupon ${rows[0].id}`);
 });
 
 async function deleteCoupon(req, res) {

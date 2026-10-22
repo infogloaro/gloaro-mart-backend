@@ -7,6 +7,7 @@ const { dispatch: dispatchWhatsappEvents } = require('./src/services/whatsappEve
 const { sweep: sweepAdCampaigns } = require('./src/services/adCampaigns');
 const { attributeOrders: attributeAdOrders } = require('./src/services/adServing');
 const { pruneViews: pruneShopViews } = require('./src/services/shopVisits');
+const { announceDue: announceDueOffers } = require('./src/services/shopOfferAlerts');
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
@@ -74,6 +75,25 @@ if (pruneHours > 0) {
       .then((n) => n && console.log(`[shop visits] pruned ${n} old visitor rows`))
       .catch((err) => err.code !== '42P01' && console.error(`[shop visits] prune failed: ${err.message}`));
   }, pruneHours * 3600000).unref();
+}
+
+// Tells followers about shop offers that started on their own: a coupon with a
+// later start, a joined campaign that began (SB8). OFFER_ALERTS_SWEEP_MINUTES=0 turns it off.
+const offerAlertMinutes = Number(process.env.OFFER_ALERTS_SWEEP_MINUTES ?? 10);
+if (offerAlertMinutes > 0) {
+  let announcing = false;
+  setInterval(async () => {
+    if (announcing) return;
+    announcing = true;
+    try {
+      const sent = await announceDueOffers();
+      if (sent) console.log(`[offer alerts] ${sent} follower alert(s) sent`);
+    } catch (err) {
+      if (err.code !== '42P01') console.error(`[offer alerts] sweep failed: ${err.message}`);
+    } finally {
+      announcing = false;
+    }
+  }, offerAlertMinutes * 60000).unref();
 }
 
 // Sends queued WhatsApp messages and retries ones that failed for a reason

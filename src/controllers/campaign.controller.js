@@ -1,6 +1,7 @@
 const pool = require("../config/db");
 const { recordAudit } = require("../services/auditLog");
 const { SPENT_SQL, STATUS_SQL } = require("../services/campaigns");
+const offerAlerts = require("../services/shopOfferAlerts");
 
 /**
  * Admin → Campaigns. A campaign is a discount across the marketplace, a set of
@@ -340,6 +341,8 @@ async function vendorOptIn(req, res) {
   }
   await recordAudit({ actorUserId: req.user.id, action: join ? "campaign.vendor_opted_in" : "campaign.vendor_opted_out", module: MODULE, entityType: "campaign", entityId: c.id, newValue: { vendorId } });
   res.json({ optedIn: join });
+  // SB8: the shop's followers hear about it once it runs (now, or from the sweep when it starts).
+  if (join) offerAlerts.later(offerAlerts.announceCampaign(c.id, vendorId), `campaign ${c.id}`);
 }
 
 // ── Public: what the shopper app may show ──
