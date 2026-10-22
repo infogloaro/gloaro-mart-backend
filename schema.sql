@@ -3658,3 +3658,29 @@ CREATE TABLE IF NOT EXISTS shop_offer_alerts (
   UNIQUE (vendor_id, offer_key)
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_user_type_time ON notifications (user_id, type, created_at DESC);
+
+-- ===== PUBLIC OFFERS (SB6) =====
+-- Shop coupons a customer can find (the offers hub) and the rules they keep.
+-- is_public: the shop lists the coupon in the hub (off by default, so every
+-- existing coupon stays as private as it was). starts_at / max_uses /
+-- per_user_limit / new_customers_only are checked at validation and checkout.
+-- A 'free_delivery' coupon takes off exactly the shop's delivery charge.
+-- Uses are counted from orders (coupon_id, not cancelled), never stored.
+-- Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB6).
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS title VARCHAR(80);
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ;
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS max_uses INTEGER;
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS per_user_limit INTEGER;
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS new_customers_only BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE coupons DROP CONSTRAINT IF EXISTS coupons_discount_type_check;
+ALTER TABLE coupons ADD CONSTRAINT coupons_discount_type_check CHECK (discount_type IN ('flat', 'percentage', 'free_delivery'));
+ALTER TABLE coupons DROP CONSTRAINT IF EXISTS coupons_max_uses_check;
+ALTER TABLE coupons ADD CONSTRAINT coupons_max_uses_check CHECK (max_uses IS NULL OR max_uses > 0);
+ALTER TABLE coupons DROP CONSTRAINT IF EXISTS coupons_per_user_limit_check;
+ALTER TABLE coupons ADD CONSTRAINT coupons_per_user_limit_check CHECK (per_user_limit IS NULL OR per_user_limit > 0);
+CREATE INDEX IF NOT EXISTS idx_coupons_public ON coupons (expires_at) WHERE is_public AND is_active;
+CREATE INDEX IF NOT EXISTS idx_orders_coupon ON orders (coupon_id) WHERE coupon_id IS NOT NULL;
+-- A free-delivery coupon has no amount of its own (it is the delivery charge).
+ALTER TABLE coupons DROP CONSTRAINT IF EXISTS coupons_discount_value_check;
+ALTER TABLE coupons ADD CONSTRAINT coupons_discount_value_check CHECK (discount_value > 0 OR discount_type = 'free_delivery');

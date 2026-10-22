@@ -345,6 +345,12 @@ async function vendorOptIn(req, res) {
 // ── Public: what the shopper app may show ──
 
 async function publicCampaigns(req, res) {
+  res.set("Cache-Control", "public, max-age=60");
+  res.json(await runningCampaigns());
+}
+
+/** Running campaigns as the shopper app sees them (also the offers hub, SB6). */
+async function runningCampaigns() {
   const { rows } = await pool.query(`SELECT * FROM (${SELECT}) x WHERE x.status = 'running' ORDER BY x.ends_at`);
   const out = [];
   for (const r of rows) {
@@ -365,13 +371,12 @@ async function publicCampaigns(req, res) {
       vendorIds: r.funded_by === "platform" && r.scope !== "vendor" ? [] : parts.filter((p) => p.type === "vendor" && (p.optedIn || r.funded_by === "platform")).map((p) => p.refId),
     });
   }
-  res.set("Cache-Control", "public, max-age=60");
-  res.json(out);
+  return out;
 }
 
 module.exports = {
   listCampaigns, campaignSummary, getCampaign, createCampaign, updateCampaign,
   resumeCampaign, pauseCampaign, endCampaign,
   candidates, addParticipant, updateParticipant, removeParticipant,
-  vendorCampaigns, vendorOptIn, publicCampaigns,
+  vendorCampaigns, vendorOptIn, publicCampaigns, runningCampaigns,
 };

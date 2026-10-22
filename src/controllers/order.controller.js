@@ -224,7 +224,12 @@ async function checkout(req, res) {
         0
       );
       try {
-        const resolved = await resolveCouponForCheckout(vendorId, code, subtotalCents);
+        // SB6: the customer's own coupon limits, and the delivery charge a
+        // free-delivery coupon takes off.
+        const resolved = await resolveCouponForCheckout(vendorId, code, subtotalCents, {
+          userId: req.user.id,
+          deliveryChargeCents: deliveryChargeByVendor.get(vendorId) || 0,
+        });
         resolvedCoupons.set(vendorId, resolved);
       } catch (err) {
         if (err.status) return res.status(err.status).json({ message: err.message });
