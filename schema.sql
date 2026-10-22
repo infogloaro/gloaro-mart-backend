@@ -3465,3 +3465,27 @@ CREATE TABLE IF NOT EXISTS vendor_gallery (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_vendor_gallery_vendor ON vendor_gallery (vendor_id, sort_order, id);
+
+-- ===== SHOP TRUST & PLACE (SB2) =====
+-- What a customer can trust about a shop and where it is. "Verified" isn't
+-- stored: it is worked out when read (approved shop + every required KYC
+-- document approved), so it can't drift from the documents; an admin can hold
+-- the badge back with a reason. approved_at is the first approval (backfilled
+-- from the audit log where one was recorded, else left empty). district is
+-- the shop's district, which ad targeting already matches on.
+-- Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB2).
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS district TEXT;
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS verification_hold BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS verification_hold_reason VARCHAR(300);
+
+UPDATE vendor_profiles vp SET approved_at = a.at
+FROM (
+  SELECT entity_id, MIN(created_at) AS at FROM audit_logs
+  WHERE action = 'vendor.status_changed' AND new_value->>'status' = 'approved'
+  GROUP BY entity_id
+) a
+WHERE vp.id::text = a.entity_id AND vp.approved_at IS NULL AND vp.status = 'approved';
+
+CREATE INDEX IF NOT EXISTS idx_vendor_documents_approved ON vendor_documents (vendor_id, doc_type) WHERE status = 'approved';
+CREATE INDEX IF NOT EXISTS idx_vendor_profiles_approved_at ON vendor_profiles (approved_at DESC);

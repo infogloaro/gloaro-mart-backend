@@ -10,6 +10,7 @@ const cancellations = require('../services/cancellations');
 const shipments = require('../services/shipments');
 const { issueAfterDelivery } = require('../services/invoices');
 const shopBranding = require('../services/shopBranding');
+const shopTrust = require('../services/shopTrust');
 
 const ALL_ORDER_STATUSES = [...STATUS_FLOW, 'cancelled'];
 const USER_ROLES = ['customer', 'vendor', 'admin'];
@@ -92,7 +93,7 @@ async function getUser(req, res) {
 async function listVendors(req, res) {
   const { status } = req.query;
   const { rows } = await pool.query(
-    `SELECT vp.*, u.email, u.full_name
+    `SELECT vp.*, u.email, u.full_name, ${shopTrust.verifiedSql('vp')} AS verified
      FROM vendor_profiles vp
      JOIN users u ON u.id = vp.user_id
      WHERE ($1::text IS NULL OR vp.status = $1)
@@ -109,7 +110,8 @@ async function updateVendorStatus(req, res) {
   }
   const { rows: beforeRows } = await pool.query('SELECT id, status FROM vendor_profiles WHERE id = $1', [req.params.id]);
   if (!beforeRows[0]) return res.status(404).json({ message: 'Vendor not found' });
-  const { rows } = await pool.query('UPDATE vendor_profiles SET status = $2 WHERE id = $1 RETURNING *', [
+  // approved_at keeps the first approval (SB2): reinstating an old shop doesn't make it "new".
+  const { rows } = await pool.query("UPDATE vendor_profiles SET status = $2, approved_at = COALESCE(approved_at, CASE WHEN $2 = 'approved' THEN now() END) WHERE id = $1 RETURNING *", [
     req.params.id,
     status,
   ]);
@@ -147,14 +149,14 @@ async function updateVendor(req, res) {
   // Description, logo and cover (SB1): an admin can correct what a shop shows.
   let fields;
   try {
-    fields = shopBranding.readBranding(req.body || {});
+    fields = { ...shopBranding.readBranding(req.body || {}), ...shopTrust.readPlace(req.body || {}) };
   } catch (err) {
-    if (err instanceof shopBranding.BrandingError) return res.status(err.status).json({ message: err.message });
+    if (err instanceof shopBranding.BrandingError || err instanceof shopTrust.TrustError) return res.status(err.status).json({ message: err.message });
     throw err;
   }
   const branding = shopBranding.brandingSet(fields, 11);
   const { rows: before } = Object.keys(fields).length
-    ? await pool.query('SELECT description, logo_url, cover_image_url FROM vendor_profiles WHERE id = $1', [req.params.id])
+    ? await pool.query('SELECT description, logo_url, cover_image_url, district FROM vendor_profiles WHERE id = $1', [req.params.id])
     : { rows: [] };
   const { rows } = await pool.query(
     `UPDATE vendor_profiles SET
@@ -183,6 +185,42 @@ async function updateVendor(req, res) {
     });
   }
   res.json(rows[0]);
+}
+
+/**
+ * Hold a shop's Verified badge back (the shop sees the reason) or release it
+ * (SB2). The badge otherwise follows the KYC documents by itself.
+ */
+async function setVendorVerificationHold(req, res) {
+  let hold;
+  try {
+    hold = shopTrust.readHold(req.body || {});
+  } catch (err) {
+    if (err instanceof shopTrust.TrustError) return res.status(err.status).json({ message: err.message });
+    throw err;
+  }
+  const { rows: before } = await pool.query('SELECT id, verification_hold, verification_hold_reason FROM vendor_profiles WHERE id = $1', [req.params.id]);
+  if (!before[0]) return res.status(404).json({ message: 'Vendor not found' });
+  const { rows } = await pool.query(
+    `UPDATE vendor_profiles SET verification_hold = $2, verification_hold_reason = $3 WHERE id = $1
+     RETURNING id, verification_hold, verification_hold_reason, ${shopTrust.verifiedSql('vendor_profiles')} AS verified`,
+    [before[0].id, hold.hold, hold.reason]
+  );
+  await recordAudit({
+    actorUserId: req.user.id,
+    action: hold.hold ? 'vendor.verification_held' : 'vendor.verification_released',
+    module: 'vendors',
+    entityType: 'vendor',
+    entityId: before[0].id,
+    previousValue: { hold: before[0].verification_hold, reason: before[0].verification_hold_reason },
+    newValue: { hold: hold.hold, reason: hold.reason },
+  });
+  res.json({
+    id: rows[0].id,
+    verificationHold: rows[0].verification_hold,
+    verificationHoldReason: rows[0].verification_hold_reason,
+    verified: rows[0].verified,
+  });
 }
 
 /** A shop's gallery with each photo's status (SB1). */
@@ -899,6 +937,7 @@ module.exports = {
   updateVendorStatus,
   updateVendor,
   getVendorGallery,
+  setVendorVerificationHold,
   setVendorGalleryPhotoStatus,
   listAllOrders,
   getAnyOrder,

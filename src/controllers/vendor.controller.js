@@ -1,8 +1,10 @@
 const pool = require('../config/db');
 const shopBranding = require('../services/shopBranding');
+const shopTrust = require('../services/shopTrust');
 
 const BUSINESS_TYPES = ['b2b', 'b2c', 'both'];
-const VENDOR_SORTS = ['rating', 'newest', 'nearest', 'name'];
+// approved = newly approved shops first (SB2).
+const VENDOR_SORTS = ['rating', 'newest', 'nearest', 'name', 'approved'];
 
 function toNumber(value) {
   if (value == null || value === '') return null;
@@ -34,7 +36,7 @@ async function createProfile(req, res) {
 }
 
 async function getMyProfile(req, res) {
-  const { rows } = await pool.query('SELECT * FROM vendor_profiles WHERE user_id = $1', [req.user.id]);
+  const { rows } = await pool.query(`SELECT vp.*, ${shopTrust.verifiedSql('vp')} AS verified FROM vendor_profiles vp WHERE vp.user_id = $1`, [req.user.id]);
   if (!rows[0]) return res.status(404).json({ message: 'Vendor profile not found' });
   res.json(rows[0]);
 }
@@ -42,12 +44,15 @@ async function getMyProfile(req, res) {
 async function updateMyProfile(req, res) {
   const { businessName, businessType, gstNumber, addressLine, city, state, pincode, latitude, longitude } =
     req.body || {};
-  // Description, logo and cover (SB1): only the ones sent change; '' clears.
+  // Description, logo and cover (SB1) and district (SB2): only the ones sent
+  // change; '' clears.
   let branding;
   try {
-    branding = shopBranding.brandingSet(shopBranding.readBranding(req.body || {}), 11);
+    branding = shopBranding.brandingSet({ ...shopBranding.readBranding(req.body || {}), ...shopTrust.readPlace(req.body || {}) }, 11);
   } catch (err) {
-    if (err instanceof shopBranding.BrandingError) return res.status(err.status).json({ message: err.message });
+    if (err instanceof shopBranding.BrandingError || err instanceof shopTrust.TrustError) {
+      return res.status(err.status).json({ message: err.message });
+    }
     throw err;
   }
   const { rows } = await pool.query(
@@ -109,7 +114,14 @@ async function getPublicProfile(req, res) {
             vp.city, vp.state, vp.pincode, vp.status, vp.description, vp.logo_url, vp.cover_image_url,
             dr.supports_delivery, dr.supports_pickup, dr.opens_at, dr.closes_at,
             CASE WHEN pm.rating_count > 0 THEN ROUND(pm.rating_sum / pm.rating_count, 2) END AS rating,
-            COALESCE(pm.rating_count, 0) AS review_count
+            COALESCE(pm.rating_count, 0) AS review_count,
+            -- SB2: trust, place and the delivery facts a buyer checks first.
+            vp.district, vp.latitude, vp.longitude, vp.approved_at, ${shopTrust.verifiedSql('vp')} AS verified,
+            dr.delivery_charge_cents, dr.free_delivery_above_cents, dr.min_order_cents, dr.preparation_minutes,
+            (SELECT COALESCE(array_agg(DISTINCT sa.pincode ORDER BY sa.pincode), '{}') FROM vendor_service_areas sa
+              WHERE sa.vendor_id = vp.id AND sa.is_active AND sa.area_type = 'pincode' AND sa.pincode IS NOT NULL) AS service_pincodes,
+            (SELECT MAX(sa.radius_km) FROM vendor_service_areas sa
+              WHERE sa.vendor_id = vp.id AND sa.is_active AND sa.area_type = 'radius') AS service_radius_km
      FROM vendor_profiles vp
      LEFT JOIN vendor_delivery_rules dr ON dr.vendor_id = vp.id
      LEFT JOIN vendor_performance_metrics pm ON pm.vendor_id = vp.id
@@ -121,6 +133,7 @@ async function getPublicProfile(req, res) {
   res.json({
     ...vendor,
     rating: vendor.rating == null ? null : Number(vendor.rating),
+    service_radius_km: vendor.service_radius_km == null ? null : Number(vendor.service_radius_km),
     // Visible photos only (SB1); hidden ones never reach customers.
     gallery: await shopBranding.publicGallery(vendor.id),
   });
@@ -151,6 +164,8 @@ async function listVendors(req, res) {
   };
 
   if (req.query.q) conditions.push(`vp.business_name ILIKE ${push(`%${req.query.q}%`)}`);
+  // SB2: only shops with the Verified badge.
+  if (req.query.verified === 'true') conditions.push(shopTrust.verifiedSql('vp'));
   if (req.query.businessType && BUSINESS_TYPES.includes(req.query.businessType)) {
     conditions.push(`vp.business_type = ${push(req.query.businessType)}`);
   }
@@ -176,6 +191,7 @@ async function listVendors(req, res) {
   const orderBy = {
     rating: 'rating DESC NULLS LAST, vp.business_name ASC',
     newest: 'vp.created_at DESC',
+    approved: 'vp.approved_at DESC NULLS LAST, vp.created_at DESC',
     nearest: 'distance_km ASC NULLS LAST, vp.business_name ASC',
     name: 'vp.business_name ASC',
   }[sort];
@@ -187,6 +203,7 @@ async function listVendors(req, res) {
   const [{ rows }, { rows: countRows }, { rows: categoryRows }] = await Promise.all([
     pool.query(
       `SELECT vp.id, vp.business_name, vp.business_type, vp.description, vp.logo_url, vp.cover_image_url,
+              vp.district, vp.approved_at, ${shopTrust.verifiedSql('vp')} AS verified,
               vp.address_line, vp.city, vp.state, vp.pincode, vp.status,
               dr.supports_delivery, dr.supports_pickup, dr.opens_at, dr.closes_at,
               CASE WHEN pm.rating_count > 0 THEN ROUND(pm.rating_sum / pm.rating_count, 2) END AS rating,

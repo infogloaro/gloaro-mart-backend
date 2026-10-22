@@ -224,6 +224,8 @@ router.patch("/vendors/:id/status", admin.updateVendorStatus);
 router.patch("/vendors/:id", admin.updateVendor);
 // Shop gallery (SB1): every photo with its status; hide one with a reason.
 router.get("/vendors/:id/gallery", admin.getVendorGallery);
+// Verified badge (SB2): hold it back with a reason, or release it.
+router.patch("/vendors/:id/verification", admin.setVendorVerificationHold);
 router.patch("/vendors/:id/gallery/:photoId", admin.setVendorGalleryPhotoStatus);
 
 // Sprint 5 — the weights every vendor is ranked by, and the log of what those

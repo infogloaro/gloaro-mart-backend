@@ -149,4 +149,4 @@ async function reviewDocument(req, res) {
   res.json(updated[0]);
 }
 
-module.exports = { listDocuments, listKycSummary, listVendorDocuments, createDocument, reviewDocument };
+module.exports = { REQUIRED_TYPES, listDocuments, listKycSummary, listVendorDocuments, createDocument, reviewDocument };
