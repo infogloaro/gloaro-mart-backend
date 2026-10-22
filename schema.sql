@@ -3629,3 +3629,32 @@ CREATE TABLE IF NOT EXISTS shop_reports (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_shop_reports_one_open ON shop_reports (vendor_id, user_id) WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS idx_shop_reports_queue ON shop_reports (status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_shop_reports_user ON shop_reports (user_id, created_at DESC);
+-- ===== NOTIFICATION PREFERENCES (SB8) =====
+-- What each customer wants to hear about (topic) and where (channel). No row
+-- means the topic's default (services/notificationPrefs.js). Switching a
+-- channel on records consent_at; off keeps the row with enabled = false.
+-- Order updates in the app can't be switched off (they are the order itself).
+-- WhatsApp consent stays on users.whatsapp_opt_in (the bot's START / STOP).
+-- shop_offer_alerts remembers which offers were already announced, so a shop
+-- pausing and resuming a coupon doesn't alert its followers twice.
+-- Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB8).
+CREATE TABLE IF NOT EXISTS notification_preferences (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  topic VARCHAR(20) NOT NULL CHECK (topic IN ('order_updates', 'shop_offers', 'price_drops')),
+  channel VARCHAR(10) NOT NULL CHECK (channel IN ('in_app', 'push')),
+  enabled BOOLEAN NOT NULL,
+  consent_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, topic, channel)
+);
+
+CREATE TABLE IF NOT EXISTS shop_offer_alerts (
+  id SERIAL PRIMARY KEY,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  offer_key VARCHAR(60) NOT NULL,
+  title VARCHAR(160) NOT NULL,
+  recipients INTEGER NOT NULL DEFAULT 0,
+  sent_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (vendor_id, offer_key)
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_type_time ON notifications (user_id, type, created_at DESC);

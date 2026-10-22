@@ -9,6 +9,9 @@ router.get("/", notifications.listMine);
 router.post("/device-token", notifications.registerDeviceToken);
 router.delete("/device-token", notifications.removeDeviceToken);
 router.post("/read-all", notifications.markAllRead);
+// SB8: what the customer wants to hear about, and where.
+router.get("/preferences", notifications.getPreferences);
+router.put("/preferences", notifications.updatePreferences);
 router.patch("/:id/read", notifications.markRead);
 
 module.exports = router;

@@ -1,4 +1,5 @@
 const pool = require("../config/db");
+const notificationPrefs = require("../services/notificationPrefs");
 
 async function listMine(req, res) {
   const { rows } = await pool.query(
@@ -74,7 +75,23 @@ async function removeDeviceToken(req, res) {
   res.json({ message: "Device removed" });
 }
 
+/** Notification preferences (SB8): topics × channels, with consent times. */
+async function getPreferences(req, res) {
+  res.json(await notificationPrefs.get(req.user.id));
+}
+
+async function updatePreferences(req, res) {
+  try {
+    res.json(await notificationPrefs.update(req.user.id, req.body || {}));
+  } catch (err) {
+    if (err instanceof notificationPrefs.PrefsError) return res.status(err.status).json({ message: err.message });
+    throw err;
+  }
+}
+
 module.exports = {
+  getPreferences,
+  updatePreferences,
   listMine,
   markRead,
   markAllRead,
