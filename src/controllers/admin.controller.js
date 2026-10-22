@@ -11,6 +11,7 @@ const shipments = require('../services/shipments');
 const { issueAfterDelivery } = require('../services/invoices');
 const shopBranding = require('../services/shopBranding');
 const shopTrust = require('../services/shopTrust');
+const shopHours = require('../services/shopHours');
 
 const ALL_ORDER_STATUSES = [...STATUS_FLOW, 'cancelled'];
 const USER_ROLES = ['customer', 'vendor', 'admin'];
@@ -221,6 +222,37 @@ async function setVendorVerificationHold(req, res) {
     verificationHoldReason: rows[0].verification_hold_reason,
     verified: rows[0].verified,
   });
+}
+
+/** A shop's hours (SB3): weekly timetable, timezone, holidays, open now. */
+async function getVendorHours(req, res) {
+  const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = $1', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ message: 'Vendor not found' });
+  res.json(await shopHours.getHours(rows[0].id));
+}
+
+/** Sets a shop's weekly timetable and/or timezone (SB3), audited. */
+async function updateVendorHours(req, res) {
+  try {
+    const input = shopHours.readWeek(req.body || {});
+    const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = $1', [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ message: 'Vendor not found' });
+    const before = await shopHours.getHours(rows[0].id);
+    const after = await shopHours.saveHours(rows[0].id, input);
+    await recordAudit({
+      actorUserId: req.user.id,
+      action: 'vendor.hours_changed',
+      module: 'vendors',
+      entityType: 'vendor',
+      entityId: rows[0].id,
+      previousValue: { timezone: before.timezone, week: before.week },
+      newValue: { timezone: after.timezone, week: after.week },
+    });
+    res.json(after);
+  } catch (err) {
+    if (err instanceof shopHours.HoursError) return res.status(err.status).json({ message: err.message });
+    throw err;
+  }
 }
 
 /** A shop's gallery with each photo's status (SB1). */
@@ -938,6 +970,8 @@ module.exports = {
   updateVendor,
   getVendorGallery,
   setVendorVerificationHold,
+  getVendorHours,
+  updateVendorHours,
   setVendorGalleryPhotoStatus,
   listAllOrders,
   getAnyOrder,

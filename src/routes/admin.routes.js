@@ -226,6 +226,9 @@ router.patch("/vendors/:id", admin.updateVendor);
 router.get("/vendors/:id/gallery", admin.getVendorGallery);
 // Verified badge (SB2): hold it back with a reason, or release it.
 router.patch("/vendors/:id/verification", admin.setVendorVerificationHold);
+// Shop hours (SB3): see and set a shop's weekly timetable and timezone.
+router.get("/vendors/:id/hours", admin.getVendorHours);
+router.put("/vendors/:id/hours", admin.updateVendorHours);
 router.patch("/vendors/:id/gallery/:photoId", admin.setVendorGalleryPhotoStatus);
 
 // Sprint 5 — the weights every vendor is ranked by, and the log of what those

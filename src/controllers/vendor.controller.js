@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const shopBranding = require('../services/shopBranding');
 const shopTrust = require('../services/shopTrust');
+const shopHours = require('../services/shopHours');
 
 const BUSINESS_TYPES = ['b2b', 'b2c', 'both'];
 // approved = newly approved shops first (SB2).
@@ -108,6 +109,35 @@ const removeGalleryPhoto = gallery(async (vendorId, req, res) => {
   res.status(204).send();
 });
 
+/** The shop's own hours handlers (SB3): weekly timetable, timezone, holidays. */
+const hours = (fn) => async (req, res) => {
+  const vendorId = await myVendorId(req.user.id);
+  if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
+  try {
+    await fn(vendorId, req, res);
+  } catch (err) {
+    if (err instanceof shopHours.HoursError) return res.status(err.status).json({ message: err.message });
+    throw err;
+  }
+};
+
+const getMyHours = hours(async (vendorId, req, res) => {
+  res.json(await shopHours.getHours(vendorId));
+});
+
+const updateMyHours = hours(async (vendorId, req, res) => {
+  res.json(await shopHours.saveHours(vendorId, shopHours.readWeek(req.body || {})));
+});
+
+const addMyHoliday = hours(async (vendorId, req, res) => {
+  res.status(201).json(await shopHours.addHoliday(vendorId, req.body || {}));
+});
+
+const removeMyHoliday = hours(async (vendorId, req, res) => {
+  await shopHours.removeHoliday(vendorId, req.params.holidayId);
+  res.status(204).send();
+});
+
 async function getPublicProfile(req, res) {
   const { rows } = await pool.query(
     `SELECT vp.id, vp.business_name, vp.business_type, vp.gst_number, vp.address_line,
@@ -121,7 +151,9 @@ async function getPublicProfile(req, res) {
             (SELECT COALESCE(array_agg(DISTINCT sa.pincode ORDER BY sa.pincode), '{}') FROM vendor_service_areas sa
               WHERE sa.vendor_id = vp.id AND sa.is_active AND sa.area_type = 'pincode' AND sa.pincode IS NOT NULL) AS service_pincodes,
             (SELECT MAX(sa.radius_km) FROM vendor_service_areas sa
-              WHERE sa.vendor_id = vp.id AND sa.is_active AND sa.area_type = 'radius') AS service_radius_km
+              WHERE sa.vendor_id = vp.id AND sa.is_active AND sa.area_type = 'radius') AS service_radius_km,
+            -- SB3: open now on the shop's clock, and today's hours.
+            vp.timezone, ${shopHours.openNowSql('vp')} AS open_now, ${shopHours.todaySql('vp')} AS hours_today
      FROM vendor_profiles vp
      LEFT JOIN vendor_delivery_rules dr ON dr.vendor_id = vp.id
      LEFT JOIN vendor_performance_metrics pm ON pm.vendor_id = vp.id
@@ -136,6 +168,8 @@ async function getPublicProfile(req, res) {
     service_radius_km: vendor.service_radius_km == null ? null : Number(vendor.service_radius_km),
     // Visible photos only (SB1); hidden ones never reach customers.
     gallery: await shopBranding.publicGallery(vendor.id),
+    // SB3: the weekly timetable ([] = the daily window) and coming holidays.
+    ...(await shopHours.publicHours(vendor.id)),
   });
 }
 
@@ -166,6 +200,14 @@ async function listVendors(req, res) {
   if (req.query.q) conditions.push(`vp.business_name ILIKE ${push(`%${req.query.q}%`)}`);
   // SB2: only shops with the Verified badge.
   if (req.query.verified === 'true') conditions.push(shopTrust.verifiedSql('vp'));
+  // SB3: the filters the app used to apply on the phone, with the same rules
+  // (a shop with no delivery settings yet matches neither delivery nor pickup),
+  // plus open now from real hours and always-free delivery.
+  if (req.query.openNow === 'true') conditions.push(`${shopHours.openNowSql('vp')} IS TRUE`);
+  if (req.query.delivery === 'true') conditions.push('dr.supports_delivery IS TRUE');
+  if (req.query.pickup === 'true') conditions.push('dr.supports_pickup IS TRUE');
+  if (req.query.freeDelivery === 'true') conditions.push('(dr.supports_delivery IS TRUE AND dr.delivery_charge_cents = 0)');
+  if (req.query.wholesale === 'true') conditions.push("vp.business_type IN ('b2b', 'both')");
   if (req.query.businessType && BUSINESS_TYPES.includes(req.query.businessType)) {
     conditions.push(`vp.business_type = ${push(req.query.businessType)}`);
   }
@@ -206,6 +248,8 @@ async function listVendors(req, res) {
               vp.district, vp.approved_at, ${shopTrust.verifiedSql('vp')} AS verified,
               vp.address_line, vp.city, vp.state, vp.pincode, vp.status,
               dr.supports_delivery, dr.supports_pickup, dr.opens_at, dr.closes_at,
+              dr.delivery_charge_cents, dr.free_delivery_above_cents,
+              ${shopHours.openNowSql('vp')} AS open_now, ${shopHours.todaySql('vp')} AS hours_today,
               CASE WHEN pm.rating_count > 0 THEN ROUND(pm.rating_sum / pm.rating_count, 2) END AS rating,
               COALESCE(pm.rating_count, 0) AS review_count,
               (SELECT COUNT(*)::int FROM products p
@@ -258,4 +302,8 @@ module.exports = {
   addGalleryPhoto,
   updateGalleryPhoto,
   removeGalleryPhoto,
+  getMyHours,
+  updateMyHours,
+  addMyHoliday,
+  removeMyHoliday,
 };

@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const { findOwnedAddress } = require('./address.controller');
 const { resolveUnitPriceCents } = require('./product.controller');
+const shopHours = require('../services/shopHours');
 
 /** Average city delivery speed used for the Phase 1 ETA. Replaced in Phase 3. */
 const AVERAGE_SPEED_KMPH = 20;
@@ -27,8 +28,13 @@ function rulesFor(map, vendorId) {
 /**
  * A shop is open when now falls inside [opens_at, closes_at). A window that
  * wraps past midnight (22:00–02:00) is treated as two spans.
+ *
+ * SB3: rules.open_now, when the caller looked it up (shopHours.openNowFor),
+ * is the answer on the shop's own clock with weekly hours and holidays, and
+ * wins. null there means the shop never gave hours: still open, as before.
  */
 function isOpenNow(rules, now = new Date()) {
+  if (rules.open_now === true || rules.open_now === false) return rules.open_now;
   if (!rules.opens_at || !rules.closes_at) return true;
   const minutesNow = now.getHours() * 60 + now.getMinutes();
   const toMinutes = (t) => {
@@ -163,9 +169,10 @@ async function evaluate({ userId, addressId, items }) {
   }
 
   const vendorIds = [...new Set(products.map((p) => p.vendor_id))];
-  const [{ rows: areaRows }, { rows: ruleRows }] = await Promise.all([
+  const [{ rows: areaRows }, { rows: ruleRows }, openNow] = await Promise.all([
     pool.query('SELECT * FROM vendor_service_areas WHERE vendor_id = ANY($1) AND is_active = true', [vendorIds]),
     pool.query('SELECT * FROM vendor_delivery_rules WHERE vendor_id = ANY($1)', [vendorIds]),
+    shopHours.openNowFor(vendorIds),
   ]);
   const areasByVendor = new Map();
   for (const area of areaRows) {
@@ -201,7 +208,7 @@ async function evaluate({ userId, addressId, items }) {
     const evaluated = evaluateVendor({
       vendor: { id: vendorId, business_name: first.business_name },
       areas: areasByVendor.get(vendorId) || [],
-      rules: rulesFor(rulesByVendor, vendorId),
+      rules: { ...rulesFor(rulesByVendor, vendorId), open_now: openNow.get(vendorId) },
       address,
       distanceKm: first.distance_km == null ? null : Number(first.distance_km),
       subtotalCents,

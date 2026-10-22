@@ -20,6 +20,7 @@
  */
 const pool = require('../config/db');
 const { evaluateVendor, DEFAULT_RULES } = require('../controllers/serviceability.controller');
+const shopHours = require('./shopHours');
 
 const STRATEGIES = ['recommended', 'fastest', 'cheapest', 'nearest', 'best_rated', 'pickup'];
 
@@ -228,9 +229,10 @@ async function findCandidates({
   if (rows.length === 0) return { seed, candidates: [] };
 
   const vendorIds = [...new Set(rows.map((r) => r.vendor_id))];
-  const [{ rows: areaRows }, { rows: ruleRows }] = await Promise.all([
+  const [{ rows: areaRows }, { rows: ruleRows }, openNow] = await Promise.all([
     client.query('SELECT * FROM vendor_service_areas WHERE vendor_id = ANY($1) AND is_active = true', [vendorIds]),
     client.query('SELECT * FROM vendor_delivery_rules WHERE vendor_id = ANY($1)', [vendorIds]),
+    shopHours.openNowFor(vendorIds),
   ]);
   const areasByVendor = new Map();
   for (const area of areaRows) {
@@ -244,7 +246,11 @@ async function findCandidates({
     const distanceKm = r.distance_km == null ? null : Number(r.distance_km);
     const hasStock = r.available_qty >= quantity;
 
-    const rules = rulesByVendor.get(r.vendor_id) || { ...DEFAULT_RULES, vendor_id: r.vendor_id };
+    const rules = {
+      ...(rulesByVendor.get(r.vendor_id) || { ...DEFAULT_RULES, vendor_id: r.vendor_id }),
+      // SB3: open or closed on the shop's own clock, the same answer checkout gets.
+      open_now: openNow.get(r.vendor_id),
+    };
 
     // Reuses Sprint 1's decision matrix rather than a second copy of it: the
     // rules for "can this shop serve this address" must not differ between

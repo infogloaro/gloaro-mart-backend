@@ -28,6 +28,12 @@ router.post('/gallery', requireAuth, requireRole('vendor'), vendorController.add
 router.patch('/gallery/:photoId', requireAuth, requireRole('vendor'), vendorController.updateGalleryPhoto);
 router.delete('/gallery/:photoId', requireAuth, requireRole('vendor'), vendorController.removeGalleryPhoto);
 
+// Shop hours (SB3): weekly timetable, timezone and holidays.
+router.get('/hours', requireAuth, requireRole('vendor'), vendorController.getMyHours);
+router.put('/hours', requireAuth, requireRole('vendor'), vendorController.updateMyHours);
+router.post('/holidays', requireAuth, requireRole('vendor'), vendorController.addMyHoliday);
+router.delete('/holidays/:holidayId', requireAuth, requireRole('vendor'), vendorController.removeMyHoliday);
+
 // Public: the Mart tab's shop-discovery grid. Must stay above '/:id' for the
 // same reason 'delivery-settings' does.
 router.get('/', vendorController.listVendors);

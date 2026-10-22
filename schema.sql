@@ -3489,3 +3489,72 @@ WHERE vp.id::text = a.entity_id AND vp.approved_at IS NULL AND vp.status = 'appr
 
 CREATE INDEX IF NOT EXISTS idx_vendor_documents_approved ON vendor_documents (vendor_id, doc_type) WHERE status = 'approved';
 CREATE INDEX IF NOT EXISTS idx_vendor_profiles_approved_at ON vendor_profiles (approved_at DESC);
+
+-- ===== SHOP HOURS (SB3) =====
+-- When a shop is open. A shop can keep its one daily window (opens_at /
+-- closes_at on vendor_delivery_rules, unchanged) or set a weekly timetable:
+-- one row per day of the week (0 = Sunday), either closed or open from
+-- opens_at to closes_at (a window past midnight runs into the next day;
+-- opens_at = closes_at means open 24 hours). Holidays close the shop for a
+-- whole date. Times are the shop's own clock (timezone, India by default),
+-- never the server's. shop_open_at() is the one rule used by the shop list,
+-- the shop page and checkout: weekly hours win, then the daily window; NULL
+-- when the shop never said (checkout keeps treating that as open).
+-- Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB3).
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata';
+
+CREATE TABLE IF NOT EXISTS vendor_hours (
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  day_of_week SMALLINT NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
+  is_closed BOOLEAN NOT NULL DEFAULT false,
+  opens_at TIME,
+  closes_at TIME,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (vendor_id, day_of_week),
+  CHECK (is_closed OR (opens_at IS NOT NULL AND closes_at IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS vendor_holidays (
+  id SERIAL PRIMARY KEY,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  holiday_date DATE NOT NULL,
+  note VARCHAR(80),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (vendor_id, holiday_date)
+);
+
+CREATE OR REPLACE FUNCTION shop_open_at(p_vendor INTEGER, p_at TIMESTAMPTZ)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $fn$
+  WITH t AS (
+    SELECT l.ts::date AS d, l.ts::time AS tm, EXTRACT(DOW FROM l.ts)::int AS dow
+    FROM (SELECT p_at AT TIME ZONE vp.timezone AS ts FROM vendor_profiles vp WHERE vp.id = p_vendor) l
+  )
+  SELECT CASE
+    WHEN EXISTS (SELECT 1 FROM vendor_hours h WHERE h.vendor_id = p_vendor) THEN (
+      -- Today's window, unless today is a holiday.
+      EXISTS (
+        SELECT 1 FROM vendor_hours h, t
+        WHERE h.vendor_id = p_vendor AND h.day_of_week = t.dow AND NOT h.is_closed
+          AND NOT EXISTS (SELECT 1 FROM vendor_holidays x WHERE x.vendor_id = p_vendor AND x.holiday_date = t.d)
+          AND (h.opens_at = h.closes_at
+               OR (h.opens_at < h.closes_at AND t.tm >= h.opens_at AND t.tm < h.closes_at)
+               OR (h.opens_at > h.closes_at AND t.tm >= h.opens_at)))
+      -- Or yesterday's window running past midnight.
+      OR EXISTS (
+        SELECT 1 FROM vendor_hours h, t
+        WHERE h.vendor_id = p_vendor AND h.day_of_week = (t.dow + 6) % 7 AND NOT h.is_closed
+          AND NOT EXISTS (SELECT 1 FROM vendor_holidays x WHERE x.vendor_id = p_vendor AND x.holiday_date = t.d - 1)
+          AND h.opens_at > h.closes_at AND t.tm < h.closes_at))
+    WHEN EXISTS (SELECT 1 FROM vendor_holidays x, t WHERE x.vendor_id = p_vendor AND x.holiday_date = t.d) THEN false
+    ELSE (
+      SELECT CASE
+        WHEN dr.opens_at IS NULL OR dr.closes_at IS NULL THEN NULL
+        WHEN dr.opens_at = dr.closes_at THEN true
+        WHEN dr.opens_at < dr.closes_at THEN t.tm >= dr.opens_at AND t.tm < dr.closes_at
+        ELSE t.tm >= dr.opens_at OR t.tm < dr.closes_at
+      END
+      FROM t LEFT JOIN vendor_delivery_rules dr ON dr.vendor_id = p_vendor)
+  END
+$fn$;
+
+CREATE INDEX IF NOT EXISTS idx_vendor_holidays_vendor_date ON vendor_holidays (vendor_id, holiday_date);
