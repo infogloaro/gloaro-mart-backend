@@ -6,6 +6,7 @@ const { processQueue: processWhatsappQueue } = require('./src/services/whatsapp'
 const { dispatch: dispatchWhatsappEvents } = require('./src/services/whatsappEvents');
 const { sweep: sweepAdCampaigns } = require('./src/services/adCampaigns');
 const { attributeOrders: attributeAdOrders } = require('./src/services/adServing');
+const { reverseReturnedOrders: reverseReturnedAdOrders } = require('./src/services/adFixes');
 const { pruneViews: pruneShopViews } = require('./src/services/shopVisits');
 const { announceDue: announceDueOffers } = require('./src/services/shopOfferAlerts');
 
@@ -58,6 +59,9 @@ if (adSeconds > 0) {
       // Delivered orders that came from an ad tap are credited to it.
       const credited = await attributeAdOrders();
       if (credited) console.log(`[ads] ${credited} order(s) credited to ads`);
+      // …and ones refunded on a return since give the ad commission back (SB10).
+      const reversed = await reverseReturnedAdOrders();
+      if (reversed) console.log(`[ads] ${reversed} returned order(s) reversed`);
     } catch (err) {
       console.error(`[ads] schedule sweep failed: ${err.message}`);
     } finally {

@@ -1,6 +1,7 @@
 const express = require('express');
 const { optionalAuth } = require('../middleware/auth');
 const serving = require('../services/adServing');
+const adFixes = require('../services/adFixes');
 
 /**
  * Shop ads in the app (Ad Promotions). Public: signed-out shoppers see ads
@@ -41,7 +42,12 @@ router.get('/', handle(async (req, res) => {
 
 router.post('/events', optionalAuth, handle(async (req, res) => {
   if (tooMany(req.ip)) return res.status(429).json({ message: 'Too many ad reports — batch them.' });
-  const accepted = await serving.recordEvents({ sessionId: req.body?.sessionId, events: req.body?.events, userId: req.user?.id });
+  const accepted = await serving.recordEvents({
+    sessionId: req.body?.sessionId,
+    events: req.body?.events,
+    userId: req.user?.id,
+    ipHash: adFixes.ipHash(adFixes.clientIp(req)),
+  });
   res.status(202).json({ accepted });
 }));
 

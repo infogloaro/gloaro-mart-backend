@@ -89,7 +89,7 @@ async function serve(query) {
  * and slot per hour (impressions) or per minute (taps), and only while the
  * campaign was running. Returns how many were counted.
  */
-async function recordEvents({ sessionId, events, userId }) {
+async function recordEvents({ sessionId, events, userId, ipHash = null }) {
   if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) throw new ServeError(400, 'sessionId is 8–64 letters, digits, - or _.');
   if (!Array.isArray(events) || events.length === 0) throw new ServeError(400, 'Send at least one event.');
   if (events.length > MAX_BATCH) throw new ServeError(400, `At most ${MAX_BATCH} events per request.`);
@@ -117,11 +117,12 @@ async function recordEvents({ sessionId, events, userId }) {
     if (!c || !(c.placements ?? []).includes(e.placement)) continue;
     if (e.at < new Date(c.starts_at) || e.at > new Date(new Date(c.ends_at).getTime() + 3600000)) continue;
     const unit = e.type === 'impression' ? 'hour' : 'minute';
+    // SB10: the sender's address, hashed, so repeated taps from one place can be reviewed.
     const { rows } = await pool.query(
-      `INSERT INTO ad_events (campaign_id, event, placement, session_id, user_id, bucket, occurred_at)
-       VALUES ($1, $2, $3, $4, $5, date_trunc('${unit}', $6::timestamptz), $6)
+      `INSERT INTO ad_events (campaign_id, event, placement, session_id, user_id, bucket, occurred_at${ipHash ? ', ip_hash' : ''})
+       VALUES ($1, $2, $3, $4, $5, date_trunc('${unit}', $6::timestamptz), $6${ipHash ? ', $7' : ''})
        ON CONFLICT (campaign_id, placement, session_id, event, bucket) DO NOTHING RETURNING id`,
-      [e.campaignId, e.type, e.placement, sessionId, userId ?? null, e.at]
+      [e.campaignId, e.type, e.placement, sessionId, userId ?? null, e.at, ...(ipHash ? [ipHash] : [])]
     );
     if (!rows[0]) continue;
     const col = { impression: 'impressions', click: 'clicks', enquiry: 'enquiries' }[e.type];
@@ -151,6 +152,7 @@ async function attributeOrders({ limit = 200 } = {}) {
        SELECT e.id AS event_id, e.campaign_id, e.placement, c.model, c.commission_percent, c.reference
        FROM ad_events e JOIN ad_campaigns c ON c.id = e.campaign_id
        WHERE e.event = 'click' AND e.user_id = o.user_id AND c.vendor_id = o.vendor_id
+         AND e.invalid_at IS NULL -- SB10: a tap marked invalid never credits an order
          AND e.occurred_at <= o.created_at
          AND e.occurred_at >= o.created_at - make_interval(days => COALESCE((c.price_snapshot->'settings'->>'attributionDays')::int, 7))
        ORDER BY e.occurred_at DESC LIMIT 1

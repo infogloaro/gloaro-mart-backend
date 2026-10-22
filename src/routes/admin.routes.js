@@ -47,6 +47,7 @@ const whatsappAdmin = require("../controllers/whatsapp.controller");
 const adPricing = require("../controllers/adPricing.controller");
 const adCampaign = require("../controllers/adCampaign.controller");
 const adDashboard = require("../controllers/adDashboard.controller");
+const adFixes = require("../controllers/adFixes.controller");
 const platformHealthController = require("../controllers/platformHealth.controller");
 const shopReports = require("../controllers/shopReports.controller");
 const { requirePermission } = require("../middleware/rbac");
@@ -450,6 +451,9 @@ router.post("/ads/campaigns/:id/resume", adCampaign.resume);
 router.post("/ads/campaigns/:id/cancel", adCampaign.cancel);
 router.post("/ads/campaigns/:id/extend", adCampaign.extend);
 router.post("/ads/campaigns/:id/renew", adCampaign.renew);
+// SB10: repeated taps on one ad, reviewed and marked "don't bill".
+router.get("/ads/click-review", adFixes.listRepeatedTaps);
+router.post("/ads/click-review/mark", adFixes.markTaps);
 
 // Analytics — guarded by the analytics permission module.
 router.get("/analytics", analyticsController.adminAnalytics);

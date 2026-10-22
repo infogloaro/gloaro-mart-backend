@@ -3727,3 +3727,46 @@ CREATE TABLE IF NOT EXISTS shop_enquiry_messages (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_shop_enquiry_messages_enquiry ON shop_enquiry_messages (enquiry_id, created_at);
+
+-- ===== AD FIXES (SB10) =====
+-- Two fixes to the ad results (Phase 54):
+-- 1. An order credited to an ad and then refunded on a return no longer counts:
+--    the ad commission the shop paid on it is credited back (a negative
+--    vendor_charges row, paid in its next settlement) and the campaign's daily
+--    results drop the order. A partial refund gives back that share. Reversals
+--    also happen when the tap that brought the order is marked invalid (below).
+-- 2. Repeated taps on one ad from one session or one network address in a day
+--    are listed for the admin, who can mark them invalid ("don't bill"): they
+--    leave the shop's click count and can't credit an order to the ad.
+-- The address is kept only as a salted hash (ip_hash). Rules in
+-- services/adFixes.js. Plan: G_mart docs/SHOPS_PROMOTIONS_PLAN.md (SB10).
+ALTER TABLE ad_events ADD COLUMN IF NOT EXISTS ip_hash VARCHAR(16);
+ALTER TABLE ad_events ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
+ALTER TABLE ad_events ADD COLUMN IF NOT EXISTS invalid_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE ad_events ADD COLUMN IF NOT EXISTS invalid_note TEXT;
+CREATE INDEX IF NOT EXISTS idx_ad_events_click_day ON ad_events (campaign_id, occurred_at) WHERE event = 'click';
+
+ALTER TABLE ad_attributions ADD COLUMN IF NOT EXISTS reversed_value_cents INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE ad_attributions ADD COLUMN IF NOT EXISTS reversed_commission_cents INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS ad_attribution_reversals (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES ad_attributions(order_id) ON DELETE CASCADE,
+  campaign_id INTEGER NOT NULL REFERENCES ad_campaigns(id) ON DELETE CASCADE,
+  reason VARCHAR(15) NOT NULL CHECK (reason IN ('returned', 'invalid_click')),
+  return_id INTEGER REFERENCES order_returns(id) ON DELETE SET NULL,
+  value_cents INTEGER NOT NULL CHECK (value_cents >= 0),
+  commission_cents INTEGER NOT NULL CHECK (commission_cents >= 0),
+  vendor_charge_id INTEGER REFERENCES vendor_charges(id) ON DELETE SET NULL,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ad_attribution_reversals_order ON ad_attribution_reversals (order_id);
+
+-- The credit back to the shop, and its line in the ad money ledger.
+ALTER TABLE vendor_charges DROP CONSTRAINT IF EXISTS vendor_charges_kind_check;
+ALTER TABLE vendor_charges ADD CONSTRAINT vendor_charges_kind_check
+  CHECK (kind IN ('advertising', 'ad_refund', 'ad_commission', 'ad_reversal'));
+ALTER TABLE ad_ledger DROP CONSTRAINT IF EXISTS ad_ledger_entry_check;
+ALTER TABLE ad_ledger ADD CONSTRAINT ad_ledger_entry_check
+  CHECK (entry IN ('ad_revenue', 'ad_tax', 'ad_discount', 'ad_refund', 'ad_tax_refund', 'ad_commission', 'ad_reversal'));
