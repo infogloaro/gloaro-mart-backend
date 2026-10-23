@@ -3844,6 +3844,30 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS points_redeemed INTEGER NOT NULL DEF
 -- Part of discount_cents (so totals add up as before), funded by Gloaro Mart.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS points_discount_cents INTEGER NOT NULL DEFAULT 0;
 
+-- ===== PHONE SIGN-UP =====
+-- Sign-up is by mobile number: the number is checked with an OTP before the
+-- account exists, then a password is set. No username; email is optional
+-- (an account without one gets a placeholder like the WhatsApp bot's).
+CREATE TABLE IF NOT EXISTS signup_otps (
+  id SERIAL PRIMARY KEY,
+  phone TEXT NOT NULL CHECK (phone ~ '^[0-9]{10}$'),
+  role TEXT NOT NULL CHECK (role IN ('customer', 'vendor')),
+  otp_hash TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS signup_otps_phone_idx ON signup_otps (phone, role, created_at DESC);
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS gender TEXT;
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_gender_check;
+ALTER TABLE users ADD CONSTRAINT users_gender_check CHECK (gender IN ('male', 'female', 'other'));
+-- The code typed at sign-up, kept as typed; no reward is tied to it yet.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code_used TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
+
 -- ===== VENDOR REGISTRATION & KYC (VK1) =====
 -- Vendor sign-up asks for the business (legal form, what it sells, where it
 -- is) and then the documents: a government ID, a photo of the shop and the

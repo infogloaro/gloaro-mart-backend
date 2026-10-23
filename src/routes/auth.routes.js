@@ -1,10 +1,12 @@
 const express = require('express');
-const { deleteMe, changePassword, sendLoginOtp, verifyLoginOtp, checkAuthStatus, signup, login, forgotPassword, resetPassword, getMe, updateMe, logout, refresh } = require('../controllers/auth.controller');
+const { deleteMe, changePassword, sendLoginOtp, verifyLoginOtp, sendSignupOtp, verifySignupOtp, checkAuthStatus, signup, login, forgotPassword, resetPassword, getMe, updateMe, logout, refresh } = require('../controllers/auth.controller');
 const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
 router.get('/status', checkAuthStatus);
+router.post('/signup/otp/send', sendSignupOtp);
+router.post('/signup/otp/verify', verifySignupOtp);
 router.post('/signup', signup);
 router.post('/login', login);
 router.post('/otp/send', sendLoginOtp);

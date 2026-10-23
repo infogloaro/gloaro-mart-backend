@@ -65,7 +65,196 @@ async function findByPhone(phone, role) {
   return rows[0];
 }
 
+/** True when [phone] (10 digits) already has an account with [role]. */
+async function phoneTaken(phone, role, db = pool) {
+  const { rows } = await db.query(
+    `SELECT 1 FROM users
+      WHERE right(regexp_replace(coalesce(phone_number, ''), '\\D', '', 'g'), 10) = $1 AND role = $2
+      LIMIT 1`,
+    [phone, role]
+  );
+  return rows.length > 0;
+}
+
+const SIGNUP_TOKEN_TTL = '30m';
+// Its own secret, so a sign-up ticket can never pass requireAuth as a session.
+const SIGNUP_SECRET = `${JWT_SECRET}:signup`;
+const GENDERS = ['male', 'female', 'other'];
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const MIN_SIGNUP_AGE = 13;
+
+/** The phone and role a sign-up ticket was issued for, or null when it isn't valid. */
+function readSignupToken(token) {
+  try {
+    const p = jwt.verify(String(token), SIGNUP_SECRET);
+    return p.purpose === 'signup' && /^\d{10}$/.test(p.phone) && VALID_ROLES.includes(p.role) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+/** "YYYY-MM-DD" for someone at least [MIN_SIGNUP_AGE] and born after 1900, else null. */
+function validDob(raw) {
+  if (typeof raw !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  const d = new Date(`${raw}T00:00:00Z`);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== raw) return null;
+  const now = new Date();
+  const cutoff = new Date(Date.UTC(now.getUTCFullYear() - MIN_SIGNUP_AGE, now.getUTCMonth(), now.getUTCDate()));
+  return d.getUTCFullYear() >= 1900 && d <= cutoff ? raw : null;
+}
+
+/**
+ * Phone sign-up step 1: texts a code to a number that has no account with
+ * this role yet. Unlike login this says when the number is taken — the
+ * person needs to know to sign in instead.
+ */
+async function sendSignupOtp(req, res) {
+  if (!sms.isAvailable()) {
+    return res.status(503).json({ message: "Sign-up by phone isn't available yet. Please try again later." });
+  }
+  const { phone, role } = req.body || {};
+  const ph = normalizePhone(phone);
+  if (!ph) return res.status(400).json({ field: 'phone', message: 'Enter a valid 10-digit mobile number' });
+  const userRole = VALID_ROLES.includes(role) ? role : 'customer';
+  if (await phoneTaken(ph, userRole)) {
+    return res.status(409).json({ field: 'phone', message: 'This number already has an account. Sign in instead.' });
+  }
+  const recent = await pool.query(
+    'SELECT 1 FROM signup_otps WHERE phone = $1 AND role = $2 AND created_at > $3',
+    [ph, userRole, new Date(Date.now() - OTP_RESEND_MS)]
+  );
+  if (recent.rows[0]) {
+    return res.status(429).json({ message: 'Please wait a minute before requesting another OTP' });
+  }
+
+  let otpHash;
+  try {
+    if (sms.usesWidget()) {
+      otpHash = `${WIDGET_PREFIX}${await sms.sendWidgetOtp(`+91${ph}`)}`;
+    } else {
+      const otp = crypto.randomInt(100000, 1000000).toString();
+      otpHash = await bcrypt.hash(otp, 10);
+      await sms.sendSms({
+        to: `+91${ph}`,
+        otp,
+        expiryMinutes: OTP_TTL_MS / 60000,
+        text: `${otp} is your Gloaro Mart sign-up OTP. It expires in 10 minutes. Do not share it with anyone.`,
+      });
+    }
+  } catch (err) {
+    console.error('[signup-otp] send failed:', err.message);
+    return res.status(502).json({ message: 'Could not send the OTP. Please try again.' });
+  }
+  await pool.query(
+    'UPDATE signup_otps SET consumed_at = now() WHERE phone = $1 AND role = $2 AND consumed_at IS NULL',
+    [ph, userRole]
+  );
+  await pool.query(
+    'INSERT INTO signup_otps (phone, role, otp_hash, expires_at) VALUES ($1, $2, $3, $4)',
+    [ph, userRole, otpHash, new Date(Date.now() + OTP_TTL_MS)]
+  );
+  res.json({ message: 'OTP sent', otp_length: sms.otpLength() });
+}
+
+/** Step 2: a correct code returns a 30-minute ticket that step 3 (signup) spends. */
+async function verifySignupOtp(req, res) {
+  const { phone, role, otp } = req.body || {};
+  const ph = normalizePhone(phone);
+  if (!ph || !otp) return res.status(400).json({ message: 'Phone number and OTP are required' });
+  const userRole = VALID_ROLES.includes(role) ? role : 'customer';
+  const invalid = () => res.status(401).json({ message: 'Invalid or expired OTP' });
+
+  const { rows } = await pool.query(
+    `SELECT id, otp_hash, attempts FROM signup_otps
+      WHERE phone = $1 AND role = $2 AND consumed_at IS NULL AND expires_at > now()
+      ORDER BY created_at DESC LIMIT 1`,
+    [ph, userRole]
+  );
+  const pending = rows[0];
+  if (!pending || pending.attempts >= OTP_MAX_ATTEMPTS) return invalid();
+
+  let matches;
+  if (pending.otp_hash.startsWith(WIDGET_PREFIX)) {
+    try {
+      matches = await sms.verifyWidgetOtp(pending.otp_hash.slice(WIDGET_PREFIX.length), otp);
+    } catch (err) {
+      console.error('[signup-otp] widget verify failed:', err.message);
+      return res.status(502).json({ message: 'Could not check the OTP. Please try again.' });
+    }
+  } else {
+    matches = await bcrypt.compare(String(otp), pending.otp_hash);
+  }
+  if (!matches) {
+    await pool.query('UPDATE signup_otps SET attempts = attempts + 1 WHERE id = $1', [pending.id]);
+    return invalid();
+  }
+  const claimed = await pool.query(
+    'UPDATE signup_otps SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL RETURNING id',
+    [pending.id]
+  );
+  if (!claimed.rows[0]) return invalid();
+  const signupToken = jwt.sign({ purpose: 'signup', phone: ph, role: userRole }, SIGNUP_SECRET, { expiresIn: SIGNUP_TOKEN_TTL });
+  res.json({ signupToken });
+}
+
+/**
+ * Step 3 of phone sign-up: creates the account for the number the ticket
+ * proves, with the details from the first screen and the new password.
+ */
+async function signupWithPhone(req, res) {
+  const { signupToken, fullName, email, password, dateOfBirth, gender, referralCode, termsAccepted } = req.body || {};
+  const ticket = readSignupToken(signupToken);
+  if (!ticket) {
+    return res.status(401).json({ field: 'otp', message: 'Your verification has expired. Please verify your number again.' });
+  }
+  const name = typeof fullName === 'string' ? fullName.trim() : '';
+  if (!name || name.length > 100) return res.status(400).json({ field: 'fullName', message: 'Enter your full name' });
+  const dob = validDob(dateOfBirth);
+  if (!dob) return res.status(400).json({ field: 'dateOfBirth', message: `Enter a valid date of birth (you must be ${MIN_SIGNUP_AGE} or older)` });
+  if (!GENDERS.includes(gender)) return res.status(400).json({ field: 'gender', message: 'Choose a gender' });
+  const em = typeof email === 'string' ? email.trim() : '';
+  if (em && (!EMAIL_RE.test(em) || em.length > 254)) {
+    return res.status(400).json({ field: 'email', message: 'Enter a valid email address' });
+  }
+  const referral = typeof referralCode === 'string' ? referralCode.trim() : '';
+  if (referral.length > 40) return res.status(400).json({ field: 'referralCode', message: 'That referral code is too long' });
+  if (termsAccepted !== true) return res.status(400).json({ field: 'terms', message: 'Please accept the Terms & Conditions' });
+  if (typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ field: 'password', message: 'Password must be at least 8 characters' });
+  }
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Serialises sign-ups for one number, so two taps can't make two accounts.
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`signup:${ticket.phone}:${ticket.role}`]);
+    if (await phoneTaken(ticket.phone, ticket.role, client)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ field: 'phone', message: 'This number already has an account. Sign in instead.' });
+    }
+    // No email: a placeholder like the WhatsApp bot's, so the login identity stays unique.
+    const storedEmail = em || `p${ticket.phone}.${crypto.randomBytes(4).toString('hex')}@phone.gloaromart.invalid`;
+    await client.query(
+      `INSERT INTO users (full_name, email, phone_number, password_hash, role, date_of_birth, gender, referral_code_used, terms_accepted_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())`,
+      [name, storedEmail, ticket.phone, passwordHash, ticket.role, dob, gender, referral || null]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (err.code === '23505') {
+      return res.status(409).json({ field: 'email', message: 'An account with this email already exists. Sign in instead.' });
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+  res.status(201).json({ message: 'Account created. Please sign in.' });
+}
+
 async function signup(req, res) {
+  if (req.body?.signupToken !== undefined) return signupWithPhone(req, res);
   const { fullName, username, email, phoneNumber, password, role } = req.body || {};
   if (!email || !password || password.length < 8) {
     return res.status(400).json({ message: 'Invalid email or password' });
@@ -92,14 +281,19 @@ async function signup(req, res) {
   }
 }
 
-/** Password sign-in with a username (or, for older accounts, an email). */
+/**
+ * Password sign-in with a username, a mobile number (the role picks the
+ * account when a customer and a vendor share it) or, for older accounts, an
+ * email.
+ */
 async function login(req, res) {
-  const { identifier, email, password } = req.body || {};
+  const { identifier, email, password, role } = req.body || {};
   const login = String(identifier ?? email ?? '').trim();
   if (!login || typeof password !== 'string') {
     return res.status(401).json({ message: 'Invalid credentials' });
   }
-  const user = await findByLogin(login);
+  const phone = /^\+?[\d\s-]+$/.test(login) ? normalizePhone(login) : null;
+  const user = phone ? await findByPhone(phone, role) : await findByLogin(login);
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
     return res.status(401).json({ message: 'Invalid credentials' });
   }
@@ -156,7 +350,7 @@ async function resetPassword(req, res) {
   res.json({ message: 'Password updated. Please log in again.' });
 }
 
-const PROFILE_COLUMNS = 'id, full_name, username, email, phone_number, role, created_at';
+const PROFILE_COLUMNS = "id, full_name, username, email, phone_number, role, to_char(date_of_birth, 'YYYY-MM-DD') AS date_of_birth, gender, created_at";
 
 function toProfile(row) {
   return {
@@ -166,6 +360,8 @@ function toProfile(row) {
     email: row.email,
     phoneNumber: row.phone_number,
     role: row.role,
+    dateOfBirth: row.date_of_birth,
+    gender: row.gender,
     createdAt: row.created_at,
   };
 }
@@ -494,4 +690,4 @@ async function deleteMe(req, res) {
   res.json({ message: 'Your account has been deleted' });
 }
 
-module.exports = { deleteMe, changePassword, sendLoginOtp, verifyLoginOtp, checkAuthStatus, signup, login, forgotPassword, resetPassword, getMe, updateMe, logout, refresh };
+module.exports = { deleteMe, changePassword, sendLoginOtp, verifyLoginOtp, sendSignupOtp, verifySignupOtp, checkAuthStatus, signup, login, forgotPassword, resetPassword, getMe, updateMe, logout, refresh };
