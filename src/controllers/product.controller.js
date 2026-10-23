@@ -16,11 +16,21 @@ function resolveUnitPriceCents(product, quantity, tiers) {
   return tier ? tier.unit_price_cents : product.price_cents;
 }
 
+// Each tier with order_count: order lines of the product (orders not cancelled)
+// whose quantity falls inside the tier, so the app can mark the most bought one.
+const TIERS_WITH_ORDERS_SQL = `
+  SELECT t.*,
+         (SELECT COUNT(*)::int FROM order_items oi JOIN orders o ON o.id = oi.order_id
+           WHERE oi.product_id = t.product_id AND o.status <> 'cancelled'
+             AND oi.quantity >= t.min_quantity
+             AND (t.max_quantity IS NULL OR oi.quantity <= t.max_quantity)) AS order_count
+    FROM product_price_tiers t`;
+
 async function attachTiers(products) {
   if (products.length === 0) return products;
   const ids = products.map((p) => p.id);
   const { rows: tierRows } = await pool.query(
-    'SELECT * FROM product_price_tiers WHERE product_id = ANY($1) ORDER BY min_quantity ASC',
+    `${TIERS_WITH_ORDERS_SQL} WHERE t.product_id = ANY($1) ORDER BY t.min_quantity ASC`,
     [ids]
   );
   const tiersByProduct = new Map();
@@ -322,10 +332,9 @@ async function listProducts(req, res) {
 }
 
 async function getTiers(req, res) {
-  const { rows } = await pool.query(
-    'SELECT * FROM product_price_tiers WHERE product_id = $1 ORDER BY min_quantity ASC',
-    [req.params.id]
-  );
+  const { rows } = await pool.query(`${TIERS_WITH_ORDERS_SQL} WHERE t.product_id = $1 ORDER BY t.min_quantity ASC`, [
+    req.params.id,
+  ]);
   res.json(rows);
 }
 
