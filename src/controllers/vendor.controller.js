@@ -17,19 +17,41 @@ function toNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+// The business's legal form (VK1).
+const ENTITY_TYPES = ['proprietorship', 'partnership', 'llp', 'private_limited', 'other'];
+
+/** Entity type, category and landmark from a create/update body (VK1); undefined when not sent. */
+function readRegistration(body, res) {
+  const { entityType, shopCategory, landmark } = body;
+  if (entityType != null && entityType !== '' && !ENTITY_TYPES.includes(entityType)) {
+    res.status(400).json({ field: 'entityType', message: `entityType must be one of ${ENTITY_TYPES.join(', ')}` });
+    return null;
+  }
+  const text = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) || null : undefined);
+  return { entityType: entityType || undefined, shopCategory: text(shopCategory, 60), landmark: text(landmark, 120) };
+}
+
 async function createProfile(req, res) {
-  const { businessName, businessType, gstNumber, addressLine, city, state, pincode, latitude, longitude } =
+  const { businessName, businessType, gstNumber, addressLine, city, state, pincode, latitude, longitude, district } =
     req.body || {};
   if (!businessName || !BUSINESS_TYPES.includes(businessType)) {
     return res.status(400).json({ message: 'businessName and a valid businessType are required' });
   }
+  const reg = readRegistration(req.body || {}, res);
+  if (!reg) return;
   try {
     const { rows } = await pool.query(
       `INSERT INTO vendor_profiles
-        (user_id, business_name, business_type, gst_number, address_line, city, state, pincode, latitude, longitude)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        (user_id, business_name, business_type, gst_number, address_line, city, state, pincode, latitude, longitude,
+         entity_type, shop_category, landmark, district)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING *`,
-      [req.user.id, businessName, businessType, gstNumber || null, addressLine || null, city || null, state || null, pincode || null, latitude ?? null, longitude ?? null]
+      [
+        req.user.id, businessName, businessType, gstNumber || null, addressLine || null, city || null, state || null,
+        pincode || null, latitude ?? null, longitude ?? null,
+        reg.entityType ?? null, reg.shopCategory ?? null, reg.landmark ?? null,
+        typeof district === 'string' && district.trim() ? district.trim().slice(0, 80) : null,
+      ]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -64,8 +86,15 @@ async function updateMyProfile(req, res) {
     }
     throw err;
   }
+  const reg = readRegistration(req.body || {}, res);
+  if (!reg) return;
+  // The registration fields come after the branding ones ($11…).
+  const n = 10 + branding.values.length;
   const { rows } = await pool.query(
     `UPDATE vendor_profiles SET
+      entity_type = COALESCE($${n + 1}, entity_type),
+      shop_category = COALESCE($${n + 2}, shop_category),
+      landmark = COALESCE($${n + 3}, landmark),
       business_name = COALESCE($2, business_name),
       business_type = COALESCE($3, business_type),
       gst_number = COALESCE($4, gst_number),
@@ -77,7 +106,10 @@ async function updateMyProfile(req, res) {
       longitude = COALESCE($10, longitude)${branding.sql.map((s) => `,\n      ${s}`).join('')}
      WHERE user_id = $1
      RETURNING *`,
-    [req.user.id, businessName, businessType, gstNumber, addressLine, city, state, pincode, latitude, longitude, ...branding.values]
+    [
+      req.user.id, businessName, businessType, gstNumber, addressLine, city, state, pincode, latitude, longitude,
+      ...branding.values, reg.entityType ?? null, reg.shopCategory ?? null, reg.landmark ?? null,
+    ]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Vendor profile not found' });
   res.json(rows[0]);

@@ -3843,3 +3843,35 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_reward_txns_one_refund
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS points_redeemed INTEGER NOT NULL DEFAULT 0;
 -- Part of discount_cents (so totals add up as before), funded by Gloaro Mart.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS points_discount_cents INTEGER NOT NULL DEFAULT 0;
+
+-- ===== VENDOR REGISTRATION & KYC (VK1) =====
+-- Vendor sign-up asks for the business (legal form, what it sells, where it
+-- is) and then the documents: a government ID, a photo of the shop and the
+-- owner's signature, confirmed with an OTP to the registered mobile. Only
+-- the last four characters of an ID number are stored; the reviewer reads
+-- the full number off the uploaded photo.
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS entity_type TEXT;
+ALTER TABLE vendor_profiles DROP CONSTRAINT IF EXISTS vendor_profiles_entity_type_check;
+ALTER TABLE vendor_profiles ADD CONSTRAINT vendor_profiles_entity_type_check
+  CHECK (entity_type IN ('proprietorship', 'partnership', 'llp', 'private_limited', 'other'));
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS shop_category TEXT;
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS landmark TEXT;
+-- When the vendor last sent the documents from the app; null until then.
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS kyc_submitted_at TIMESTAMPTZ;
+
+ALTER TABLE vendor_documents DROP CONSTRAINT IF EXISTS vendor_documents_doc_type_check;
+ALTER TABLE vendor_documents ADD CONSTRAINT vendor_documents_doc_type_check
+  CHECK (doc_type IN ('gstin', 'pan', 'bank', 'fssai', 'other',
+                      'aadhaar', 'voter_id', 'driving_licence', 'shop_photo', 'signature'));
+
+-- The code that confirms a KYC submission, sent to the vendor's own number.
+CREATE TABLE IF NOT EXISTS kyc_otps (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  otp_hash TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS kyc_otps_user_idx ON kyc_otps (user_id, created_at DESC);

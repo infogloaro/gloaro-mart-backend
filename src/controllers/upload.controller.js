@@ -36,6 +36,9 @@ const FOLDERS = {
 
 const MAX_BYTES = 5 * 1024 * 1024;
 
+// Vendor KYC pictures (VK1): uploaded only by the vendor's own route.
+const PRIVATE_FOLDER = 'kyc';
+
 // Kept in memory so the bytes can be checked before anything is stored.
 const receive = multer({
   storage: multer.memoryStorage(),
@@ -76,7 +79,9 @@ function saveImage(folder, req, res, next) {
     if (!ext) return res.status(400).json({ message: 'Only JPG, PNG or WebP images are accepted' });
 
     try {
-      const name = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${ext}`;
+      // ID documents are served only to someone holding the link, so their
+      // names are long enough that the link can't be guessed.
+      const name = `${Date.now()}-${crypto.randomBytes(folder === PRIVATE_FOLDER ? 24 : 6).toString('hex')}.${ext}`;
       const filePath = `/uploads/${folder}/${name}`;
       await pool.query('INSERT INTO media_files (path, mime, bytes, size) VALUES ($1, $2, $3, $4)', [
         filePath,
@@ -104,7 +109,8 @@ async function serveUpload(req, res, next) {
     if (!rows[0]) return next();
     res.set({
       'Content-Type': rows[0].mime,
-      'Cache-Control': 'public, max-age=2592000, immutable',
+      // Vendor ID documents stay out of shared caches.
+      'Cache-Control': req.path.startsWith(`/${PRIVATE_FOLDER}/`) ? 'private, no-store' : 'public, max-age=2592000, immutable',
       'X-Content-Type-Options': 'nosniff',
     });
     res.send(rows[0].bytes);

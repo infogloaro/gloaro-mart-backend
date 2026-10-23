@@ -6,6 +6,7 @@ const { getVendorProducts } = require('../controllers/product.controller');
 const review = require('../controllers/review.controller');
 const { uploadTo } = require('../controllers/upload.controller');
 const shopReports = require('../controllers/shopReports.controller');
+const kyc = require('../controllers/vendorKyc.controller');
 
 const router = express.Router();
 
@@ -28,6 +29,13 @@ router.get('/gallery', requireAuth, requireRole('vendor'), vendorController.getM
 router.post('/gallery', requireAuth, requireRole('vendor'), vendorController.addGalleryPhoto);
 router.patch('/gallery/:photoId', requireAuth, requireRole('vendor'), vendorController.updateGalleryPhoto);
 router.delete('/gallery/:photoId', requireAuth, requireRole('vendor'), vendorController.removeGalleryPhoto);
+
+// Registration documents (VK1): pictures upload to /uploads/kyc first, then
+// one submission with the ID number, confirmed by an OTP to the vendor's number.
+router.get('/kyc', requireAuth, requireRole('vendor'), kyc.getMyKyc);
+router.post('/kyc/uploads', requireAuth, requireRole('vendor'), uploadTo('kyc'));
+router.post('/kyc/otp', requireAuth, requireRole('vendor'), kyc.sendKycOtp);
+router.post('/kyc', requireAuth, requireRole('vendor'), kyc.submitMyKyc);
 
 // Shop hours (SB3): weekly timetable, timezone and holidays.
 router.get('/hours', requireAuth, requireRole('vendor'), vendorController.getMyHours);
