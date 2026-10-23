@@ -90,6 +90,7 @@ async function getPublicSettings(req, res) {
     platform_name: settings.platform_name,
     tagline: settings.tagline,
     logo_url: settings.logo_url,
+    favicon_url: settings.favicon_url,
     support_email: settings.support_email,
     support_phone: settings.support_phone,
     whatsapp_number: settings.whatsapp_number,
