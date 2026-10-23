@@ -31,6 +31,11 @@ const REQUIRED = ['platformName', 'currencyCode', 'invoicePrefix', 'maintenanceM
 
 const URL_FIELDS = ['logoUrl', 'faviconUrl', 'instagramUrl', 'facebookUrl', 'youtubeUrl'];
 
+// The logo and favicon can also be a file uploaded from the Settings page,
+// which is saved as a path like /uploads/settings/1792…-ab12.png.
+const IMAGE_FIELDS = ['logoUrl', 'faviconUrl'];
+const SETTINGS_UPLOAD = /^\/uploads\/settings\/[\w.-]+\.(jpg|png|webp)$/;
+
 function validate(body) {
   for (const key of REQUIRED) {
     if (key in body && body[key] == null) return `${key} cannot be empty`;
@@ -57,8 +62,12 @@ function validate(body) {
     return 'Currency must be a 3-letter code, e.g. INR';
   }
   for (const field of URL_FIELDS) {
-    if (field in body && body[field] && !/^https?:\/\/\S+$/i.test(body[field])) {
-      return `${field} must start with http:// or https://`;
+    if (!(field in body) || !body[field]) continue;
+    if (IMAGE_FIELDS.includes(field) && SETTINGS_UPLOAD.test(body[field])) continue;
+    if (!/^https?:\/\/\S+$/i.test(body[field])) {
+      return IMAGE_FIELDS.includes(field)
+        ? `${field} must be an uploaded image or start with http:// or https://`
+        : `${field} must start with http:// or https://`;
     }
   }
   if ('maintenanceMode' in body && typeof body.maintenanceMode !== 'boolean') {
