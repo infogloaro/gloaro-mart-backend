@@ -3899,3 +3899,17 @@ CREATE TABLE IF NOT EXISTS kyc_otps (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS kyc_otps_user_idx ON kyc_otps (user_id, created_at DESC);
+
+-- ===== SHIPPING OUTSIDE THE SERVICE AREA (SH1) =====
+-- A customer may order from a shop in another district or state. Inside the
+-- shop's service area the order is a local delivery as before; outside it the
+-- shop ships by courier, at its own outstation charge and an ETA in days,
+-- unless it has turned shipping off (fresh food, say). On by default, so a
+-- Madurai customer can buy from a Coimbatore shop without the shop doing
+-- anything.
+ALTER TABLE vendor_delivery_rules ADD COLUMN IF NOT EXISTS ships_outside_area BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE vendor_delivery_rules ADD COLUMN IF NOT EXISTS outstation_charge_cents INTEGER NOT NULL DEFAULT 6000;
+ALTER TABLE vendor_delivery_rules ADD COLUMN IF NOT EXISTS outstation_eta_days INTEGER NOT NULL DEFAULT 4;
+ALTER TABLE vendor_delivery_rules DROP CONSTRAINT IF EXISTS vendor_delivery_rules_outstation_check;
+ALTER TABLE vendor_delivery_rules ADD CONSTRAINT vendor_delivery_rules_outstation_check
+  CHECK (outstation_charge_cents >= 0 AND outstation_eta_days BETWEEN 1 AND 30);

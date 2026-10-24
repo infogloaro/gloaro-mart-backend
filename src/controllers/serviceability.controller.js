@@ -6,6 +6,12 @@ const shopHours = require('../services/shopHours');
 /** Average city delivery speed used for the Phase 1 ETA. Replaced in Phase 3. */
 const AVERAGE_SPEED_KMPH = 20;
 
+/**
+ * SH1: a shop with no service areas delivers locally this far; beyond it the
+ * order ships by courier. Matches the app's "near you" radius.
+ */
+const UNRESTRICTED_LOCAL_KM = 15;
+
 const DEFAULT_RULES = {
   delivery_charge_cents: 0,
   free_delivery_above_cents: null,
@@ -15,6 +21,9 @@ const DEFAULT_RULES = {
   supports_pickup: false,
   opens_at: null,
   closes_at: null,
+  ships_outside_area: true,
+  outstation_charge_cents: 6000,
+  outstation_eta_days: 4,
 };
 
 /**
@@ -59,6 +68,11 @@ function etaMinutes(rules, distanceKm) {
  * needs coordinates on both the shop and the address, a pincode rule does not.
  * A vendor with no areas configured at all is treated as unrestricted, so the
  * existing catalogue keeps working before anyone opens the admin screens.
+ *
+ * SH1: outside the area (or, for an unrestricted shop, beyond
+ * UNRESTRICTED_LOCAL_KM) the shop still serves the address by courier unless
+ * it turned ships_outside_area off: delivery only, the outstation charge, and
+ * an ETA in days (etaMinutes stays null so older apps show no minutes).
  */
 function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCents, hasStock }) {
   const result = {
@@ -67,9 +81,11 @@ function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCen
     deliverable: false,
     distanceKm: distanceKm == null ? null : Number(distanceKm.toFixed(2)),
     deliveryMethods: [],
+    deliveryMode: null,
     deliveryChargeCents: 0,
     freeDeliveryApplied: false,
     etaMinutes: null,
+    etaDays: null,
   };
 
   if (rules.supports_delivery) result.deliveryMethods.push('delivery');
@@ -83,21 +99,23 @@ function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCen
 
   let inArea;
   if (areas.length === 0) {
-    inArea = true;
+    inArea = distanceKm == null || distanceKm <= UNRESTRICTED_LOCAL_KM;
   } else {
     const pincodeMatch = pincodeAreas.some((a) => a.pincode === address.pincode);
     const radiusMatch =
       distanceKm != null && radiusAreas.some((a) => distanceKm <= Number(a.radius_km));
     inArea = pincodeMatch || radiusMatch;
-
-    if (!inArea) {
-      // Distinguish "we don't cover your pincode" from "you're too far", so the
-      // app can say something specific rather than one generic line.
-      const reason =
-        radiusAreas.length === 0 || distanceKm == null ? 'PINCODE_NOT_SERVED' : 'OUT_OF_SERVICE_AREA';
-      return { ...result, reason };
-    }
   }
+
+  const courier = !inArea && rules.supports_delivery && rules.ships_outside_area !== false;
+  if (!inArea && !courier) {
+    // Distinguish "we don't cover your pincode" from "you're too far", so the
+    // app can say something specific rather than one generic line.
+    const reason =
+      radiusAreas.length === 0 || distanceKm == null ? 'PINCODE_NOT_SERVED' : 'OUT_OF_SERVICE_AREA';
+    return { ...result, reason };
+  }
+  if (courier) result.deliveryMethods = ['delivery'];
 
   if (subtotalCents < (rules.min_order_cents || 0)) {
     return { ...result, reason: 'BELOW_MIN_ORDER' };
@@ -109,9 +127,22 @@ function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCen
   const threshold = rules.free_delivery_above_cents;
   const freeDeliveryApplied = threshold != null && subtotalCents >= threshold;
 
+  if (courier) {
+    const charge = rules.outstation_charge_cents ?? DEFAULT_RULES.outstation_charge_cents;
+    return {
+      ...result,
+      deliverable: true,
+      deliveryMode: 'courier',
+      deliveryChargeCents: freeDeliveryApplied ? 0 : charge,
+      freeDeliveryApplied,
+      etaDays: rules.outstation_eta_days ?? DEFAULT_RULES.outstation_eta_days,
+    };
+  }
+
   return {
     ...result,
     deliverable: true,
+    deliveryMode: 'local',
     deliveryChargeCents: freeDeliveryApplied ? 0 : rules.delivery_charge_cents || 0,
     freeDeliveryApplied,
     etaMinutes: etaMinutes(rules, distanceKm),

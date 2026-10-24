@@ -17,6 +17,9 @@ function defaultsFor(vendorId) {
     supports_pickup: false,
     opens_at: null,
     closes_at: null,
+    ships_outside_area: true,
+    outstation_charge_cents: 6000,
+    outstation_eta_days: 4,
     updated_at: null,
   };
 }
@@ -36,6 +39,7 @@ function validateRules(body) {
     deliveryChargeCents: body.deliveryChargeCents,
     minOrderCents: body.minOrderCents,
     preparationMinutes: body.preparationMinutes,
+    outstationChargeCents: body.outstationChargeCents,
   };
   for (const [key, value] of Object.entries(ints)) {
     if (value != null && (!Number.isInteger(Number(value)) || Number(value) < 0)) {
@@ -61,15 +65,22 @@ function validateRules(body) {
   if ((body.opensAt == null) !== (body.closesAt == null)) {
     return 'Set both opensAt and closesAt, or neither';
   }
+  if (body.outstationEtaDays != null) {
+    const days = Number(body.outstationEtaDays);
+    if (!Number.isInteger(days) || days < 1 || days > 30) return 'outstationEtaDays must be 1 to 30';
+  }
   return null;
 }
 
+// SH1 fields are optional in the body: a form that predates them (the admin
+// console, an older app) keeps what the shop set instead of resetting it.
 async function upsertRules(vendorId, body) {
   const { rows } = await pool.query(
     `INSERT INTO vendor_delivery_rules
       (vendor_id, delivery_charge_cents, free_delivery_above_cents, min_order_cents,
-       preparation_minutes, supports_delivery, supports_pickup, opens_at, closes_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
+       preparation_minutes, supports_delivery, supports_pickup, opens_at, closes_at,
+       ships_outside_area, outstation_charge_cents, outstation_eta_days, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, COALESCE($10, true), COALESCE($11, 6000), COALESCE($12, 4), now())
      ON CONFLICT (vendor_id) DO UPDATE SET
        delivery_charge_cents     = EXCLUDED.delivery_charge_cents,
        free_delivery_above_cents = EXCLUDED.free_delivery_above_cents,
@@ -79,6 +90,9 @@ async function upsertRules(vendorId, body) {
        supports_pickup           = EXCLUDED.supports_pickup,
        opens_at                  = EXCLUDED.opens_at,
        closes_at                 = EXCLUDED.closes_at,
+       ships_outside_area        = COALESCE($10, vendor_delivery_rules.ships_outside_area),
+       outstation_charge_cents   = COALESCE($11, vendor_delivery_rules.outstation_charge_cents),
+       outstation_eta_days       = COALESCE($12, vendor_delivery_rules.outstation_eta_days),
        updated_at                = now()
      RETURNING *`,
     [
@@ -91,6 +105,9 @@ async function upsertRules(vendorId, body) {
       body.supportsPickup === true,
       body.opensAt || null,
       body.closesAt || null,
+      typeof body.shipsOutsideArea === 'boolean' ? body.shipsOutsideArea : null,
+      body.outstationChargeCents == null ? null : Number(body.outstationChargeCents),
+      body.outstationEtaDays == null ? null : Number(body.outstationEtaDays),
     ]
   );
   return rows[0];
