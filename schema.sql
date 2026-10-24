@@ -2931,6 +2931,21 @@ CREATE INDEX IF NOT EXISTS idx_refunds_updated ON refunds (updated_at) WHERE sta
 CREATE INDEX IF NOT EXISTS idx_order_return_events_created ON order_return_events (created_at);
 CREATE INDEX IF NOT EXISTS idx_checkout_groups_created ON checkout_groups (created_at);
 
+-- ===== WHATSAPP PROVIDER (PHASE WP1) =====
+--
+-- Two ways to send WhatsApp, one in use at a time, picked in Admin → Channels:
+-- Meta's Cloud API ('whatsapp_cloud', approved templates only) and UltraMsg
+-- ('ultramsg', a QR-linked number sending the templates' text as plain
+-- messages) — a stand-in until Meta is approved. Each is its own platform row
+-- with its own encrypted settings; the queue, templates, order-update rules
+-- and log are shared. Also adds the shop's new-order alert (shop_new_order).
+ALTER TABLE platform_settings ADD COLUMN IF NOT EXISTS whatsapp_provider VARCHAR(20) NOT NULL DEFAULT 'whatsapp_cloud';
+ALTER TABLE platform_settings DROP CONSTRAINT IF EXISTS platform_settings_whatsapp_provider_check;
+ALTER TABLE platform_settings ADD CONSTRAINT platform_settings_whatsapp_provider_check
+  CHECK (whatsapp_provider IN ('whatsapp_cloud', 'ultramsg'));
+-- Which provider sent (or received) a message.
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS provider VARCHAR(20);
+
 -- ===== AD PROMOTIONS — PRICING (PHASE 52) =====
 --
 -- Shops pay GLOARO to promote their shop, products and offers. This phase is

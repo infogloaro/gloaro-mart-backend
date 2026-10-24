@@ -9,7 +9,11 @@ const templates = require('./whatsappTemplates');
  *
  * Who gets it: the customer, on the WhatsApp number they ordered from (the
  * bot links it to their account), else their account's phone — and only when
- * they've opted in. Plan: docs/whatsapp-plan.md §5.
+ * they've opted in. Shop alerts (audience 'shop') go to the shop owner's
+ * phone unless they wrote STOP. Plan: docs/whatsapp-plan.md §5.
+ *
+ * With Meta a rule sends once its template is approved; with UltraMsg, which
+ * sends plain text, any template that isn't disabled will do.
  */
 
 // Events older than this are never sent: a late "out for delivery" is worse than none.
@@ -188,6 +192,30 @@ const EVENTS = [
       ORDER BY i.id LIMIT ${BATCH}`,
     values: (r) => [r.invoice_number, r.ref],
   },
+  {
+    key: 'shop_new_order',
+    label: 'New order (to the shop)',
+    description: 'To the shop owner’s phone when an order for their shop comes in (COD, or once paid online).',
+    template: 'shop_new_order',
+    audience: 'shop',
+    enabledByDefault: false,
+    variables: ['Order reference', 'Shop name', 'Number of items', 'Order total (₹)'],
+    sql: `
+      SELECT o.id AS source_id, 'shop_new_order:order:' || o.id AS dedupe_key, o.id AS order_id, o.checkout_group_id AS group_id,
+             ${REF} AS ref, vp.business_name AS shop, o.total_cents,
+             (SELECT COALESCE(SUM(oi.quantity), 0)::int FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
+             ${RECIPIENT}
+      FROM orders o
+      JOIN vendor_profiles vp ON vp.id = o.vendor_id
+      JOIN users u ON u.id = vp.user_id
+      LEFT JOIN checkout_groups cg ON cg.id = o.checkout_group_id
+      LEFT JOIN payments p ON p.checkout_group_id = o.checkout_group_id
+      WHERE ${RECENT('o.created_at')} AND ${NOT_SENT("'shop_new_order:order:' || o.id")}
+        AND o.status <> 'cancelled' AND o.replacement_of_order_id IS NULL
+        AND (o.payment_method IN ('cod', 'credit') OR p.status IN ${PAID})
+      ORDER BY o.id LIMIT ${BATCH}`,
+    values: (r) => [r.ref, r.shop, String(r.item_count), rupees(r.total_cents)],
+  },
 ];
 const BY_KEY = new Map(EVENTS.map((e) => [e.key, e]));
 
@@ -207,8 +235,13 @@ async function seedRules(db = pool) {
  * never been on WhatsApp with us (an app customer before opting in) is left
  * out quietly rather than logged on every order.
  */
-function recipient(r) {
+function recipient(r, audience = 'customer') {
   const phone = r.u_wa || whatsapp.normalizePhone(r.u_phone);
+  // A shop's own order alerts: their business, sent unless they wrote STOP.
+  if (audience === 'shop') {
+    if (r.u_opt_out) return { skip: 'The shop owner wrote STOP.' };
+    return phone ? { phone } : { skip: 'The shop owner has no phone number.' };
+  }
   if (r.u_opt_in && phone) return { phone };
   if (!r.u_wa && !r.u_opt_out) return { quiet: true };
   if (!phone) return { skip: 'The customer has no phone number.' };
@@ -216,9 +249,10 @@ function recipient(r) {
 }
 
 /**
- * One pass: every enabled rule whose template Meta has approved. Nothing runs
- * while WhatsApp isn't connected or its platform isn't Active — those events
- * wait (up to MAX_AGE_HOURS) instead of piling up as failures.
+ * One pass: every enabled rule whose template can be sent (approved by Meta,
+ * or any but disabled on UltraMsg). Nothing runs while the provider in use
+ * isn't connected or its platform isn't Active — those events wait (up to
+ * MAX_AGE_HOURS) instead of piling up as failures.
  */
 async function dispatch() {
   const conn = await whatsapp.loadConnection();
@@ -233,7 +267,7 @@ async function dispatch() {
     `SELECT r.*, t.id AS t_id, t.status AS t_status, t.body_text, t.buttons, t.name AS t_name, t.language AS t_language
      FROM whatsapp_event_rules r
      JOIN whatsapp_templates t ON t.name = r.template_name AND t.language = r.language
-     WHERE r.enabled AND t.status = 'approved'`
+     WHERE r.enabled AND ${conn.needsApproval ? "t.status = 'approved'" : "t.status <> 'disabled'"}`
   );
   const out = { queued: 0, skipped: 0 };
   for (const rule of rules) {
@@ -245,7 +279,7 @@ async function dispatch() {
     for (const r of rows) {
       const values = event.values(r);
       if (!values) continue;
-      const who = recipient(r);
+      const who = recipient(r, event.audience);
       if (who.quiet) continue;
       const base = { dedupeKey: r.dedupe_key, orderId: r.order_id, groupId: r.group_id, userId: r.u_id, event: event.key };
       if (who.skip || values.length !== needed) {
@@ -254,7 +288,7 @@ async function dispatch() {
         continue;
       }
       try {
-        const m = await whatsapp.enqueue(pool, { phone: who.phone, userId: r.u_id, template, variables: values.map(clean), event: event.key, ...base });
+        const m = await whatsapp.enqueue(pool, { phone: who.phone, userId: r.u_id, template, variables: values.map(clean), approvedOnly: conn.needsApproval, ...base });
         if (m) out.queued += 1;
       } catch (err) {
         if (!(err instanceof whatsapp.WhatsAppError)) throw err;
@@ -278,8 +312,12 @@ async function logSkip({ dedupeKey, orderId, groupId, userId, event, phone, temp
   );
 }
 
+/** Whether the provider in use sends only Meta-approved templates. */
+const needsApproval = async () => whatsapp.PROVIDERS[await whatsapp.currentProvider()].needsApproval;
+
 /** Rules as the admin sees them, with whether each can actually send. */
 async function listRules() {
+  const approvalNeeded = await needsApproval();
   const { rows } = await pool.query(
     `SELECT r.*, t.id AS t_id, t.status AS t_status, t.body_text, t.body_examples,
             (SELECT COUNT(*) FILTER (WHERE m.status IN ('sent', 'delivered', 'read'))::int FROM whatsapp_messages m
@@ -297,12 +335,14 @@ async function listRules() {
     const count = r?.body_text ? templates.variablesIn(r.body_text).length : null;
     let problem = null;
     if (!r?.t_id) problem = `No template named ${r?.template_name ?? e.template} (${r?.language ?? 'en'}).`;
-    else if (r.t_status !== 'approved') problem = `The template is ${r.t_status} — it sends once Meta approves it.`;
+    else if (r.t_status === 'disabled') problem = 'The template is disabled.';
+    else if (approvalNeeded && r.t_status !== 'approved') problem = `The template is ${r.t_status} — it sends once Meta approves it.`;
     else if (count !== e.variables.length) problem = `The template has ${count} variable(s); this event fills ${e.variables.length}.`;
     return {
       event: e.key,
       label: e.label,
       description: e.description,
+      audience: e.audience ?? 'customer',
       variables: e.variables,
       enabled: r?.enabled ?? false,
       enabledAt: r?.enabled_at ?? null,
@@ -339,7 +379,10 @@ async function updateRule({ event, enabled, templateName, language, userId }) {
   const { rows: t } = await pool.query('SELECT * FROM whatsapp_templates WHERE name = $1 AND language = $2', [name, lang]);
   if (!t[0]) throw new RuleError(400, `No template named ${name} (${lang}).`);
   if (on) {
-    if (t[0].status !== 'approved') throw new RuleError(409, `${name} is ${t[0].status} — it can be switched on once Meta approves it.`);
+    if (t[0].status === 'disabled') throw new RuleError(409, `${name} is disabled.`);
+    if ((await needsApproval()) && t[0].status !== 'approved') {
+      throw new RuleError(409, `${name} is ${t[0].status} — it can be switched on once Meta approves it (or switch WhatsApp to UltraMsg).`);
+    }
     const count = templates.variablesIn(t[0].body_text).length;
     if (count !== def.variables.length) {
       throw new RuleError(409, `${name} has ${count} variable(s), but ${def.label} fills ${def.variables.length}: ${def.variables.join(', ')}.`);

@@ -275,6 +275,7 @@ const DRAFTS = [
   ['payment_pending', 'payment_pending', 'Payment for your order {{1}} of ₹{{2}} is pending. Please complete it in the Gloaro Mart app to confirm your order.', ['GLM-2026-00012', '630.00']],
   ['invoice_ready', 'invoice_ready', 'The invoice {{1}} for your order {{2}} is ready. You can download it from the order page in the Gloaro Mart app.', ['GLM/2026-27/000123', 'GLM-2026-00012']],
   ['vendor_new_order', 'vendor_new_order', 'New order {{1}} for {{2}}: {{3}} item(s), ₹{{4}}. Please accept it by {{5}} in the Gloaro Mart vendor app.', ['GLM-2026-00012', 'Sri Balaji Stores', '3', '630.00', '6:45 PM']],
+  ['shop_new_order', 'shop_new_order', 'New order {{1}} for {{2}}: {{3}} item(s), ₹{{4}}. Please open the Gloaro Mart vendor app to accept it.', ['GLM-2026-00012', 'Sri Balaji Stores', '3', '630.00']],
   ['vendor_reroute_offer', 'vendor_reroute_offer', 'Order {{1}} near you is available: {{2}} item(s), ₹{{3}}. Accept it by {{4}} in the Gloaro Mart vendor app.', ['GLM-2026-00012', '3', '630.00', '6:45 PM']],
   ['vendor_rfq_invite', 'vendor_rfq_invite', 'You have been invited by {{1}} to quote on {{2}} ({{3}}). Quotes close on {{4}}.', ['Gloaro Cafe Pvt Ltd', 'Cafe supplies', 'RFQ-2026-00004', '18 Oct']],
   ['vendor_po_issued', 'vendor_po_issued', 'Purchase order {{1}} for ₹{{2}} has been issued to you by {{3}}. Please acknowledge it in the Gloaro Mart vendor app.', ['PO-2026-00007', '5,59,700.00', 'Gloaro Cafe Pvt Ltd']],

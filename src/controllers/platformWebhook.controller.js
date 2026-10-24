@@ -41,7 +41,7 @@ async function receive(req, res) {
   if (!target) return res.status(404).json({ message: "Not found" });
   const { platform, connector, secrets } = target;
 
-  const verdict = connector.verifyWebhook({ rawBody: req.rawBody, headers: req.headers, secrets });
+  const verdict = connector.verifyWebhook({ rawBody: req.rawBody, headers: req.headers, query: req.query, secrets });
   if (!verdict.ok) {
     await recordSyncLog({
       platformId: platform.id,
@@ -71,6 +71,12 @@ async function receive(req, res) {
     require("../services/whatsapp")
       .applyStatuses(req.body)
       .catch((err) => console.error(`[whatsapp] receipts failed: ${err.message}`));
+  }
+  // UltraMsg: acks update the log; START / STOP set the customer's consent.
+  if (connector.key === "ultramsg") {
+    require("../services/whatsapp")
+      .applyUltraMsgEvent(req.body)
+      .catch((err) => console.error(`[whatsapp] ultramsg webhook failed: ${err.message}`));
   }
 }
 

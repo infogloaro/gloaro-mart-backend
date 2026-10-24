@@ -391,6 +391,7 @@ router.post("/quotations/:id/messages", quotation.adminMessage);
 // Channels and WhatsApp — guarded by the channels permission module.
 router.get("/channels", whatsappAdmin.listChannels);
 router.post("/channels/whatsapp/setup", whatsappAdmin.setupWhatsapp);
+router.put("/channels/whatsapp/provider", whatsappAdmin.setWhatsappProvider);
 router.get("/channels/bot-keys", whatsappAdmin.listBotKeys);
 router.post("/channels/bot-keys", whatsappAdmin.createBotKey);
 router.delete("/channels/bot-keys/:id", whatsappAdmin.revokeBotKey);

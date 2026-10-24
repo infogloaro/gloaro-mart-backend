@@ -63,9 +63,30 @@ async function platformJson(id) {
   return rows[0] ? toPlatformJson(rows[0]) : null;
 }
 
+/** Each provider, set up or not, for the switch on the WhatsApp card. */
+async function providerList(current) {
+  return Promise.all(
+    Object.entries(whatsapp.PROVIDERS).map(async ([key, p]) => {
+      const conn = await whatsapp.loadConnection(pool, key);
+      return {
+        key,
+        label: p.label,
+        needsApproval: p.needsApproval,
+        inUse: key === current,
+        setUp: Boolean(conn),
+        connectionStatus: conn?.connectionStatus ?? null,
+        platformStatus: conn?.platformStatus ?? null,
+      };
+    })
+  );
+}
+
 async function whatsappOverview() {
-  const conn = await whatsapp.loadConnection();
-  if (!conn) return { setUp: false, platform: null, ready: false };
+  const provider = await whatsapp.currentProvider();
+  const providers = await providerList(provider);
+  const needsApproval = whatsapp.PROVIDERS[provider].needsApproval;
+  const conn = await whatsapp.loadConnection(pool, provider);
+  if (!conn) return { provider, providers, needsApproval, setUp: false, platform: null, ready: false };
   const [{ rows: t }, { rows: m }] = await Promise.all([
     pool.query(`SELECT COUNT(*) FILTER (WHERE status = 'approved')::int AS approved, COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
                        COUNT(*) FILTER (WHERE status = 'draft')::int AS drafts, COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected
@@ -81,6 +102,9 @@ async function whatsappOverview() {
     ready = false;
   }
   return {
+    provider,
+    providers,
+    needsApproval,
     setUp: true,
     platform: await platformJson(conn.platformId),
     ready,
@@ -97,12 +121,29 @@ async function listChannels(req, res) {
   res.json({ whatsapp: await whatsappOverview(), channels: CHANNELS });
 }
 
-/** Creates the WhatsApp platform (once), so its settings can be entered. */
+/** Creates the platform of the provider in use (once), so its settings can be entered. */
 async function setupWhatsapp(req, res) {
-  const before = await whatsapp.loadConnection();
-  const id = await whatsapp.ensurePlatform(pool, req.user.id);
-  if (!before) await audit(req, 'channel.whatsapp_set_up', 'platform', id, null);
+  const provider = await whatsapp.currentProvider();
+  const before = await whatsapp.loadConnection(pool, provider);
+  const id = await whatsapp.ensurePlatform(pool, req.user.id, provider);
+  if (!before) await audit(req, 'channel.whatsapp_set_up', 'platform', id, { provider });
   res.json(await whatsappOverview());
+}
+
+/**
+ * Picks who sends WhatsApp messages: { provider: 'whatsapp_cloud' | 'ultramsg' }.
+ * Messages already queued go out through the new one.
+ */
+async function setWhatsappProvider(req, res) {
+  try {
+    const before = await whatsapp.currentProvider();
+    const provider = await whatsapp.setProvider(req.body?.provider);
+    await whatsapp.ensurePlatform(pool, req.user.id, provider);
+    if (before !== provider) await audit(req, 'channel.whatsapp_provider_changed', 'platform_settings', 1, { from: before, to: provider });
+    res.json(await whatsappOverview());
+  } catch (err) {
+    fail(res, err);
+  }
 }
 
 // ----------------------------------------------------------------- templates
@@ -195,7 +236,7 @@ async function deleteTemplate(req, res) {
   try {
     const t = await loadTemplate(req.params.id);
     if (t.meta_template_id) {
-      const conn = whatsapp.assertReady(await whatsapp.loadConnection());
+      const conn = whatsapp.assertReady(await whatsapp.loadConnection(pool, 'whatsapp_cloud'));
       await templates.removeOnMeta(conn, t);
     }
     await pool.query('DELETE FROM whatsapp_templates WHERE id = $1', [t.id]);
@@ -212,7 +253,7 @@ async function submitTemplate(req, res) {
     if (!['draft', 'rejected', 'paused'].includes(t.status)) return res.status(409).json({ message: `This template is already ${t.status}.` });
     const { errors } = templates.validate({}, { partial: true, existing: t });
     if (errors.length) return res.status(400).json({ message: errors.join('. '), errors });
-    const conn = whatsapp.assertReady(await whatsapp.loadConnection());
+    const conn = whatsapp.assertReady(await whatsapp.loadConnection(pool, 'whatsapp_cloud'));
     const r = await templates.submit(conn, t);
     const { rows } = await pool.query(
       `UPDATE whatsapp_templates SET meta_template_id = $2, status = $3, category = $4, rejected_reason = NULL, submitted_at = now(), updated_at = now()
@@ -228,7 +269,7 @@ async function submitTemplate(req, res) {
 
 async function syncTemplates(req, res) {
   try {
-    const conn = whatsapp.assertReady(await whatsapp.loadConnection());
+    const conn = whatsapp.assertReady(await whatsapp.loadConnection(pool, 'whatsapp_cloud'));
     const result = await templates.sync(conn);
     await audit(req, 'whatsapp.templates_synced', 'whatsapp_template', null, result);
     res.json(result);
@@ -327,18 +368,20 @@ async function retryMessage(req, res) {
  */
 async function testSend(req, res) {
   try {
-    whatsapp.assertReady(await whatsapp.loadConnection());
+    const conn = whatsapp.assertReady(await whatsapp.loadConnection());
     const { to, templateId, variables, buttonParam, text } = req.body ?? {};
     const template = templateId != null ? await loadTemplate(templateId) : null;
     if (!template && (text == null || text === '')) return res.status(400).json({ message: 'Pick a template, or write a text message.' });
-    const m = await whatsapp.enqueue(pool, { phone: to, template, variables, buttonParam, text: template ? null : text, event: 'test', createdBy: req.user.id });
+    const m = await whatsapp.enqueue(pool, {
+      phone: to, template, variables, buttonParam, text: template ? null : text, event: 'test', createdBy: req.user.id, approvedOnly: conn.needsApproval,
+    });
     await whatsapp.processQueue({ ids: [m.id] });
     const { rows } = await pool.query('SELECT * FROM whatsapp_messages WHERE id = $1', [m.id]);
     await audit(req, 'whatsapp.test_sent', 'whatsapp_message', m.id, { to: m.phone, template: m.template_name, status: rows[0].status });
     const sent = rows[0];
     res.status(sent.status === 'failed' ? 502 : 200).json({
       ...messageJson(sent),
-      message: sent.status === 'sent' ? 'Sent — Meta accepted it.' : sent.status === 'failed' ? `Not sent: ${sent.error_message}` : `Queued: ${sent.error_message ?? 'will retry'}`,
+      message: sent.status === 'sent' ? `Sent — ${conn.providerLabel} accepted it.` : sent.status === 'failed' ? `Not sent: ${sent.error_message}` : `Queued: ${sent.error_message ?? 'will retry'}`,
     });
   } catch (err) {
     fail(res, err);
@@ -360,6 +403,7 @@ async function listRules(req, res) {
     // Automatic messages need both; the page says which one is missing.
     connected: ready,
     platformActive: conn?.platformStatus === 'active',
+    provider: conn?.provider ?? (await whatsapp.currentProvider()),
     maxAgeHours: events.MAX_AGE_HOURS,
   });
 }
@@ -428,7 +472,7 @@ async function revokeBotKey(req, res) {
 module.exports = {
   listRules, updateRule,
   listBotKeys, createBotKey, revokeBotKey,
-  CHANNELS, listChannels, setupWhatsapp,
+  CHANNELS, listChannels, setupWhatsapp, setWhatsappProvider,
   listTemplates, createTemplate, updateTemplate, deleteTemplate, submitTemplate, syncTemplates,
   listMessages, retryMessage, testSend,
 };

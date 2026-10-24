@@ -9,12 +9,12 @@
  *   key, name, category, description, capabilities
  *   settings                 the settings form it needs (applied to the platform)
  *   testConnection({ config, secrets, environment }) → { ok, message }
- *   verifyWebhook({ rawBody, headers, secrets })     → { ok, message? }
+ *   verifyWebhook({ rawBody, headers, query, secrets }) → { ok, message? }
  *   describeEvent(body)      → { event, detail } — a short, credential-free summary
  *   verifySubscription?      for providers with a GET handshake (Meta)
  */
 const CONNECTORS = new Map(
-  [require("./razorpay"), require("./shiprocket"), require("./whatsappCloud")].map((c) => [c.key, c]),
+  [require("./razorpay"), require("./shiprocket"), require("./whatsappCloud"), require("./ultramsg")].map((c) => [c.key, c]),
 );
 
 function getConnector(key) {

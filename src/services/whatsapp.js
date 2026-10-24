@@ -2,18 +2,28 @@ const pool = require('../config/db');
 const secretBox = require('./secretBox');
 const { requestJson, ProviderError } = require('../connectors/http');
 const whatsappCloud = require('../connectors/whatsappCloud');
+const ultramsg = require('../connectors/ultramsg');
 const templates = require('./whatsappTemplates');
 
 /**
  * Sending WhatsApp messages (schema PHASE 49). Every message is a row first
  * and is sent from a queue (processQueue, run by server.js and right away for a
- * test send), so a slow or failing Meta never holds up the request that caused
- * it, and every attempt is on record.
+ * test send), so a slow or failing provider never holds up the request that
+ * caused it, and every attempt is on record.
+ *
+ * Two providers (PHASE WP1), one in use at a time (platform_settings.whatsapp_provider):
+ * Meta's Cloud API, which only starts a conversation with an approved
+ * template, and UltraMsg, which sends any text — the template's text filled in.
  */
 
 const { GRAPH } = whatsappCloud;
 const CONNECTOR = 'whatsapp_cloud';
 const SLUG = 'whatsapp_cloud';
+const PROVIDERS = {
+  whatsapp_cloud: { connector: whatsappCloud, slug: SLUG, name: 'WhatsApp', label: 'Meta Cloud API', needsApproval: true },
+  ultramsg: { connector: ultramsg, slug: 'whatsapp_ultramsg', name: 'WhatsApp (UltraMsg)', label: 'UltraMsg', needsApproval: false },
+};
+const provider = (key) => PROVIDERS[key] ?? PROVIDERS[CONNECTOR];
 // After a failure that may pass: 1 min, 5 min, 30 min; then it's failed.
 const BACKOFF_SECONDS = [60, 300, 1800];
 const MAX_ATTEMPTS = BACKOFF_SECONDS.length + 1;
@@ -27,16 +37,40 @@ class WhatsAppError extends Error {
   }
 }
 
+/** The provider that sends: 'whatsapp_cloud' or 'ultramsg'. */
+async function currentProvider(db = pool) {
+  try {
+    const { rows } = await db.query('SELECT whatsapp_provider FROM platform_settings WHERE id = 1');
+    return PROVIDERS[rows[0]?.whatsapp_provider] ? rows[0].whatsapp_provider : CONNECTOR;
+  } catch (err) {
+    // Before the WP1 migration the column isn't there yet: Meta, as before.
+    if (err.code === '42703') return CONNECTOR;
+    throw err;
+  }
+}
+
+async function setProvider(key, db = pool) {
+  if (!PROVIDERS[key]) throw new WhatsAppError(400, `provider is one of ${Object.keys(PROVIDERS).join(', ')}`);
+  await db.query(
+    `INSERT INTO platform_settings (id, whatsapp_provider) VALUES (1, $1)
+     ON CONFLICT (id) DO UPDATE SET whatsapp_provider = EXCLUDED.whatsapp_provider, updated_at = now()`,
+    [key]
+  );
+  return key;
+}
+
 /**
- * The WhatsApp platform row, made on first use from the connector: Engagement
+ * A provider's platform row, made on first use from the connector: Engagement
  * category, connector attached, its settings form applied. A row made before a
  * setting was added to the connector gets the missing fields too.
  */
-async function ensurePlatform(db = pool, userId = null) {
-  const { rows } = await db.query('SELECT * FROM platforms WHERE connector_key = $1 ORDER BY id LIMIT 1', [CONNECTOR]);
+async function ensurePlatform(db = pool, userId = null, key = CONNECTOR) {
+  const p = provider(key);
+  const { connector } = p;
+  const { rows } = await db.query('SELECT * FROM platforms WHERE connector_key = $1 ORDER BY id LIMIT 1', [connector.key]);
   if (rows[0]) {
     const have = new Set((rows[0].config_schema ?? []).map((f) => f.key));
-    const missing = whatsappCloud.settings.filter((f) => !have.has(f.key));
+    const missing = connector.settings.filter((f) => !have.has(f.key));
     if (missing.length) {
       await db.query('UPDATE platforms SET config_schema = config_schema || $2::jsonb, updated_at = now() WHERE id = $1', [rows[0].id, JSON.stringify(missing)]);
     }
@@ -46,25 +80,30 @@ async function ensurePlatform(db = pool, userId = null) {
   const { rows: created } = await db.query(
     `INSERT INTO platforms (category_id, slug, name, description, integration_method, connector_key, status, capabilities,
        config_schema, created_by_user_id, updated_by_user_id)
-     VALUES ($1, $2, 'WhatsApp', $3, 'connector', $4, 'inactive', $5, $6, $7, $7)
+     VALUES ($1, $2, $3, $4, 'connector', $5, 'inactive', $6, $7, $8, $8)
      ON CONFLICT (slug) DO UPDATE SET connector_key = EXCLUDED.connector_key RETURNING id`,
-    [cat[0]?.id, SLUG, whatsappCloud.description, CONNECTOR, JSON.stringify(whatsappCloud.capabilities),
-      JSON.stringify(whatsappCloud.settings), userId]
+    [cat[0]?.id, p.slug, p.name, connector.description, connector.key, JSON.stringify(connector.capabilities),
+      JSON.stringify(connector.settings), userId]
   );
   return created[0].id;
 }
 
-/** The saved settings of the environment in use, secrets opened. Null when WhatsApp isn't set up. */
-async function loadConnection(db = pool) {
+/**
+ * The saved settings of the environment in use, secrets opened — for the
+ * provider that sends, or the one named. Null when that provider isn't set up.
+ */
+async function loadConnection(db = pool, key = null) {
+  const providerKey = key ?? (await currentProvider(db));
   const { rows } = await db.query(
     `SELECT p.id, p.name, p.status, p.environment, pc.config, pc.secrets_encrypted, pc.status AS connection_status,
             pc.last_tested_at, pc.last_error
      FROM platforms p LEFT JOIN platform_connections pc ON pc.platform_id = p.id AND pc.environment = p.environment
      WHERE p.connector_key = $1 ORDER BY p.id LIMIT 1`,
-    [CONNECTOR]
+    [providerKey]
   );
   const p = rows[0];
   if (!p) return null;
+  const { label, needsApproval } = provider(providerKey);
   let secrets = {};
   try {
     secrets = secretBox.open(p.secrets_encrypted);
@@ -72,6 +111,7 @@ async function loadConnection(db = pool) {
     secrets = {};
   }
   return {
+    provider: providerKey, providerLabel: label, needsApproval,
     platformId: p.id, platformStatus: p.status, environment: p.environment, config: p.config ?? {}, secrets,
     connectionStatus: p.connection_status ?? 'not_connected', lastTestedAt: p.last_tested_at, lastError: p.last_error,
   };
@@ -80,8 +120,12 @@ async function loadConnection(db = pool) {
 /** Ready to send: settings saved and the connection test passed for the environment in use. */
 function assertReady(conn) {
   if (!conn) throw new WhatsAppError(409, 'WhatsApp is not set up yet — open Channels → WhatsApp.');
-  if (!conn.config.phone_number_id || !conn.secrets.access_token) throw new WhatsAppError(409, 'Save the phone number ID and access token first.');
-  if (conn.connectionStatus !== 'connected') throw new WhatsAppError(409, 'Test the WhatsApp connection first — it has not passed yet.');
+  if (conn.provider === 'ultramsg') {
+    if (!conn.config.instance_id || !conn.secrets.token) throw new WhatsAppError(409, 'Save the UltraMsg instance ID and token first.');
+  } else if (!conn.config.phone_number_id || !conn.secrets.access_token) {
+    throw new WhatsAppError(409, 'Save the phone number ID and access token first.');
+  }
+  if (conn.connectionStatus !== 'connected') throw new WhatsAppError(409, `Test the ${conn.providerLabel} connection first — it has not passed yet.`);
   return conn;
 }
 
@@ -105,18 +149,21 @@ function normalizePhone(input) {
 
 /**
  * Puts a message on the queue. A template message must name an approved
- * template and give exactly its variables; a text message is free-form, which
- * Meta only delivers inside 24 hours of the person's last message.
+ * template (unless the provider sends plain text, approvedOnly false) and give
+ * exactly its variables; a text message is free-form, which Meta only
+ * delivers inside 24 hours of the person's last message.
  */
 async function enqueue(db, {
   phone, userId = null, template = null, variables = [], buttonParam = null, text = null, event = null, createdBy = null,
   // Automatic messages: one per dedupeKey; a second enqueue of the same key returns null.
-  dedupeKey = null, orderId = null, groupId = null,
+  dedupeKey = null, orderId = null, groupId = null, approvedOnly = true,
 }) {
   const to = normalizePhone(phone);
   if (!to) throw new WhatsAppError(400, 'Enter a WhatsApp number with country code, e.g. +91 98765 43210.');
   if (template) {
-    if (template.status !== 'approved') throw new WhatsAppError(409, `The template ${template.name} is ${template.status}, not approved by Meta yet.`);
+    if (template.status === 'disabled' || (approvedOnly && template.status !== 'approved')) {
+      throw new WhatsAppError(409, `The template ${template.name} is ${template.status}, not approved by Meta yet.`);
+    }
     const needed = templates.variablesIn(template.body_text).length;
     const vars = (Array.isArray(variables) ? variables : []).map((v) => String(v ?? '').trim());
     if (vars.length !== needed || vars.some((v) => !v)) throw new WhatsAppError(400, `The template ${template.name} needs ${needed} value(s).`);
@@ -155,8 +202,50 @@ function payloadFor(m) {
   };
 }
 
+/**
+ * The text UltraMsg sends: the filled-in template (or the free text), with
+ * the header on top, the footer below, and link or call buttons as lines.
+ */
+function plainTextFor(m, template) {
+  if (m.kind === 'text' || !template) return m.body;
+  const lines = [];
+  if (template.header_text) lines.push(`*${template.header_text}*`);
+  lines.push(m.body);
+  for (const b of template.buttons ?? []) {
+    if (b.type === 'URL') lines.push(`${b.text}: ${m.button_param ? String(b.url).replace('{{1}}', m.button_param) : b.url}`);
+    if (b.type === 'PHONE_NUMBER') lines.push(`${b.text}: ${b.phone}`);
+  }
+  if (template.footer_text) lines.push(`_${template.footer_text}_`);
+  return lines.join('\n\n');
+}
+
+/** One UltraMsg send. referenceId comes back on its acks, so they can find the row. */
+async function attemptUltraMsg(conn, m) {
+  let template = null;
+  if (m.kind === 'template' && m.template_id) {
+    ({ rows: [template] } = await pool.query('SELECT header_text, footer_text, buttons FROM whatsapp_templates WHERE id = $1', [m.template_id]));
+  }
+  try {
+    const { status, data } = await requestJson(`${ultramsg.base(conn.config)}/messages/chat`, {
+      method: 'POST',
+      body: { token: conn.secrets.token, to: `+${m.phone}`, body: plainTextFor(m, template), referenceId: `glm${m.id}` },
+      retries: 1,
+    });
+    if (status === 200 && (data?.sent === 'true' || data?.sent === true)) return { ok: true, metaId: `um:${data.id ?? m.id}` };
+    const err = data?.error;
+    const message = typeof err === 'string' ? err : Array.isArray(err) ? err.map((e) => Object.values(e ?? {}).join(' ')).join('; ') : data?.message;
+    // A wrong token or number won't pass by itself; anything else may.
+    const retryable = status === 429 || status >= 500;
+    return { ok: false, code: String(status), message: String(message || `UltraMsg answered HTTP ${status}`).slice(0, 500), retryable };
+  } catch (err) {
+    if (err instanceof ProviderError) return { ok: false, code: 'network', message: err.message, retryable: true };
+    throw err;
+  }
+}
+
 /** One send attempt. Returns what to write back to the row. */
 async function attempt(conn, m) {
+  if (conn.provider === 'ultramsg') return attemptUltraMsg(conn, m);
   try {
     const { status, data } = await requestJson(`${GRAPH}/${encodeURIComponent(String(conn.config.phone_number_id))}/messages`, {
       method: 'POST',
@@ -204,8 +293,8 @@ async function processQueue({ limit = 20, ids = null } = {}) {
     const r = notReady ? { ok: false, code: 'not_ready', message: notReady, retryable: true } : await attempt(conn, m);
     if (r.ok) {
       await pool.query(
-        "UPDATE whatsapp_messages SET status = 'sent', meta_message_id = $2, sent_at = now(), environment = $3, error_code = NULL, error_message = NULL WHERE id = $1",
-        [m.id, r.metaId, conn.environment]
+        "UPDATE whatsapp_messages SET status = 'sent', meta_message_id = $2, sent_at = now(), environment = $3, provider = $4, error_code = NULL, error_message = NULL WHERE id = $1",
+        [m.id, r.metaId, conn.environment, conn.provider]
       );
       out.sent += 1;
     } else if (r.retryable && m.attempts < MAX_ATTEMPTS) {
@@ -216,8 +305,8 @@ async function processQueue({ limit = 20, ids = null } = {}) {
       out.retrying += 1;
     } else {
       await pool.query(
-        "UPDATE whatsapp_messages SET status = 'failed', failed_at = now(), error_code = $2, error_message = $3, environment = $4 WHERE id = $1",
-        [m.id, r.code, r.message, conn?.environment ?? null]
+        "UPDATE whatsapp_messages SET status = 'failed', failed_at = now(), error_code = $2, error_message = $3, environment = $4, provider = $5 WHERE id = $1",
+        [m.id, r.code, r.message, conn?.environment ?? null, conn?.provider ?? null]
       );
       out.failed += 1;
     }
@@ -272,6 +361,62 @@ async function applyStatuses(body) {
   return changed;
 }
 
+// UltraMsg's ack names, as our statuses.
+const ULTRAMSG_ACK = { server: 'sent', device: 'delivered', read: 'read', played: 'read' };
+const OPT_OUT = /^(stop|unsubscribe|stop all)$/i;
+const OPT_IN = /^(start|subscribe)$/i;
+
+/**
+ * UltraMsg's webhook: acks move a message we sent forward (found by the
+ * referenceId it was sent with); a message from a customer is logged, and
+ * START / STOP set their consent — what the Gloaro bot does on Meta.
+ */
+async function applyUltraMsgEvent(body) {
+  const type = body?.event_type;
+  const d = body?.data ?? {};
+  if (type === 'message_ack') {
+    const ref = String(body?.referenceId ?? d.referenceId ?? '').match(/^glm(\d+)$/);
+    const status = ULTRAMSG_ACK[String(d.ack ?? '').toLowerCase()];
+    if (!ref || !status) return 0;
+    const { rowCount } = await pool.query(
+      `UPDATE whatsapp_messages SET status = $2::varchar,
+         delivered_at = CASE WHEN $2::varchar IN ('delivered', 'read') THEN COALESCE(delivered_at, now()) ELSE delivered_at END,
+         read_at = CASE WHEN $2::varchar = 'read' THEN COALESCE(read_at, now()) ELSE read_at END
+       WHERE id = $1 AND direction = 'out'
+         AND (CASE status WHEN 'queued' THEN 0 WHEN 'sending' THEN 1 WHEN 'sent' THEN 2 WHEN 'delivered' THEN 3 WHEN 'read' THEN 4 ELSE 5 END) < $3`,
+      [Number(ref[1]), status, STATUS_RANK[status]]
+    );
+    return rowCount;
+  }
+  if (type !== 'message_received' || d.fromMe === true || d.fromMe === 'true') return 0;
+  // Groups and broadcasts aren't a customer writing to us.
+  const from = String(d.from ?? '');
+  if (!from.endsWith('@c.us')) return 0;
+  const phone = normalizePhone(`+${from.split('@')[0]}`);
+  if (!phone) return 0;
+  const text = typeof d.body === 'string' ? d.body.trim() : '';
+  const { rows } = await pool.query(
+    `INSERT INTO whatsapp_messages (direction, phone, user_id, kind, body, status, meta_message_id, provider, event)
+     VALUES ('in', $1::varchar, (SELECT id FROM users WHERE whatsapp_phone = $1::varchar LIMIT 1), 'text', $2, 'received', $3, 'ultramsg', 'inbound')
+     ON CONFLICT (meta_message_id) DO NOTHING RETURNING id`,
+    [phone, text.slice(0, 4096) || `(${d.type ?? 'message'})`, d.id ? `um-in:${d.id}` : null]
+  );
+  // A webhook UltraMsg sent twice is handled once.
+  if (!rows[0] || !(OPT_OUT.test(text) || OPT_IN.test(text))) return 1;
+  const optIn = OPT_IN.test(text);
+  const { setOptIn } = require('./botAccess');
+  const r = await setOptIn({ phone, optIn });
+  await pool.query('UPDATE whatsapp_messages SET user_id = $2 WHERE id = $1', [rows[0].id, r.customerId]);
+  await enqueue(pool, {
+    phone, userId: r.customerId, event: optIn ? 'opt_in' : 'opt_out',
+    text: optIn
+      ? 'You will now get your Gloaro Mart order updates here. Send STOP any time to switch them off.'
+      : 'You will no longer get Gloaro Mart updates on WhatsApp. Send START to switch them back on.',
+  });
+  return 1;
+}
+
 module.exports = {
-  WhatsAppError, SLUG, MAX_ATTEMPTS, ensurePlatform, loadConnection, assertReady, normalizePhone, enqueue, processQueue, retry, applyStatuses,
+  WhatsAppError, SLUG, MAX_ATTEMPTS, PROVIDERS, currentProvider, setProvider, ensurePlatform, loadConnection, assertReady, normalizePhone,
+  enqueue, processQueue, retry, applyStatuses, applyUltraMsgEvent,
 };

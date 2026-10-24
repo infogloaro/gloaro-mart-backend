@@ -42,6 +42,7 @@
     "migrate:purchase-orders": "node scripts/migrate-purchase-orders.js",
     "migrate:analytics": "node scripts/migrate-analytics.js",
     "migrate:whatsapp": "node scripts/migrate-whatsapp.js",
+    "migrate:whatsapp-provider": "node scripts/migrate-whatsapp-provider.js",
     "migrate:ads": "node scripts/migrate-ads.js",
     "migrate:media-files": "node scripts/migrate-media-files.js",
     "migrate:shop-branding": "node scripts/migrate-shop-branding.js",
