@@ -33,7 +33,9 @@ const RECIPIENT = `u.id AS u_id, u.full_name AS u_name, u.phone_number AS u_phon
   u.whatsapp_opt_in AS u_opt_in, u.whatsapp_opt_out_at AS u_opt_out`;
 const REF = "COALESCE(cg.reference, 'GLM-ORDER-' || o.id)";
 // The mobile number on the delivery address (WP2): it gets a copy too.
-const ADDR = (alias) => `${alias}.delivery_address_snapshot->>'mobile_number' AS addr_mobile`;
+// Checkout writes the snapshot in camelCase (mobileNumber); older rows may say mobile_number.
+const ADDR = (alias) =>
+  `COALESCE(${alias}.delivery_address_snapshot->>'mobileNumber', ${alias}.delivery_address_snapshot->>'mobile_number') AS addr_mobile`;
 // Every line of a purchase, shop by shop, for the itemised bill.
 const ITEMS = `(SELECT json_build_object(
      'lines', json_agg(json_build_object('shop', vp.business_name, 'name', oi.product_name_snapshot, 'qty', oi.quantity,
