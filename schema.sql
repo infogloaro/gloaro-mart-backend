@@ -2946,6 +2946,15 @@ ALTER TABLE platform_settings ADD CONSTRAINT platform_settings_whatsapp_provider
 -- Which provider sent (or received) a message.
 ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS provider VARCHAR(20);
 
+-- ===== WHATSAPP BILLS & INVOICES (PHASE WP2) =====
+--
+-- On a plain-text provider (UltraMsg) "Order placed" carries the itemised
+-- bill and "Invoice ready" the invoice as a PDF, made when the message is sent
+-- (services/invoicePdf.js) — never stored. Customer updates also go to the
+-- delivery address's mobile number unless it wrote STOP.
+-- { type: 'invoice', id } — the file sent with the message.
+ALTER TABLE whatsapp_messages ADD COLUMN IF NOT EXISTS attachment JSONB;
+
 -- ===== AD PROMOTIONS — PRICING (PHASE 52) =====
 --
 -- Shops pay GLOARO to promote their shop, products and offers. This phase is

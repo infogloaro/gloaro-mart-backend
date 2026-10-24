@@ -9,8 +9,9 @@ const templates = require('./whatsappTemplates');
  *
  * Who gets it: the customer, on the WhatsApp number they ordered from (the
  * bot links it to their account), else their account's phone — and only when
- * they've opted in. Shop alerts (audience 'shop') go to the shop owner's
- * phone unless they wrote STOP. Plan: docs/whatsapp-plan.md §5.
+ * they've opted in. A copy goes to the mobile number on the delivery address
+ * unless that number wrote STOP (WP2). Shop alerts (audience 'shop') go to
+ * the shop owner's phone unless they wrote STOP. Plan: docs/whatsapp-plan.md §5.
  *
  * With Meta a rule sends once its template is approved; with UltraMsg, which
  * sends plain text, any template that isn't disabled will do.
@@ -31,6 +32,40 @@ const METHOD = { upi: 'UPI account', card: 'card', netbanking: 'bank account', w
 const RECIPIENT = `u.id AS u_id, u.full_name AS u_name, u.phone_number AS u_phone, u.whatsapp_phone AS u_wa,
   u.whatsapp_opt_in AS u_opt_in, u.whatsapp_opt_out_at AS u_opt_out`;
 const REF = "COALESCE(cg.reference, 'GLM-ORDER-' || o.id)";
+// The mobile number on the delivery address (WP2): it gets a copy too.
+const ADDR = (alias) => `${alias}.delivery_address_snapshot->>'mobile_number' AS addr_mobile`;
+// Every line of a purchase, shop by shop, for the itemised bill.
+const ITEMS = `(SELECT json_build_object(
+     'lines', json_agg(json_build_object('shop', vp.business_name, 'name', oi.product_name_snapshot, 'qty', oi.quantity,
+                                         'price', oi.unit_price_cents) ORDER BY o.id, oi.id),
+     'charges', (SELECT json_build_object(
+         'gst', COALESCE(SUM(o2.gst_cents), 0),
+         'delivery', COALESCE(SUM(o2.delivery_charge_cents), 0),
+         'discount', COALESCE(SUM(o2.discount_cents + o2.campaign_discount_cents + o2.points_discount_cents), 0))
+       FROM orders o2 WHERE o2.checkout_group_id = cg.id AND o2.status <> 'cancelled'))
+   FROM orders o JOIN order_items oi ON oi.order_id = o.id JOIN vendor_profiles vp ON vp.id = o.vendor_id
+   WHERE o.checkout_group_id = cg.id AND o.status <> 'cancelled') AS items`;
+
+/** The itemised bill under "Order placed", for providers that send plain text. */
+function bill(r) {
+  const lines = r.items?.lines ?? [];
+  if (!lines.length) return null;
+  const out = ['*Your bill*'];
+  let shop = null;
+  for (const l of lines) {
+    if (l.shop !== shop) {
+      shop = l.shop;
+      out.push(`_${shop}_`);
+    }
+    out.push(`• ${l.qty} × ${l.name} — ₹${rupees(l.qty * l.price)}`);
+  }
+  const c = r.items.charges ?? {};
+  if (Number(c.gst)) out.push(`GST — ₹${rupees(c.gst)}`);
+  if (Number(c.delivery)) out.push(`Delivery — ₹${rupees(c.delivery)}`);
+  if (Number(c.discount)) out.push(`Discount — −₹${rupees(c.discount)}`);
+  out.push(`*Total — ₹${rupees(r.payable_cents)}*`);
+  return out.join('\n');
+}
 const NOT_SENT = (key) => `NOT EXISTS (SELECT 1 FROM whatsapp_messages w WHERE w.dedupe_key = ${key})`;
 const RECENT = (col) => `${col} > GREATEST($1::timestamptz, now() - interval '${MAX_AGE_HOURS} hours')`;
 
@@ -38,7 +73,7 @@ const RECENT = (col) => `${col} > GREATEST($1::timestamptz, now() - interval '${
 const statusSource = (toStatus, prefix) => `
   SELECT h.id AS source_id, '${prefix}:order:' || o.id AS dedupe_key, o.id AS order_id, o.checkout_group_id AS group_id,
          ${REF} AS ref, vp.business_name AS shop, o.total_cents, o.payment_method, o.estimated_delivery_at,
-         o.delivery_partner_name, o.delivery_partner_phone, p.status AS payment_status,
+         o.delivery_partner_name, o.delivery_partner_phone, p.status AS payment_status, ${ADDR('o')},
          (SELECT row_to_json(s) FROM (SELECT partner_name, partner_phone, estimated_delivery_at FROM shipments
             WHERE order_id = o.id ORDER BY id DESC LIMIT 1) s) AS shipment,
          ${RECIPIENT}
@@ -62,13 +97,14 @@ const EVENTS = [
   {
     key: 'order_placed',
     label: 'Order placed',
-    description: 'Once per purchase, for orders placed in the app. Bot orders are confirmed by the bot in the chat.',
+    description: 'Once per purchase, for orders placed in the app; on UltraMsg with the itemised bill. Bot orders are confirmed by the bot in the chat.',
     template: 'order_placed',
     enabledByDefault: true,
     variables: ['Customer first name', 'Order reference', 'Order total (₹)'],
     sql: `
       SELECT cg.id AS source_id, 'order_placed:group:' || cg.id AS dedupe_key, NULL::int AS order_id, cg.id AS group_id,
-             cg.reference AS ref, cg.total_cents, cg.payment_method, p.status AS payment_status, ${RECIPIENT},
+             cg.reference AS ref, cg.total_cents, cg.payment_method, p.status AS payment_status, ${RECIPIENT}, ${ADDR('cg')},
+             ${ITEMS},
              (SELECT COALESCE(SUM(o.total_cents) FILTER (WHERE o.status <> 'cancelled'), 0) FROM orders o WHERE o.checkout_group_id = cg.id) AS payable_cents
       FROM checkout_groups cg
       JOIN users u ON u.id = cg.user_id
@@ -81,6 +117,7 @@ const EVENTS = [
         AND EXISTS (SELECT 1 FROM orders o WHERE o.checkout_group_id = cg.id AND o.replacement_of_order_id IS NULL)
       ORDER BY cg.id LIMIT ${BATCH}`,
     values: (r) => [firstName(r.u_name), r.ref, rupees(r.payable_cents)],
+    details: bill,
   },
   {
     key: 'order_confirmed',
@@ -146,8 +183,9 @@ const EVENTS = [
     variables: ['Amount (₹)', 'Order reference', 'Where it went'],
     sql: `
       SELECT rf.id AS source_id, 'refund_completed:refund:' || rf.id AS dedupe_key, rf.order_id, p.checkout_group_id AS group_id,
-             COALESCE(cg.reference, 'GLM-ORDER-' || rf.order_id) AS ref, rf.amount_cents, p.method, ${RECIPIENT}
+             COALESCE(cg.reference, 'GLM-ORDER-' || rf.order_id) AS ref, rf.amount_cents, p.method, ${RECIPIENT}, ${ADDR('ro')}
       FROM refunds rf
+      LEFT JOIN orders ro ON ro.id = rf.order_id
       JOIN payments p ON p.id = rf.payment_id
       JOIN users u ON u.id = p.user_id
       LEFT JOIN checkout_groups cg ON cg.id = p.checkout_group_id
@@ -164,7 +202,7 @@ const EVENTS = [
     variables: ['Order reference', 'Pickup date'],
     sql: `
       SELECT e.id AS source_id, 'return_pickup:return:' || r.id AS dedupe_key, o.id AS order_id, o.checkout_group_id AS group_id,
-             ${REF} AS ref, r.pickup_scheduled_at, ${RECIPIENT}
+             ${REF} AS ref, r.pickup_scheduled_at, ${RECIPIENT}, ${ADDR('o')}
       FROM order_return_events e
       JOIN order_returns r ON r.id = e.return_id
       JOIN orders o ON o.id = r.order_id
@@ -177,13 +215,13 @@ const EVENTS = [
   {
     key: 'invoice_ready',
     label: 'Invoice ready',
-    description: 'When the tax invoice is issued (on delivery).',
+    description: 'When the tax invoice is issued (on delivery); on UltraMsg with the invoice PDF attached.',
     template: 'invoice_ready',
     enabledByDefault: false,
     variables: ['Invoice number', 'Order reference'],
     sql: `
       SELECT i.id AS source_id, 'invoice_ready:invoice:' || i.id AS dedupe_key, o.id AS order_id, o.checkout_group_id AS group_id,
-             ${REF} AS ref, i.invoice_number, ${RECIPIENT}
+             ${REF} AS ref, i.id AS invoice_id, i.invoice_number, ${RECIPIENT}, ${ADDR('o')}
       FROM invoices i
       JOIN orders o ON o.id = i.order_id
       JOIN users u ON u.id = o.user_id
@@ -191,6 +229,7 @@ const EVENTS = [
       WHERE i.status = 'issued' AND ${RECENT('i.created_at')} AND ${NOT_SENT("'invoice_ready:invoice:' || i.id")}
       ORDER BY i.id LIMIT ${BATCH}`,
     values: (r) => [r.invoice_number, r.ref],
+    attachment: (r) => ({ type: 'invoice', id: r.invoice_id }),
   },
   {
     key: 'shop_new_order',
@@ -279,25 +318,50 @@ async function dispatch() {
     for (const r of rows) {
       const values = event.values(r);
       if (!values) continue;
-      const who = recipient(r, event.audience);
-      if (who.quiet) continue;
       const base = { dedupeKey: r.dedupe_key, orderId: r.order_id, groupId: r.group_id, userId: r.u_id, event: event.key };
-      if (who.skip || values.length !== needed) {
-        await logSkip({ ...base, phone: who.phone ?? r.u_wa ?? null, template, reason: who.skip ?? `The template needs ${needed} value(s); this event gives ${values.length}.` });
+      if (values.length !== needed) {
+        await logSkip({ ...base, phone: r.u_wa ?? null, template, reason: `The template needs ${needed} value(s); this event gives ${values.length}.` });
         out.skipped += 1;
         continue;
       }
-      try {
-        const m = await whatsapp.enqueue(pool, { phone: who.phone, userId: r.u_id, template, variables: values.map(clean), approvedOnly: conn.needsApproval, ...base });
-        if (m) out.queued += 1;
-      } catch (err) {
-        if (!(err instanceof whatsapp.WhatsAppError)) throw err;
-        await logSkip({ ...base, phone: who.phone, template, reason: err.message });
+      // The bill and the invoice PDF go only where plain text and files can (UltraMsg).
+      const extra = conn.needsApproval ? {} : { details: event.details?.(r) ?? null, attachment: event.attachment?.(r) ?? null };
+      const send = async (phone, keys) => {
+        try {
+          const m = await whatsapp.enqueue(pool, { phone, template, variables: values.map(clean), approvedOnly: conn.needsApproval, ...extra, ...keys });
+          if (m) out.queued += 1;
+        } catch (err) {
+          if (!(err instanceof whatsapp.WhatsAppError)) throw err;
+          await logSkip({ ...keys, phone, template, reason: err.message });
+          out.skipped += 1;
+        }
+      };
+      const who = recipient(r, event.audience);
+      if (who.phone) await send(who.phone, base);
+      else if (who.skip) {
+        await logSkip({ ...base, phone: r.u_wa ?? null, template, reason: who.skip });
         out.skipped += 1;
+      }
+      // A copy to the delivery address's mobile, when it's another number (or the
+      // account's own one wasn't used) — unless that number wrote STOP.
+      if (event.audience !== 'shop') {
+        const addr = whatsapp.normalizePhone(r.addr_mobile);
+        if (addr && addr !== who.phone && !(await optedOut(addr))) await send(addr, { ...base, dedupeKey: `${r.dedupe_key}:addr` });
       }
     }
   }
   return out;
+}
+
+/** A number that wrote STOP, on any account it's linked to or stored on. */
+async function optedOut(phone) {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM users WHERE whatsapp_opt_out_at IS NOT NULL
+       AND (whatsapp_phone = $1::varchar OR right(regexp_replace(COALESCE(phone_number, ''), '\\D', '', 'g'), 10) = right($1::varchar, 10))
+     LIMIT 1`,
+    [phone]
+  );
+  return rows.length > 0;
 }
 
 // Meta refuses values with line breaks, tabs or long runs of spaces.

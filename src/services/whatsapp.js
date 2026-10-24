@@ -157,6 +157,9 @@ async function enqueue(db, {
   phone, userId = null, template = null, variables = [], buttonParam = null, text = null, event = null, createdBy = null,
   // Automatic messages: one per dedupeKey; a second enqueue of the same key returns null.
   dedupeKey = null, orderId = null, groupId = null, approvedOnly = true,
+  // Plain-text providers only (WP2): lines added under the template's text
+  // (an itemised bill), and a file sent with it ({ type: 'invoice', id }).
+  details = null, attachment = null,
 }) {
   const to = normalizePhone(phone);
   if (!to) throw new WhatsAppError(400, 'Enter a WhatsApp number with country code, e.g. +91 98765 43210.');
@@ -172,11 +175,12 @@ async function enqueue(db, {
     if (dynamic && !buttonParam) throw new WhatsAppError(400, 'This template has a link button — give the end of the link.');
     const { rows } = await db.query(
       `INSERT INTO whatsapp_messages (direction, phone, user_id, kind, template_id, template_name, language, variables, button_param, body, event, created_by,
-         dedupe_key, order_id, checkout_group_id)
-       VALUES ('out', $1, $2, 'template', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         dedupe_key, order_id, checkout_group_id, attachment)
+       VALUES ('out', $1, $2, 'template', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING RETURNING *`,
       [to, userId, template.id, template.name, template.language, JSON.stringify(vars), dynamic ? String(buttonParam) : null,
-        templates.render(template.body_text, vars), event, createdBy, dedupeKey, orderId, groupId]
+        [templates.render(template.body_text, vars), details].filter(Boolean).join('\n\n').slice(0, 4096),
+        event, createdBy, dedupeKey, orderId, groupId, attachment ? JSON.stringify(attachment) : null]
     );
     return rows[0] ?? null;
   }
@@ -219,17 +223,28 @@ function plainTextFor(m, template) {
   return lines.join('\n\n');
 }
 
-/** One UltraMsg send. referenceId comes back on its acks, so they can find the row. */
+/**
+ * One UltraMsg send: a text, or a document with the text as its caption when
+ * the message carries a file (an invoice that's since been cancelled goes as
+ * text only). referenceId comes back on its acks, so they can find the row.
+ */
 async function attemptUltraMsg(conn, m) {
   let template = null;
   if (m.kind === 'template' && m.template_id) {
     ({ rows: [template] } = await pool.query('SELECT header_text, footer_text, buttons FROM whatsapp_templates WHERE id = $1', [m.template_id]));
   }
+  const text = plainTextFor(m, template);
+  let file = null;
+  if (m.attachment?.type === 'invoice') file = await require('./invoicePdf').buildInvoicePdf(m.attachment.id);
   try {
-    const { status, data } = await requestJson(`${ultramsg.base(conn.config)}/messages/chat`, {
+    const { status, data } = await requestJson(`${ultramsg.base(conn.config)}/messages/${file ? 'document' : 'chat'}`, {
       method: 'POST',
-      body: { token: conn.secrets.token, to: `+${m.phone}`, body: plainTextFor(m, template), referenceId: `glm${m.id}` },
+      body: file
+        ? { token: conn.secrets.token, to: `+${m.phone}`, filename: file.filename, document: file.buffer.toString('base64'),
+            caption: text.slice(0, 1024), referenceId: `glm${m.id}` }
+        : { token: conn.secrets.token, to: `+${m.phone}`, body: text, referenceId: `glm${m.id}` },
       retries: 1,
+      timeoutMs: file ? 30000 : 10000,
     });
     if (status === 200 && (data?.sent === 'true' || data?.sent === true)) return { ok: true, metaId: `um:${data.id ?? m.id}` };
     const err = data?.error;
