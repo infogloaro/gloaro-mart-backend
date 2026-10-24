@@ -66,9 +66,11 @@ const SOURCES = {
     }),
   },
   product_carousel: {
-    byIds: `SELECT p.id, p.name, p.price_cents, p.mrp_cents, vp.business_name, ${PRODUCT_IMAGE} AS image
+    byIds: `SELECT p.id, p.name, p.price_cents, p.mrp_cents, vp.business_name,
+            COALESCE(NULLIF(btrim(vp.city), ''), vp.district) AS city, ${PRODUCT_IMAGE} AS image
             FROM products p JOIN vendor_profiles vp ON vp.id = p.vendor_id WHERE p.id = ANY($1) AND ${SELLABLE}`,
-    search: `SELECT p.id, p.name, p.price_cents, p.mrp_cents, vp.business_name, ${PRODUCT_IMAGE} AS image
+    search: `SELECT p.id, p.name, p.price_cents, p.mrp_cents, vp.business_name,
+            COALESCE(NULLIF(btrim(vp.city), ''), vp.district) AS city, ${PRODUCT_IMAGE} AS image
              FROM products p JOIN vendor_profiles vp ON vp.id = p.vendor_id
              WHERE ${SELLABLE} AND (p.name ILIKE $1 OR vp.business_name ILIKE $1) ORDER BY p.name LIMIT 20`,
     shape: (r) => productShape(r),
@@ -92,9 +94,9 @@ function productShape(r) {
   return {
     refId: r.id,
     title: r.name,
-    subtitle: [rupees(r.price_cents), off ? `${off}% off` : null, r.business_name].filter(Boolean).join(" · "),
+    subtitle: [rupees(r.price_cents), off ? `${off}% off` : null, r.business_name, r.city].filter(Boolean).join(" · "),
     imageUrl: r.image,
-    data: { kind: "product", id: r.id, name: r.name, priceCents: r.price_cents, mrpCents: r.mrp_cents, discountPercent: off, image: r.image, shop: r.business_name },
+    data: { kind: "product", id: r.id, name: r.name, priceCents: r.price_cents, mrpCents: r.mrp_cents, discountPercent: off, image: r.image, shop: r.business_name, city: r.city },
   };
 }
 
@@ -102,7 +104,8 @@ function productShape(r) {
 async function automaticItems(section) {
   if (section.type !== "local_deals") return [];
   const { rows } = await pool.query(
-    `SELECT p.id, p.name, p.price_cents, p.mrp_cents, vp.business_name, ${PRODUCT_IMAGE} AS image
+    `SELECT p.id, p.name, p.price_cents, p.mrp_cents, vp.business_name,
+            COALESCE(NULLIF(btrim(vp.city), ''), vp.district) AS city, ${PRODUCT_IMAGE} AS image
      FROM products p JOIN vendor_profiles vp ON vp.id = p.vendor_id
      WHERE ${SELLABLE} AND p.mrp_cents > p.price_cents
      ORDER BY (p.mrp_cents - p.price_cents)::float / p.mrp_cents DESC, p.id

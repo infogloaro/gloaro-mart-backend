@@ -219,6 +219,7 @@ async function queryCatalogue(query, { limit = 100, offset = 0 } = {}) {
 
   const { rows } = await pool.query(
     `SELECT p.*, b.name AS brand_name, vp.business_name AS vendor_name,
+            COALESCE(NULLIF(btrim(vp.city), ''), vp.district) AS vendor_city,
             dr.supports_delivery, dr.supports_pickup,
             ${DERIVED},
             ${etaExpression()} AS eta_minutes

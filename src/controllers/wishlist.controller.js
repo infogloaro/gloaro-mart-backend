@@ -11,7 +11,8 @@ const pool = require('./../config/db');
 
 async function listWishlist(req, res) {
   const { rows } = await pool.query(
-    `SELECT p.*, w.created_at AS saved_at, vp.business_name AS vendor_name
+    `SELECT p.*, w.created_at AS saved_at, vp.business_name AS vendor_name,
+            COALESCE(NULLIF(btrim(vp.city), ''), vp.district) AS vendor_city
      FROM wishlist_items w
      JOIN products p ON p.id = w.product_id
      LEFT JOIN vendor_profiles vp ON vp.id = p.vendor_id

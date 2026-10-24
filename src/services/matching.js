@@ -206,6 +206,7 @@ async function findCandidates({
     `SELECT p.id AS product_id, p.name, p.price_cents, p.vendor_id, p.gst_rate_percent, p.moq,
             p.image_url,
             v.business_name, v.latitude, v.longitude,
+            COALESCE(NULLIF(btrim(v.city), ''), v.district) AS city,
             COALESCE((SELECT SUM(i.available_qty)::int FROM inventory i WHERE i.product_id = p.id), 0)
               AS available_qty,
             CASE WHEN v.latitude IS NOT NULL AND v.longitude IS NOT NULL
@@ -289,6 +290,7 @@ async function findCandidates({
       serviceabilityChecked: Boolean(address),
       productId: r.product_id,
       productName: r.name,
+      city: r.city,
       imageUrl: r.image_url,
       unitPriceCents: r.price_cents,
       lineTotalCents,

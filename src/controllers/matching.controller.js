@@ -24,6 +24,7 @@ function toJson(c) {
     businessName: c.businessName,
     productId: c.productId,
     productName: c.productName,
+    city: c.city ?? null,
     imageUrl: c.imageUrl,
     unitPriceCents: c.unitPriceCents,
     lineTotalCents: c.lineTotalCents,
