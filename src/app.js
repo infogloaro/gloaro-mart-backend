@@ -55,6 +55,7 @@ app.use("/api/banners", require("./routes/banner.routes"));
 app.use("/api/categories", require("./routes/category.routes"));
 app.use("/api/brands", require("./routes/brand.routes"));
 app.use("/api/settings", require("./routes/settings.routes"));
+app.use("/api/i18n", require("./routes/i18n.routes"));
 app.use("/api/feature-flags", require("./routes/featureFlag.routes"));
 app.use("/api/menu", require("./routes/menu.routes"));
 app.use("/api/addresses", require("./routes/address.routes"));

@@ -5,6 +5,7 @@ const banner = require("../controllers/banner.controller");
 const category = require("../controllers/category.controller");
 const brand = require("../controllers/brand.controller");
 const settings = require("../controllers/settings.controller");
+const i18n = require("../controllers/i18n.controller");
 const product = require("../controllers/product.controller");
 const org = require("../controllers/org.controller");
 const adminOrg = require("../controllers/adminOrg.controller");
@@ -339,6 +340,10 @@ router.delete("/brands/:id", brand.deleteBrand);
 
 router.get("/settings", settings.getSettings);
 router.put("/settings", settings.updateSettings);
+// App languages and their wording (LG1), under the General Settings permission.
+router.get("/languages", i18n.adminList);
+router.put("/languages/strings/:key", i18n.adminSetString);
+router.patch("/languages/:code", i18n.adminUpdateLanguage);
 
 // SB6b: shops' public coupons, and hiding one from the offers list.
 router.get("/coupons/shop", offerModeration.listShopCoupons);

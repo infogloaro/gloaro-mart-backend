@@ -3935,3 +3935,43 @@ ALTER TABLE vendor_delivery_rules ADD CONSTRAINT vendor_delivery_rules_outstatio
 -- names, values are /uploads/settings/... paths. A chip with no entry shows
 -- the picture built into the app.
 ALTER TABLE platform_settings ADD COLUMN IF NOT EXISTS home_chip_images JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- ===== APP LANGUAGES (LG1) =====
+-- The languages the customer app offers (English, Tamil, Hindi) and the words
+-- on its screens. The app ships its own copy of every string; rows here are
+-- the admin's wording, which the app downloads and prefers, so a translation
+-- is fixed without a new release. English can't be switched off. One language
+-- is the default for someone who has never picked one.
+CREATE TABLE IF NOT EXISTS app_languages (
+  code VARCHAR(5) PRIMARY KEY,
+  name TEXT NOT NULL,
+  native_name TEXT NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT false,
+  is_default BOOLEAN NOT NULL DEFAULT false,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (code <> 'en' OR enabled),
+  CHECK (NOT is_default OR enabled)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS app_languages_one_default ON app_languages (is_default) WHERE is_default;
+INSERT INTO app_languages (code, name, native_name, enabled, is_default, sort_order) VALUES
+  ('en', 'English', 'English', true, true, 0),
+  ('ta', 'Tamil', 'தமிழ்', true, false, 1),
+  ('hi', 'Hindi', 'हिन्दी', true, false, 2)
+ON CONFLICT (code) DO NOTHING;
+
+-- Keyed like the app's assets/i18n/<lang>.json ("home.search_hint"). A key
+-- with no English row is unknown to the app and refused by the admin API;
+-- scripts/seed-app-strings.js adds the app's keys without touching edits.
+CREATE TABLE IF NOT EXISTS app_strings (
+  key VARCHAR(120) NOT NULL,
+  lang VARCHAR(5) NOT NULL REFERENCES app_languages(code) ON DELETE CASCADE,
+  text TEXT NOT NULL CHECK (length(text) BETWEEN 1 AND 2000),
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (key, lang)
+);
+
+-- The language a signed-in customer picked (NULL: never picked; the app then
+-- uses the default). Also meant for choosing WhatsApp template languages.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_language VARCHAR(5) REFERENCES app_languages(code) ON DELETE SET NULL;

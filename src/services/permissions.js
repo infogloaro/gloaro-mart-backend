@@ -116,7 +116,7 @@ const MODULES = [
   },
   { key: "audit_logs", label: "Admin Logs", group: "System & Administration", routes: ["audit-logs"] },
   { key: "feature_flags", label: "Feature Flags", group: "System & Administration", routes: ["feature-flags"] },
-  { key: "settings", label: "General Settings", group: "System & Administration", routes: ["settings"] },
+  { key: "settings", label: "General Settings", group: "System & Administration", routes: ["settings", "languages"] },
   { key: "channels", label: "Channels", group: "System & Administration", routes: ["channels", "whatsapp"] },
 ];
 
