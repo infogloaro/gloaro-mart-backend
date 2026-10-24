@@ -36,6 +36,26 @@ const URL_FIELDS = ['logoUrl', 'faviconUrl', 'instagramUrl', 'facebookUrl', 'you
 const IMAGE_FIELDS = ['logoUrl', 'faviconUrl'];
 const SETTINGS_UPLOAD = /^\/uploads\/settings\/[\w.-]+\.(jpg|png|webp)$/;
 
+// The quick chips under the app's home search bar (HC1). Each may carry an
+// uploaded picture; one left out shows the picture built into the app.
+const HOME_CHIPS = ['deals', 'b2b', 'near_me', 'mart', 'categories'];
+
+/** { chip: path } with blanks dropped, or a message saying what is wrong. */
+function readHomeChipImages(value) {
+  if (value === null) return { images: {} };
+  if (typeof value !== 'object' || Array.isArray(value)) return { error: 'homeChipImages must be an object' };
+  const images = {};
+  for (const [chip, picture] of Object.entries(value)) {
+    if (!HOME_CHIPS.includes(chip)) return { error: `Unknown home chip: ${chip}` };
+    if (picture === null || picture === '') continue;
+    if (typeof picture !== 'string' || !SETTINGS_UPLOAD.test(picture.trim())) {
+      return { error: `Upload the ${chip.replace('_', ' ')} chip picture first` };
+    }
+    images[chip] = picture.trim();
+  }
+  return { images };
+}
+
 function validate(body) {
   for (const key of REQUIRED) {
     if (key in body && body[key] == null) return `${key} cannot be empty`;
@@ -100,6 +120,7 @@ async function getPublicSettings(req, res) {
     youtube_url: settings.youtube_url,
     maintenance_mode: settings.maintenance_mode,
     maintenance_message: settings.maintenance_mode ? settings.maintenance_message : null,
+    home_chip_images: settings.home_chip_images ?? {},
   });
 }
 
@@ -126,6 +147,12 @@ async function updateSettings(req, res) {
     if (key === 'currencyCode' && value) value = String(value).toUpperCase();
     params.push(value);
     assignments.push(`${column} = $${params.length}`);
+  }
+  if ('homeChipImages' in body) {
+    const { images, error } = readHomeChipImages(body.homeChipImages);
+    if (error) return res.status(400).json({ message: error });
+    params.push(JSON.stringify(images));
+    assignments.push(`home_chip_images = $${params.length}::jsonb`);
   }
   if (assignments.length === 0) {
     return res.status(400).json({ message: 'No updatable fields supplied' });

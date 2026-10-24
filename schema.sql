@@ -3913,3 +3913,10 @@ ALTER TABLE vendor_delivery_rules ADD COLUMN IF NOT EXISTS outstation_eta_days I
 ALTER TABLE vendor_delivery_rules DROP CONSTRAINT IF EXISTS vendor_delivery_rules_outstation_check;
 ALTER TABLE vendor_delivery_rules ADD CONSTRAINT vendor_delivery_rules_outstation_check
   CHECK (outstation_charge_cents >= 0 AND outstation_eta_days BETWEEN 1 AND 30);
+
+-- ===== HOME CHIP PICTURES (HC1) =====
+-- The picture on each quick chip under the app's home search bar (Deals, B2B,
+-- Near Me, Mart, Categories), set from General Settings. Keys are the chip
+-- names, values are /uploads/settings/... paths. A chip with no entry shows
+-- the picture built into the app.
+ALTER TABLE platform_settings ADD COLUMN IF NOT EXISTS home_chip_images JSONB NOT NULL DEFAULT '{}'::jsonb;
