@@ -226,6 +226,9 @@ async function getPublicProfile(req, res) {
   const { rows } = await pool.query(
     `SELECT vp.id, vp.business_name, vp.business_type, vp.gst_number, vp.address_line,
             vp.city, vp.state, vp.pincode, vp.status, vp.description, vp.logo_url, vp.cover_image_url,
+            -- AB2: only what the shop chose to publish (never its login phone),
+            -- and the landmark and kind of shop it gave when signing up.
+            vp.contact, vp.landmark, vp.shop_category,
             dr.supports_delivery, dr.supports_pickup, dr.opens_at, dr.closes_at,
             CASE WHEN pm.rating_count > 0 THEN ROUND(pm.rating_sum / pm.rating_count, 2) END AS rating,
             COALESCE(pm.rating_count, 0) AS review_count,

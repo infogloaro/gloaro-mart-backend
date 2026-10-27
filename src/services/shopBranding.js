@@ -22,7 +22,7 @@ class BrandingError extends Error {
 /**
  * The branding fields present in a request body, checked. A field left out
  * stays as it is; '' or null clears it. Returns { description?, logo_url?,
- * cover_image_url? } with only the fields to change.
+ * cover_image_url?, contact? } with only the fields to change.
  */
 function readBranding(body = {}) {
   const out = {};
@@ -43,6 +43,67 @@ function readBranding(body = {}) {
       out[col] = v;
     }
   }
+  if (body.contact !== undefined) out.contact = readContact(body.contact);
+  return out;
+}
+
+/**
+ * AB2: what the shop chooses to publish for customers — never its login
+ * phone or email, only what it types here (the landmark is the existing
+ * vendor_profiles.landmark). `contact` replaces the whole
+ * set ({} clears it); every key is optional. Returns the cleaned object.
+ */
+const CONTACT_KEYS = ['phone', 'altPhone', 'whatsapp', 'email', 'website', 'establishedYear', 'instagram', 'facebook'];
+
+function readContact(c) {
+  if (c === null) return {};
+  if (typeof c !== 'object' || Array.isArray(c)) throw new BrandingError(400, 'contact must be an object.');
+  const unknown = Object.keys(c).filter((k) => !CONTACT_KEYS.includes(k));
+  if (unknown.length) throw new BrandingError(400, `Unknown contact field: ${unknown.join(', ')}.`);
+  const text = (k) => (typeof c[k] === 'string' ? c[k].trim() : c[k] == null ? '' : String(c[k]).trim());
+  const out = {};
+  // Indian numbers: a mobile (+91 optional) or, for the second line, a landline with its STD code.
+  const phone = (k, label, landline) => {
+    const v = text(k).replace(/[\s()-]/g, '');
+    if (!v) return;
+    const mobile = v.match(/^(?:\+?91|0)?([6-9]\d{9})$/);
+    if (mobile) out[k] = `+91${mobile[1]}`;
+    else if (landline && /^0\d{9,10}$/.test(v)) out[k] = v;
+    else throw new BrandingError(400, `${label} must be a 10-digit Indian ${landline ? 'mobile or a landline with its STD code' : 'mobile number'}.`);
+  };
+  phone('phone', 'The phone number', false);
+  phone('altPhone', 'The other phone number', true);
+  phone('whatsapp', 'The WhatsApp number', false);
+  const email = text('email');
+  if (email) {
+    if (email.length > 120 || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) throw new BrandingError(400, 'The email address does not look right.');
+    out.email = email.toLowerCase();
+  }
+  let site = text('website');
+  if (site) {
+    if (!/^https?:\/\//i.test(site)) site = `https://${site}`;
+    let u;
+    try { u = new URL(site); } catch { u = null; }
+    if (!u || !/\.[a-z]{2,}$/i.test(u.hostname) || site.length > 200) throw new BrandingError(400, 'The website must be a web address, like www.myshop.in.');
+    out.website = u.toString();
+  }
+  const year = text('establishedYear');
+  if (year) {
+    const y = Number(year);
+    if (!Number.isInteger(y) || y < 1800 || y > new Date().getFullYear()) throw new BrandingError(400, 'The year the shop started must be between 1800 and this year.');
+    out.establishedYear = y;
+  }
+  // Social: a handle (@name) or the profile link; stored as the link.
+  const social = (k, host, handle, label) => {
+    const v = text(k);
+    if (!v) return;
+    const m = v.match(new RegExp(`^(?:https?://)?(?:www\\.|m\\.)?${host.replace('.', '\\.')}/([^/?#\\s]+)/?(?:[?#].*)?$`, 'i'));
+    const name = m ? m[1] : v.replace(/^@/, '');
+    if (!handle.test(name)) throw new BrandingError(400, `The ${label} must be your page name or its link.`);
+    out[k] = `https://www.${host}/${name}`;
+  };
+  social('instagram', 'instagram.com', /^[A-Za-z0-9._]{1,30}$/, 'Instagram account');
+  social('facebook', 'facebook.com', /^[A-Za-z0-9.-]{1,80}$/, 'Facebook page');
   return out;
 }
 
@@ -160,6 +221,7 @@ module.exports = {
   BrandingError,
   MAX_PHOTOS,
   readBranding,
+  readContact,
   brandingSet,
   publicGallery,
   fullGallery,

@@ -3990,3 +3990,11 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_language VARCHAR(5) REFEREN
 -- YouTube link (watch, youtu.be, Shorts), played in the app under the
 -- campaign's poster (banner_url). Checked in campaign.controller.
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS video_url TEXT;
+
+-- ===== SHOP CONTACT (AB2) =====
+-- What a shop publishes for customers on its About tab: phone, altPhone,
+-- whatsapp (Indian mobiles stored as +91…, a landline allowed for altPhone),
+-- email, website, establishedYear, instagram, facebook (stored as links).
+-- Only what the shop types in shopBranding.readContact; never the login
+-- phone or email. {} = nothing published.
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS contact JSONB NOT NULL DEFAULT '{}'::jsonb;
