@@ -11,7 +11,11 @@ const offerAlerts = require("../services/shopOfferAlerts");
  *
  * The discount, scope and funding are fixed once a campaign has started —
  * changing them mid-run would reprice orders already placed. Dates, budget,
- * name, description and banner can change until it ends.
+ * name, description, banner and video can change until it ends.
+ *
+ * OF9: the banner is the campaign's poster in the shopper app's Offers page
+ * (uploaded to /uploads/campaigns/…); the video is a YouTube link the app
+ * plays in place, under that poster.
  */
 
 const SCOPES = ["platform", "category", "vendor"];
@@ -52,6 +56,7 @@ function toJson(r) {
     revenueCents: r.revenue_cents,
     discountGivenCents: r.spent_cents,
     bannerUrl: r.banner_url,
+    videoUrl: r.video_url ?? null,
     createdAt: r.created_at,
   };
 }
@@ -150,6 +155,17 @@ function readMoney(value, label, errors) {
   return value;
 }
 
+// A YouTube video (watch, youtu.be, Shorts or embed link) — the app plays only these.
+const YOUTUBE = /^https:\/\/(?:(?:www\.|m\.)?youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/)|youtu\.be\/)[\w-]{11}(?:[?&#][^\s]*)?$/;
+
+function readVideo(value, errors) {
+  if (value === undefined) return undefined;
+  if (value === null || (typeof value === "string" && !value.trim())) return null;
+  const url = typeof value === "string" ? value.trim() : "";
+  if (url.length > 300 || !YOUTUBE.test(url)) errors.push("The video must be a YouTube link (youtube.com/watch?v=…, youtu.be/… or youtube.com/shorts/…).");
+  return url;
+}
+
 function readDay(value, label, errors, endOfDay = false) {
   if (value === undefined) return undefined;
   const d = new Date(typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T${endOfDay ? "23:59:59" : "00:00:00"}` : value);
@@ -178,15 +194,16 @@ async function createCampaign(req, res) {
   if (!Number.isInteger(minOrder) || minOrder < 0) errors.push("Minimum order must be zero or more");
   const share = b.fundedBy === "shared" ? (b.platformSharePercent ?? 50) : null;
   if (share !== null && !(Number.isInteger(share) && share >= 0 && share <= 100)) errors.push("Platform share must be 0 to 100");
+  const video = readVideo(b.videoUrl, errors);
   if (errors.length) return res.status(400).json({ message: errors.join(" ") });
 
   const { rows } = await pool.query(
     `INSERT INTO campaigns (name, description, scope, discount_type, discount_value, max_discount_cents, min_order_cents,
-       starts_at, ends_at, funded_by, platform_share_percent, budget_cents, banner_url, created_by_user_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id`,
+       starts_at, ends_at, funded_by, platform_share_percent, budget_cents, banner_url, created_by_user_id, video_url)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id`,
     [name, typeof b.description === "string" ? b.description.trim() || null : null, b.scope, b.discountType, value,
       maxDiscount ?? null, minOrder, startsAt, endsAt, b.fundedBy, share, budget ?? null,
-      typeof b.bannerUrl === "string" ? b.bannerUrl.trim() || null : null, req.user.id],
+      typeof b.bannerUrl === "string" ? b.bannerUrl.trim() || null : null, req.user.id, video ?? null],
   );
   await audit(req, "campaign.created", rows[0].id, null, { name, scope: b.scope, discountType: b.discountType, discountValue: value, fundedBy: b.fundedBy });
   const c = await loadCampaign(rows[0].id);
@@ -201,7 +218,8 @@ async function updateCampaign(req, res) {
   const errors = [];
   const locked = ["scope", "discountType", "discountValue", "fundedBy", "platformSharePercent", "maxDiscountCents", "minOrderCents"].filter((k) => k in b);
   if (locked.length && c.state !== "draft") errors.push("The discount, scope and funding are fixed once a campaign has started.");
-  if (locked.length && c.state === "draft") errors.push("Change the discount by creating the campaign again; only dates, budget, name and banner can be edited here.");
+  if (locked.length && c.state === "draft") errors.push("Change the discount by creating the campaign again; only dates, budget, name, banner and video can be edited here.");
+  const video = readVideo(b.videoUrl, errors);
   const endsAt = b.endsAt === null || b.endsAt === "" ? undefined : readDay(b.endsAt, "endsAt", errors, true);
   const startsAt = b.startsAt === undefined ? undefined : readDay(b.startsAt, "startsAt", errors);
   if (startsAt && c.status !== "draft" && c.status !== "scheduled") errors.push("A campaign that has started keeps its start date.");
@@ -220,12 +238,14 @@ async function updateCampaign(req, res) {
        ends_at = COALESCE($6, ends_at),
        budget_cents = CASE WHEN $7::boolean THEN $8 ELSE budget_cents END,
        banner_url = CASE WHEN $9::boolean THEN $10 ELSE banner_url END,
+       video_url = CASE WHEN $11::boolean THEN $12 ELSE video_url END,
        updated_at = NOW()
      WHERE id = $1`,
     [c.id, typeof b.name === "string" && b.name.trim() ? b.name.trim().slice(0, 120) : null,
       "description" in b, typeof b.description === "string" ? b.description.trim() || null : null,
       startsAt ?? null, endsAt ?? null, "budgetCents" in b, budget ?? null,
-      "bannerUrl" in b, typeof b.bannerUrl === "string" ? b.bannerUrl.trim() || null : null],
+      "bannerUrl" in b, typeof b.bannerUrl === "string" ? b.bannerUrl.trim() || null : null,
+      video !== undefined, video ?? null],
   );
   await audit(req, "campaign.updated", c.id, { ends_at: c.ends_at, budget_cents: c.budget_cents }, { changed: Object.keys(b) });
   return getCampaign(req, res);
@@ -363,6 +383,7 @@ async function runningCampaigns() {
       name: r.name,
       description: r.description,
       bannerUrl: r.banner_url,
+      videoUrl: r.video_url ?? null,
       discountType: r.discount_type,
       discountValue: r.discount_value,
       maxDiscountCents: r.max_discount_cents,

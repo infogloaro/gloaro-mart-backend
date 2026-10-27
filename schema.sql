@@ -3984,3 +3984,9 @@ CREATE TABLE IF NOT EXISTS app_strings (
 -- The language a signed-in customer picked (NULL: never picked; the app then
 -- uses the default). Also meant for choosing WhatsApp template languages.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_language VARCHAR(5) REFERENCES app_languages(code) ON DELETE SET NULL;
+
+-- ===== CAMPAIGN VIDEOS (OF9) =====
+-- A Gloaro Mart campaign's promo video for the shopper app's Offers page: a
+-- YouTube link (watch, youtu.be, Shorts), played in the app under the
+-- campaign's poster (banner_url). Checked in campaign.controller.
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS video_url TEXT;

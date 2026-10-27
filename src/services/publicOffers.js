@@ -184,6 +184,7 @@ async function listOffers(query = {}, { runningCampaigns }) {
         title: k.name,
         description: k.description,
         banner_url: k.bannerUrl,
+        video_url: k.videoUrl,
         discount_type: k.discountType,
         ...amountFields(k.discountType, k.discountValue, k.discountValue),
         max_discount_cents: k.maxDiscountCents,

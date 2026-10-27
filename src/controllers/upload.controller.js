@@ -32,6 +32,8 @@ const FOLDERS = {
   'delivery-partners': 'partners',
   // Shop ad banners (Ad Promotions); guarded by the ad_promotions module.
   ads: 'ads',
+  // Gloaro Mart campaign posters (OF9); guarded by the campaigns' module.
+  campaigns: 'campaigns',
 };
 
 const MAX_BYTES = 5 * 1024 * 1024;
