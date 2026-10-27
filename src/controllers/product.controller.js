@@ -1,5 +1,5 @@
 const pool = require('../config/db');
-const { loadProductCatalogue } = require('./catalogue.controller');
+const { loadProductCatalogue, setProductAttributeValues } = require('./catalogue.controller');
 const { setSimpleStock } = require('../services/inventory');
 const { queryCatalogue, toListingJson, SORTS } = require('./search.controller');
 
@@ -45,8 +45,10 @@ async function createProduct(req, res) {
   const vendorId = await getVendorProfileId(req.user.id);
   if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
 
-  const { name, description, priceCents, currency, stockQuantity, imageUrl, category, subcategory, brandId, gstRatePercent, moq } =
-    req.body || {};
+  const {
+    name, description, priceCents, currency, stockQuantity, imageUrl, category, subcategory, brandId, gstRatePercent, moq,
+    attributeValueIds,
+  } = req.body || {};
   if (!name || !Number.isInteger(priceCents) || priceCents < 0) {
     return res.status(400).json({ message: 'name and a valid priceCents are required' });
   }
@@ -85,6 +87,14 @@ async function createProduct(req, res) {
     );
     product = rows[0];
     await openingStock(client, product, req.user.id);
+    // The product's filter facts (Material, Fit …) from the platform's attributes.
+    if (Array.isArray(attributeValueIds)) {
+      const problem = await setProductAttributeValues(client, product.id, attributeValueIds);
+      if (problem) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: problem });
+      }
+    }
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -123,8 +133,13 @@ async function openingStock(client, product, userId) {
 async function getMyProducts(req, res) {
   const vendorId = await getVendorProfileId(req.user.id);
   if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
+  // attribute_value_ids: the product's own filter facts, so the edit form can
+  // show them ticked.
   const { rows } = await pool.query(
-    'SELECT * FROM products WHERE vendor_id = $1 ORDER BY created_at DESC',
+    `SELECT p.*,
+            COALESCE((SELECT array_agg(pav.attribute_value_id ORDER BY pav.attribute_value_id)
+                      FROM product_attribute_values pav WHERE pav.product_id = p.id), '{}') AS attribute_value_ids
+     FROM products p WHERE p.vendor_id = $1 ORDER BY p.created_at DESC`,
     [vendorId]
   );
   res.json(rows);
@@ -147,6 +162,7 @@ async function updateProduct(req, res) {
     isActive,
     gstRatePercent,
     moq,
+    attributeValueIds,
   } = req.body || {};
   if (brandId != null && (!Number.isInteger(brandId) || brandId < 1)) {
     return res.status(400).json({ message: 'brandId must be a positive integer or null' });
@@ -214,6 +230,14 @@ async function updateProduct(req, res) {
       });
       const { rows: fresh } = await client.query('SELECT * FROM products WHERE id = $1', [product.id]);
       product = fresh[0];
+    }
+    // Absent leaves the product's attribute values; a list replaces them ([] clears).
+    if (Array.isArray(attributeValueIds)) {
+      const problem = await setProductAttributeValues(client, product.id, attributeValueIds);
+      if (problem) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: problem });
+      }
     }
     await client.query('COMMIT');
   } catch (err) {

@@ -358,6 +358,12 @@ async function listVendors(req, res) {
               COALESCE(pm.rating_count, 0) AS review_count,
               (SELECT COUNT(*)::int FROM products p
                 WHERE p.vendor_id = vp.id AND p.is_active = true AND p.moderation_status = 'approved') AS product_count,
+              -- The shop's main categories (most products first, up to 3), for the card's chips.
+              (SELECT COALESCE(array_agg(c.category ORDER BY c.n DESC, c.category), '{}')
+                 FROM (SELECT p.category, COUNT(*) AS n FROM products p
+                        WHERE p.vendor_id = vp.id AND p.is_active = true AND p.moderation_status = 'approved'
+                          AND p.category IS NOT NULL AND trim(p.category) <> ''
+                        GROUP BY p.category ORDER BY n DESC, p.category LIMIT 3) c) AS top_categories,
               CASE WHEN vp.latitude IS NOT NULL AND vp.longitude IS NOT NULL
                         AND $1::float8 IS NOT NULL AND $2::float8 IS NOT NULL
                    THEN earth_distance(ll_to_earth($1, $2), ll_to_earth(vp.latitude, vp.longitude)) / 1000

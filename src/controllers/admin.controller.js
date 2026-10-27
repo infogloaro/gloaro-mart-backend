@@ -3,6 +3,7 @@ const { STATUS_FLOW, recordStatusChange } = require('./order.controller');
 const { creditWalletForOrder } = require('./wallet.controller');
 const { settleCodForOrder } = require('./payment.controller');
 const { attachTiers } = require('./product.controller');
+const { setProductAttributeValues } = require('./catalogue.controller');
 const { settleStockForOrder, setSimpleStock } = require('../services/inventory');
 const { bumpMetrics, metricsForTransition } = require('../services/matching');
 const { recordAudit } = require('../services/auditLog');
@@ -737,6 +738,14 @@ async function updateAnyProduct(req, res) {
       });
       const { rows: fresh } = await client.query('SELECT * FROM products WHERE id = $1', [product.id]);
       product = fresh[0];
+    }
+    // The product's filter facts (Material, RAM …): a list replaces them, [] clears.
+    if (Array.isArray(body.attributeValueIds)) {
+      const problem = await setProductAttributeValues(client, product.id, body.attributeValueIds);
+      if (problem) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: problem });
+      }
     }
     await client.query('COMMIT');
   } catch (err) {

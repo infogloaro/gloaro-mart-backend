@@ -12,7 +12,63 @@ const pool = require('../config/db');
 const AVERAGE_SPEED_KMPH = 20;
 const DEFAULT_PREPARATION_MINUTES = 30;
 
-const SORTS = ['relevance', 'price_asc', 'price_desc', 'newest', 'discount', 'nearest', 'fastest', 'rating', 'popular'];
+const SORTS = ['relevance', 'price_asc', 'price_desc', 'newest', 'discount', 'nearest', 'fastest', 'rating', 'popular', 'top_rated'];
+
+/**
+ * Attribute filters from the query string: attr[3]=7 or attr[3]=7,9 (any of
+ * the values of attribute 3; several attributes must all match).
+ *
+ * Express 5's default "simple" query parser leaves `attr[3]` as one flat key
+ * rather than nesting it under `attr`, so both shapes are read — and it is
+ * `attr[<attributeId>]` for one reason: the key keeps the attribute, so the
+ * app can group the chosen values per attribute without a second lookup.
+ *
+ * @returns {Map<number, number[]>} attribute id → chosen value ids
+ */
+function parseAttrFilters(query) {
+  const byAttribute = new Map();
+  const add = (attributeKey, raw) => {
+    const attributeId = Number(attributeKey);
+    const ids = toIdList(raw);
+    if (!Number.isInteger(attributeId) || attributeId <= 0 || ids.length === 0) return;
+    byAttribute.set(attributeId, [...new Set([...(byAttribute.get(attributeId) ?? []), ...ids])]);
+  };
+  for (const [key, value] of Object.entries(query)) {
+    const m = /^attr\[(\d+)\]$/.exec(key);
+    if (m) add(m[1], value);
+  }
+  if (query.attr && typeof query.attr === 'object') {
+    for (const [key, value] of Object.entries(query.attr)) add(key, value);
+  }
+  return byAttribute;
+}
+
+/** The query without any attribute filter — or without one attribute's. */
+function withoutAttrFilters(query, attributeId = null) {
+  const copy = {};
+  for (const [key, value] of Object.entries(query)) {
+    const m = /^attr\[(\d+)\]$/.exec(key);
+    if (m && (attributeId == null || Number(m[1]) === attributeId)) continue;
+    if (key === 'attr' && value && typeof value === 'object') {
+      const kept = Object.fromEntries(Object.entries(value).filter(([k]) => attributeId != null && Number(k) !== attributeId));
+      if (Object.keys(kept).length) copy.attr = kept;
+      continue;
+    }
+    copy[key] = value;
+  }
+  return copy;
+}
+
+/**
+ * A product "has" an attribute value when one of its variants is sold as it
+ * or the product itself carries it (product_attribute_values).
+ */
+const PRODUCT_VALUES = `
+  SELECT pav.product_id, pav.attribute_value_id FROM product_attribute_values pav
+  UNION
+  SELECT v.product_id, vav.attribute_value_id
+  FROM product_variants v JOIN variant_attribute_values vav ON vav.variant_id = v.id
+  WHERE v.is_active = true`;
 
 /**
  * Derived columns every listing row needs, as SQL.
@@ -97,23 +153,22 @@ function buildFilters(query) {
   if (query.categoryId) {
     conditions.push(`p.category = (SELECT c.name FROM categories c WHERE c.id = ${push(Number(query.categoryId))})`);
   }
+  // One shop, or any of several (vendorIds=3,9 — the "Sold by" filter).
+  const vendorIds = toIdList(query.vendorIds);
   if (query.vendorId) conditions.push(`p.vendor_id = ${push(Number(query.vendorId))}`);
+  else if (vendorIds.length > 0) conditions.push(`p.vendor_id = ANY(${push(vendorIds)})`);
   // Sub-category within the category (Men / Women / Mobiles …), any case.
   if (query.subcategory) conditions.push(`lower(p.subcategory) = lower(${push(String(query.subcategory))})`);
 
-  // Dynamic attribute filters, e.g. attr[3]=7 -> "has a variant with
-  // attribute_value_id 7 from attribute 3". Vendor-agnostic and category-
-  // agnostic on purpose: an attribute id already implies its category.
-  if (query.attr && typeof query.attr === 'object') {
-    for (const valueId of Object.values(query.attr)) {
-      const id = toNumber(valueId);
-      if (id == null) continue;
-      conditions.push(
-        `EXISTS (SELECT 1 FROM product_variants v
-                 JOIN variant_attribute_values vav ON vav.variant_id = v.id
-                 WHERE v.product_id = p.id AND vav.attribute_value_id = ${push(id)})`
-      );
-    }
+  // Dynamic attribute filters, e.g. attr[3]=7,9 -> "is sold as (or carries)
+  // value 7 or 9 of attribute 3"; attr[3]=… and attr[5]=… must both hold.
+  // Vendor-agnostic and category-agnostic on purpose: an attribute id already
+  // implies its category.
+  for (const valueIds of parseAttrFilters(query).values()) {
+    conditions.push(
+      `EXISTS (SELECT 1 FROM (${PRODUCT_VALUES}) pv
+               WHERE pv.product_id = p.id AND pv.attribute_value_id = ANY(${push(valueIds)}))`
+    );
   }
 
   const brandIds = toIdList(query.brandId ?? query.brandIds);
@@ -140,9 +195,15 @@ function buildFilters(query) {
     );
   }
 
+  // minRating is the SHOP's rating (kept for the apps in the field);
+  // minProductRating is the product's own, from its published reviews.
   const minRating = toNumber(query.minRating);
   if (minRating != null) {
     conditions.push(`(pm.rating_count > 0 AND pm.rating_sum / pm.rating_count >= ${push(minRating)})`);
+  }
+  const minProductRating = toNumber(query.minProductRating);
+  if (minProductRating != null) {
+    conditions.push(`(p.rating_count > 0 AND p.rating_average >= ${push(minProductRating)})`);
   }
 
   const maxEta = toNumber(query.maxEtaMinutes);
@@ -184,6 +245,9 @@ function orderBy(sort, hasQuery) {
       return 'eta_minutes ASC NULLS LAST, p.created_at DESC';
     case 'rating':
       return 'vendor_rating DESC NULLS LAST, p.created_at DESC';
+    case 'top_rated':
+      // The product's own reviews; among equals, the more-reviewed first.
+      return 'p.rating_average DESC NULLS LAST, p.rating_count DESC, p.created_at DESC';
     case 'popular':
       // Units sold across the product's stock rows; newest first among equals.
       return '(SELECT COALESCE(SUM(i.sold_qty), 0) FROM inventory i WHERE i.product_id = p.id) DESC, p.created_at DESC';
@@ -284,28 +348,26 @@ async function loadFacets(query) {
 
   // Attribute facets (RAM, size, fabric, ...) only make sense once the
   // customer has narrowed to one category — a mixed catalogue has no shared
-  // attribute set to offer chips for. Scoped to the full current filter set
-  // (category included) rather than one of the "without X" scopes above,
-  // since attributes are meant to narrow further, not replace the category.
-  const fullScope = buildFilters(query);
-  const attributesPromise = query.category
-    ? pool.query(
-        `SELECT pa.id AS attribute_id, pa.name AS attribute_name,
-                av.id AS value_id, av.value, COUNT(DISTINCT p.id)::int AS count
-         FROM products p
-         JOIN product_variants v ON v.product_id = p.id
-         JOIN variant_attribute_values vav ON vav.variant_id = v.id
-         JOIN attribute_values av ON av.id = vav.attribute_value_id
-         JOIN product_attributes pa ON pa.id = av.attribute_id AND pa.is_active = true
-         ${JOINS}
-         ${fullScope.where}
-         GROUP BY pa.id, pa.name, pa.sort_order, av.id, av.value, av.sort_order
-         ORDER BY pa.sort_order ASC, av.sort_order ASC`,
-        fullScope.params
-      )
-    : Promise.resolve({ rows: [] });
+  // attribute set to offer chips for. Counted against the full current filter
+  // set (category included), since attributes narrow further rather than
+  // replace the category — except each attribute's own filter, which is left
+  // out the way brands are, so a second size can still be ticked.
+  const attributesPromise = query.category || query.categoryId ? loadAttributeFacets(query) : Promise.resolve([]);
 
-  const [brands, categories, price, attributeRows, subcategories] = await Promise.all([
+  // Shops among the results (counted without the shop filter) for "Sold by".
+  const withoutVendor = { ...query };
+  delete withoutVendor.vendorId;
+  delete withoutVendor.vendorIds;
+  const vendorScope = buildFilters(withoutVendor);
+
+  // Whether rating and discount filters have anything to bite on, so the app
+  // can hide a filter that no product here could ever match.
+  const withoutQuality = { ...query };
+  delete withoutQuality.minProductRating;
+  delete withoutQuality.minDiscountPercent;
+  const qualityScope = buildFilters(withoutQuality);
+
+  const [brands, categories, price, attributes, subcategories, vendors, quality] = await Promise.all([
     pool.query(
       `SELECT b.id, b.name, COUNT(*)::int AS count
        FROM products p ${JOINS} ${brandScope.where} AND p.brand_id IS NOT NULL
@@ -325,28 +387,113 @@ async function loadFacets(query) {
     ),
     attributesPromise,
     subcategoriesPromise,
+    pool.query(
+      `SELECT vp.id, vp.business_name AS name, COUNT(*)::int AS count
+       FROM products p ${JOINS} ${vendorScope.where}
+       GROUP BY vp.id, vp.business_name ORDER BY count DESC, vp.business_name ASC
+       LIMIT 200`,
+      vendorScope.params
+    ),
+    pool.query(
+      `SELECT COUNT(*) FILTER (WHERE p.rating_count > 0)::int AS rated,
+              COUNT(*) FILTER (WHERE p.mrp_cents IS NOT NULL AND p.mrp_cents > p.price_cents)::int AS discounted
+       FROM products p ${JOINS} ${qualityScope.where}`,
+      qualityScope.params
+    ),
   ]);
-
-  // Group the flat value rows back into one entry per attribute, in the
-  // shape the filter sheet renders: a labelled group of value chips.
-  const attributesById = new Map();
-  for (const row of attributeRows.rows) {
-    if (!attributesById.has(row.attribute_id)) {
-      attributesById.set(row.attribute_id, { id: row.attribute_id, name: row.attribute_name, values: [] });
-    }
-    attributesById.get(row.attribute_id).values.push({ id: row.value_id, value: row.value, count: row.count });
-  }
 
   return {
     brands: brands.rows,
     categories: categories.rows,
     subcategories: subcategories.rows,
+    vendors: vendors.rows,
     priceRange: {
       minPriceCents: price.rows[0]?.min_price_cents ?? 0,
       maxPriceCents: price.rows[0]?.max_price_cents ?? 0,
     },
-    attributes: [...attributesById.values()],
+    ratedProducts: quality.rows[0]?.rated ?? 0,
+    discountedProducts: quality.rows[0]?.discounted ?? 0,
+    attributes,
   };
+}
+
+/**
+ * Attribute facets: every filterable attribute that a product in scope carries
+ * (through a variant or directly), with its values and how many products have
+ * each. Attributes meant for certain sub-categories only (Sleeve → Men,
+ * Women) are left out once a different sub-category is chosen.
+ *
+ * Counted against the full filter set — except the attribute's own filter:
+ * one query for the attributes without a selection, and one per selected
+ * attribute with that attribute's values removed from the WHERE, so the
+ * customer sees what a second Size would give them.
+ */
+async function loadAttributeFacets(query) {
+  const selected = parseAttrFilters(query);
+
+  const facetRows = async (scopeQuery, onlyAttributeId) => {
+    const scope = buildFilters(scopeQuery);
+    const params = [...scope.params, query.subcategory ? String(query.subcategory) : null];
+    const subParam = `$${params.length}`;
+    let only = '';
+    if (onlyAttributeId != null) {
+      params.push(onlyAttributeId);
+      only = `AND pa.id = $${params.length}`;
+    }
+    const { rows } = await pool.query(
+      `WITH scope AS (SELECT p.id FROM products p ${JOINS} ${scope.where})
+       SELECT pa.id AS attribute_id, pa.name AS attribute_name, pa.code, pa.filter_kind, pa.unit,
+              pa.subcategories, pa.sort_order AS attribute_order,
+              av.id AS value_id, av.value, av.color_hex, av.sort_order AS value_order,
+              COUNT(DISTINCT pv.product_id)::int AS count
+       FROM (${PRODUCT_VALUES}) pv
+       JOIN scope ON scope.id = pv.product_id
+       JOIN attribute_values av ON av.id = pv.attribute_value_id
+       JOIN product_attributes pa ON pa.id = av.attribute_id AND pa.is_active = true AND pa.is_filter = true
+       WHERE (pa.subcategories IS NULL OR ${subParam}::text IS NULL
+              OR EXISTS (SELECT 1 FROM unnest(pa.subcategories) s WHERE lower(s) = lower(${subParam}::text)))
+         ${only}
+       GROUP BY pa.id, av.id
+       ORDER BY pa.sort_order ASC, pa.id ASC, av.sort_order ASC, av.id ASC`,
+      params
+    );
+    return rows;
+  };
+
+  const [plain, ...perSelected] = await Promise.all([
+    facetRows(query, null),
+    ...[...selected.keys()].map((attributeId) => facetRows(withoutAttrFilters(query, attributeId), attributeId)),
+  ]);
+
+  // Group the flat value rows back into one entry per attribute, in the
+  // shape the filter page renders: a labelled group of value chips.
+  const attributesById = new Map();
+  const take = (rows) => {
+    for (const row of rows) {
+      if (!attributesById.has(row.attribute_id)) {
+        attributesById.set(row.attribute_id, {
+          id: row.attribute_id,
+          name: row.attribute_name,
+          code: row.code,
+          filterKind: row.filter_kind,
+          unit: row.unit,
+          subcategories: row.subcategories,
+          sortOrder: row.attribute_order,
+          values: [],
+        });
+      }
+      attributesById.get(row.attribute_id).values.push({
+        id: row.value_id,
+        value: row.value,
+        colorHex: row.color_hex,
+        count: row.count,
+      });
+    }
+  };
+  take(plain.filter((row) => !selected.has(row.attribute_id)));
+  for (const rows of perSelected) take(rows);
+
+  return [...attributesById.values()].sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
 }
 
 /**

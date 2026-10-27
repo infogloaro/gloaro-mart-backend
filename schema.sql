@@ -3985,12 +3985,36 @@ CREATE TABLE IF NOT EXISTS app_strings (
 -- uses the default). Also meant for choosing WhatsApp template languages.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_language VARCHAR(5) REFERENCES app_languages(code) ON DELETE SET NULL;
 
+-- ===== FILTER ATTRIBUTES (F3) =====
+-- The attribute registry doubles as the category filter definitions the app
+-- builds its Filters page from (scripts/migrate-filter-attributes.js).
+-- is_filter: offered as a filter at all. filter_kind: how the app draws it —
+-- chips (Size), swatch (Colour, with attribute_values.color_hex), range
+-- (Screen size, with unit) or toggle (Organic: one value, on/off).
+-- subcategories: NULL = the whole category; else only once one of these
+-- sub-categories is chosen (Sleeve → Men / Women / Kids, not Accessories).
+ALTER TABLE product_attributes ADD COLUMN IF NOT EXISTS is_filter BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE product_attributes ADD COLUMN IF NOT EXISTS filter_kind TEXT NOT NULL DEFAULT 'chips'
+  CHECK (filter_kind IN ('chips', 'swatch', 'range', 'toggle'));
+ALTER TABLE product_attributes ADD COLUMN IF NOT EXISTS unit TEXT;
+ALTER TABLE product_attributes ADD COLUMN IF NOT EXISTS subcategories TEXT[];
+ALTER TABLE attribute_values ADD COLUMN IF NOT EXISTS color_hex TEXT;
+
+-- Product-level attribute values: facts that don't make a variant (Material,
+-- RAM of a phone sold without variants, Organic). Search filters and counts
+-- these together with variant_attribute_values.
+CREATE TABLE IF NOT EXISTS product_attribute_values (
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  attribute_value_id INTEGER NOT NULL REFERENCES attribute_values(id) ON DELETE CASCADE,
+  PRIMARY KEY (product_id, attribute_value_id)
+);
+CREATE INDEX IF NOT EXISTS idx_product_attribute_values_value ON product_attribute_values(attribute_value_id);
+
 -- ===== CAMPAIGN VIDEOS (OF9) =====
 -- A Gloaro Mart campaign's promo video for the shopper app's Offers page: a
 -- YouTube link (watch, youtu.be, Shorts), played in the app under the
 -- campaign's poster (banner_url). Checked in campaign.controller.
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS video_url TEXT;
-
 -- ===== SHOP CONTACT (AB2) =====
 -- What a shop publishes for customers on its About tab: phone, altPhone,
 -- whatsapp (Indian mobiles stored as +91…, a landline allowed for altPhone),

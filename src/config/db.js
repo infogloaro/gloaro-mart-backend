@@ -13,4 +13,10 @@ const pool = process.env.DATABASE_URL
       password: process.env.DB_PASSWORD,
     });
 
+// Neon drops idle connections; without a listener pg-pool's 'error' event crashes the process.
+// The pool discards the broken client on its own, so logging is enough.
+pool.on('error', (err) => {
+  console.error('Idle DB client error:', err.message);
+});
+
 module.exports = pool;

@@ -113,8 +113,9 @@ async function getDashboard(req, res) {
 async function listAttributes(req, res) {
   const { rows } = await pool.query(
     `SELECT a.id, a.name, a.code, a.input_type, a.is_variant_defining, c.name AS category_name,
+            a.is_filter, a.filter_kind, a.unit, a.subcategories,
             COALESCE(
-              json_agg(json_build_object('id', av.id, 'value', av.value)
+              json_agg(json_build_object('id', av.id, 'value', av.value, 'colorHex', av.color_hex)
                        ORDER BY av.sort_order, av.id)
               FILTER (WHERE av.id IS NOT NULL),
               '[]'

@@ -15,7 +15,43 @@ const {
  */
 
 const INPUT_TYPES = ['select', 'text', 'number'];
+const FILTER_KINDS = ['chips', 'swatch', 'range', 'toggle'];
 const MEDIA_TYPES = ['image', 'video'];
+
+/** "#0D4FD1" or null; anything else is refused by the caller. */
+function normaliseHex(value) {
+  if (value == null || value === '') return null;
+  const s = String(value).trim();
+  return /^#?[0-9a-fA-F]{6}$/.test(s) ? `#${s.replace('#', '').toUpperCase()}` : undefined;
+}
+
+/** A sub-category list from the body: array or comma string → TEXT[] (null = all). */
+function normaliseSubcategories(value) {
+  if (value == null) return null;
+  const list = (Array.isArray(value) ? value : String(value).split(','))
+    .map((s) => String(s).trim())
+    .filter(Boolean);
+  return list.length ? list : null;
+}
+
+/**
+ * Replaces a product's own attribute values (Material: Cotton, RAM: 8 GB).
+ * Two values of one attribute are allowed on purpose — a shirt can be Cotton
+ * and Linen blend — unlike a variant, which is one thing.
+ * Returns an error message, or null when the values were written.
+ */
+async function setProductAttributeValues(client, productId, valueIds) {
+  const ids = [...new Set((Array.isArray(valueIds) ? valueIds : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (ids.length) {
+    const { rows } = await client.query('SELECT id FROM attribute_values WHERE id = ANY($1)', [ids]);
+    if (rows.length !== ids.length) return 'One or more attribute values do not exist';
+  }
+  await client.query('DELETE FROM product_attribute_values WHERE product_id = $1', [productId]);
+  for (const id of ids) {
+    await client.query('INSERT INTO product_attribute_values (product_id, attribute_value_id) VALUES ($1, $2)', [productId, id]);
+  }
+  return null;
+}
 
 /** 'Red / Large' — what the customer saw, snapshotted onto the order line. */
 function variantLabel(values) {
@@ -88,8 +124,9 @@ async function loadProductCatalogue(productId) {
   // product's category, plus the ones that apply everywhere.
   const { rows: attributes } = await pool.query(
     `SELECT a.id, a.name, a.code, a.input_type, a.is_variant_defining, a.sort_order,
+            a.is_filter, a.filter_kind, a.unit, a.subcategories,
             COALESCE(
-              json_agg(json_build_object('id', av.id, 'value', av.value)
+              json_agg(json_build_object('id', av.id, 'value', av.value, 'colorHex', av.color_hex)
                        ORDER BY av.sort_order, av.id)
               FILTER (WHERE av.id IS NOT NULL),
               '[]'
@@ -106,7 +143,26 @@ async function loadProductCatalogue(productId) {
     [productId]
   );
 
+  // The product's own values (Material: Cotton) — what the page shows under
+  // "Product details" and what the filters match on besides variants.
+  const { rows: productValues } = await pool.query(
+    `SELECT av.id AS value_id, av.value, a.id AS attribute_id, a.code, a.name
+     FROM product_attribute_values pav
+     JOIN attribute_values av ON av.id = pav.attribute_value_id
+     JOIN product_attributes a ON a.id = av.attribute_id
+     WHERE pav.product_id = $1
+     ORDER BY a.sort_order ASC, a.id ASC, av.sort_order ASC, av.id ASC`,
+    [productId]
+  );
+
   return {
+    attributeValues: productValues.map((r) => ({
+      attributeId: r.attribute_id,
+      code: r.code,
+      name: r.name,
+      valueId: r.value_id,
+      value: r.value,
+    })),
     media: media.map((m) => ({
       id: m.id,
       variantId: m.variant_id,
@@ -136,6 +192,10 @@ async function loadProductCatalogue(productId) {
       code: a.code,
       inputType: a.input_type,
       isVariantDefining: a.is_variant_defining,
+      isFilter: a.is_filter,
+      filterKind: a.filter_kind,
+      unit: a.unit,
+      subcategories: a.subcategories,
       values: a.values,
     })),
   };
@@ -173,7 +233,7 @@ async function listAttributes(req, res) {
   const { rows } = await pool.query(
     `SELECT a.*, c.name AS category_name,
             COALESCE(
-              json_agg(json_build_object('id', av.id, 'value', av.value, 'sortOrder', av.sort_order)
+              json_agg(json_build_object('id', av.id, 'value', av.value, 'sortOrder', av.sort_order, 'colorHex', av.color_hex)
                        ORDER BY av.sort_order, av.id)
               FILTER (WHERE av.id IS NOT NULL),
               '[]'
@@ -190,17 +250,33 @@ async function listAttributes(req, res) {
 }
 
 async function createAttribute(req, res) {
-  const { name, code, categoryId, inputType, isVariantDefining, sortOrder } = req.body || {};
+  const { name, code, categoryId, inputType, isVariantDefining, sortOrder, isFilter, filterKind, unit, subcategories } =
+    req.body || {};
   if (!name || !code) return res.status(400).json({ message: 'name and code are required' });
   if (inputType && !INPUT_TYPES.includes(inputType)) {
     return res.status(400).json({ message: `inputType must be one of ${INPUT_TYPES.join(', ')}` });
   }
+  if (filterKind && !FILTER_KINDS.includes(filterKind)) {
+    return res.status(400).json({ message: `filterKind must be one of ${FILTER_KINDS.join(', ')}` });
+  }
 
   try {
     const { rows } = await pool.query(
-      `INSERT INTO product_attributes (name, code, category_id, input_type, is_variant_defining, sort_order)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [name, code, categoryId ?? null, inputType || 'select', isVariantDefining ?? true, sortOrder ?? 0]
+      `INSERT INTO product_attributes
+         (name, code, category_id, input_type, is_variant_defining, sort_order, is_filter, filter_kind, unit, subcategories)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [
+        name,
+        code,
+        categoryId ?? null,
+        inputType || 'select',
+        isVariantDefining ?? true,
+        sortOrder ?? 0,
+        isFilter ?? true,
+        filterKind || 'chips',
+        unit || null,
+        normaliseSubcategories(subcategories),
+      ]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -210,12 +286,18 @@ async function createAttribute(req, res) {
 }
 
 async function updateAttribute(req, res) {
-  const { name, categoryId, inputType, isVariantDefining, sortOrder, isActive } = req.body || {};
+  const { name, categoryId, inputType, isVariantDefining, sortOrder, isActive, isFilter, filterKind, unit, subcategories } =
+    req.body || {};
   if (inputType && !INPUT_TYPES.includes(inputType)) {
     return res.status(400).json({ message: `inputType must be one of ${INPUT_TYPES.join(', ')}` });
   }
+  if (filterKind && !FILTER_KINDS.includes(filterKind)) {
+    return res.status(400).json({ message: `filterKind must be one of ${FILTER_KINDS.join(', ')}` });
+  }
+  const body = req.body || {};
   // code is deliberately not updatable: it is what a variant's meaning is keyed
   // on everywhere else, and renaming it silently re-points existing data.
+  // unit and subcategories: absent leaves them, an empty value clears them.
   const { rows } = await pool.query(
     `UPDATE product_attributes SET
        name = COALESCE($2, name),
@@ -223,9 +305,27 @@ async function updateAttribute(req, res) {
        input_type = COALESCE($4, input_type),
        is_variant_defining = COALESCE($5, is_variant_defining),
        sort_order = COALESCE($6, sort_order),
-       is_active = COALESCE($7, is_active)
+       is_active = COALESCE($7, is_active),
+       is_filter = COALESCE($8, is_filter),
+       filter_kind = COALESCE($9, filter_kind),
+       unit = CASE WHEN $10::boolean THEN NULLIF(trim($11::text), '') ELSE unit END,
+       subcategories = CASE WHEN $12::boolean THEN $13::text[] ELSE subcategories END
      WHERE id = $1 RETURNING *`,
-    [req.params.id, name, categoryId, inputType, isVariantDefining, sortOrder, isActive]
+    [
+      req.params.id,
+      name,
+      categoryId,
+      inputType,
+      isVariantDefining,
+      sortOrder,
+      isActive,
+      isFilter,
+      filterKind,
+      'unit' in body,
+      unit == null ? '' : String(unit),
+      'subcategories' in body,
+      normaliseSubcategories(subcategories),
+    ]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Attribute not found' });
   res.json(rows[0]);
@@ -254,16 +354,18 @@ async function listAttributeValues(req, res) {
 }
 
 async function createAttributeValue(req, res) {
-  const { value, sortOrder } = req.body || {};
+  const { value, sortOrder, colorHex } = req.body || {};
   if (!value) return res.status(400).json({ message: 'value is required' });
+  const hex = normaliseHex(colorHex);
+  if (hex === undefined) return res.status(400).json({ message: 'colorHex must look like #RRGGBB' });
 
   const { rows: attr } = await pool.query('SELECT 1 FROM product_attributes WHERE id = $1', [req.params.id]);
   if (!attr[0]) return res.status(404).json({ message: 'Attribute not found' });
 
   try {
     const { rows } = await pool.query(
-      'INSERT INTO attribute_values (attribute_id, value, sort_order) VALUES ($1, $2, $3) RETURNING *',
-      [req.params.id, value, sortOrder ?? 0]
+      'INSERT INTO attribute_values (attribute_id, value, sort_order, color_hex) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.params.id, value, sortOrder ?? 0, hex]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -273,11 +375,14 @@ async function createAttributeValue(req, res) {
 }
 
 async function updateAttributeValue(req, res) {
-  const { value, sortOrder } = req.body || {};
+  const { value, sortOrder, colorHex } = req.body || {};
+  const hex = normaliseHex(colorHex);
+  if (hex === undefined) return res.status(400).json({ message: 'colorHex must look like #RRGGBB' });
   const { rows } = await pool.query(
-    `UPDATE attribute_values SET value = COALESCE($3, value), sort_order = COALESCE($4, sort_order)
+    `UPDATE attribute_values SET value = COALESCE($3, value), sort_order = COALESCE($4, sort_order),
+       color_hex = CASE WHEN $5::boolean THEN $6::text ELSE color_hex END
      WHERE id = $2 AND attribute_id = $1 RETURNING *`,
-    [req.params.id, req.params.valueId, value, sortOrder]
+    [req.params.id, req.params.valueId, value, sortOrder, 'colorHex' in (req.body || {}), hex]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Value not found' });
   res.json(rows[0]);
@@ -640,6 +745,7 @@ module.exports = {
   variantLabel,
   loadProductCatalogue,
   loadVariantValues,
+  setProductAttributeValues,
   listAttributes,
   createAttribute,
   updateAttribute,
