@@ -45,7 +45,14 @@ const MODULES = [
     routes: ["products", "media"],
     covers: ["Products", "Product Variants", "Product Moderation"],
   },
-  { key: "categories", label: "Categories", group: "Catalogue", routes: ["categories"] },
+  {
+    key: "categories",
+    label: "Categories",
+    group: "Catalogue",
+    // NS4: the Near Me service categories and service moderation too.
+    routes: ["categories", "service-categories", "services"],
+    covers: ["Categories", "Service categories", "Services"],
+  },
   { key: "brands", label: "Brands", group: "Catalogue", routes: ["brands"] },
   { key: "attributes", label: "Attributes", group: "Catalogue", routes: ["attributes"] },
   { key: "catalogue_import", label: "Bulk Import / Export", group: "Catalogue", routes: ["catalogue"] },

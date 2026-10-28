@@ -67,6 +67,8 @@ app.use("/api/webhooks/platforms", require("./routes/platformWebhook.routes"));
 app.use("/api/bot", require("./routes/bot.routes"));
 app.use("/api/ads", require("./routes/ads.routes"));
 app.use("/api/enquiries", require("./routes/enquiry.routes"));
+app.use("/api/services", require("./routes/services.routes"));
+app.use("/api/bookings", require("./routes/bookings.routes"));
 // Public: running discount campaigns, for the shopper app to show.
 app.get("/api/campaigns/active", require("./controllers/campaign.controller").publicCampaigns);
 // Public: the app's home screen sections, live ones only, in order.

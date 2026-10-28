@@ -16,6 +16,71 @@ const TOPICS = [
   { code: 'other', label: 'Something else' },
 ];
 const TOPIC_CODES = TOPICS.map((t) => t.code);
+// NS7: a request for one of the shop's services, sent from its service page
+// (not offered in the "Ask the shop" topic list).
+const SERVICE_TOPIC = { code: 'service', label: 'Service request' };
+const SLOTS = ['morning', 'afternoon', 'evening', 'any'];
+const MAX_PHOTOS = 4;
+const MAX_DAYS_AHEAD = 60;
+const PHOTO_PATH = /^\/uploads\/enquiries\/[\w.-]+\.(jpg|jpeg|png|webp)$/;
+const topicLabel = (code) => (code === SERVICE_TOPIC.code ? SERVICE_TOPIC : TOPICS.find((t) => t.code === code))?.label;
+
+/**
+ * A DATE column as YYYY-MM-DD. pg hands DATEs over as local midnight, so
+ * the local parts are the day; toISOString() would roll east-of-UTC days back.
+ */
+const dayText = (d) => {
+  if (!d) return null;
+  if (!(d instanceof Date)) return String(d).slice(0, 10);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+/** Today's date in India as YYYY-MM-DD (shops and customers both keep Indian time). */
+const todayInIndia = (now = new Date()) => now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+/**
+ * The service part of a request: an active service of this shop in an
+ * active category, a day from today to 60 days ahead, a part of the day,
+ * the visit address when the service is only done at home, and up to 4
+ * photos uploaded first under /uploads/enquiries.
+ */
+async function readServiceRequest(body, vendorId, now = new Date()) {
+  const serviceId = readId(body.serviceId, 'Service');
+  const { rows } = await pool.query(
+    `SELECT s.id, s.title, s.at_home, s.at_shop FROM vendor_services s
+     JOIN service_categories c ON c.id = s.category_id
+     WHERE s.id = $1 AND s.vendor_id = $2 AND s.status = 'active' AND c.is_active`,
+    [serviceId, vendorId]
+  );
+  if (!rows[0]) throw new EnquiryError(400, "This shop isn't offering that service right now.");
+  const service = rows[0];
+
+  const date = text(body.preferredDate);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(`${date}T00:00:00Z`))) {
+    throw new EnquiryError(400, 'Pick the day you would like it.');
+  }
+  const today = todayInIndia(now);
+  const last = new Date(Date.parse(`${today}T00:00:00Z`) + MAX_DAYS_AHEAD * 86400000).toISOString().slice(0, 10);
+  if (date < today) throw new EnquiryError(400, 'Pick today or a later day.');
+  if (date > last) throw new EnquiryError(400, `Pick a day within the next ${MAX_DAYS_AHEAD} days.`);
+
+  const slot = text(body.preferredSlot) || 'any';
+  if (!SLOTS.includes(slot)) throw new EnquiryError(400, `preferredSlot is one of ${SLOTS.join(', ')}.`);
+
+  const address = text(body.visitAddress);
+  if (address.length > 400) throw new EnquiryError(400, 'Keep the address under 400 characters.');
+  if (service.at_home && !service.at_shop && address.length < 10) {
+    throw new EnquiryError(400, 'Add the address where the work is to be done.');
+  }
+
+  if (body.photos != null && !Array.isArray(body.photos)) throw new EnquiryError(400, 'photos must be a list.');
+  const photos = [...new Set((body.photos ?? []).map((p) => text(p)).filter(Boolean))];
+  if (photos.length > MAX_PHOTOS) throw new EnquiryError(400, `Add at most ${MAX_PHOTOS} photos.`);
+  if (!photos.every((p) => PHOTO_PATH.test(p))) throw new EnquiryError(400, 'Upload each photo first.');
+
+  return { service, date, slot, address: address || null, photos };
+}
 const MAX_BODY = 2000;
 const MAX_QTY = 1000000;
 const MAX_NEW_PER_DAY = 20;
@@ -57,6 +122,8 @@ function listSql(side) {
   const other = side === 'customer' ? 'vendor' : 'customer';
   return `
     SELECT e.*, vp.business_name, vp.logo_url, u.full_name AS customer_name,
+           -- NS9: the customer's review of a service request, if any.
+           (SELECT json_build_object('rating', sr.rating, 'comment', sr.comment) FROM service_reviews sr WHERE sr.enquiry_id = e.id) AS service_review,
            (SELECT m.body FROM shop_enquiry_messages m WHERE m.enquiry_id = e.id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last_message,
            (SELECT COUNT(*)::int FROM shop_enquiry_messages m
              WHERE m.enquiry_id = e.id AND m.author_role = '${other}'
@@ -73,9 +140,17 @@ function summary(r, side) {
     shop: { id: r.vendor_id, name: r.business_name, logoUrl: r.logo_url },
     ...(side === 'vendor' ? { customer: { name: r.customer_name } } : {}),
     topic: r.topic,
-    topicLabel: TOPICS.find((t) => t.code === r.topic)?.label,
+    topicLabel: topicLabel(r.topic),
     product: r.product_id || r.product_name ? { id: r.product_id, name: r.product_name } : null,
     quantity: r.quantity,
+    // NS7: what a service request asked for.
+    service: r.service_id || r.service_title ? { id: r.service_id, title: r.service_title } : null,
+    preferredDate: dayText(r.preferred_date),
+    preferredSlot: r.preferred_slot ?? null,
+    visitAddress: r.visit_address ?? null,
+    photos: r.photos ?? [],
+    serviceDoneAt: r.service_done_at ?? null,
+    review: r.service_review ?? null,
     status: r.status,
     lastMessage: r.last_message,
     lastMessageFrom: r.last_message_from,
@@ -109,8 +184,10 @@ async function thread(id, side) {
 async function create(userId, body = {}) {
   const vendorId = readId(body.vendorId, 'Shop');
   const topic = text(body.topic);
-  if (!TOPIC_CODES.includes(topic)) throw new EnquiryError(400, `topic is one of ${TOPIC_CODES.join(', ')}.`);
-  const message = readBody(body.message);
+  const isService = topic === SERVICE_TOPIC.code;
+  if (!TOPIC_CODES.includes(topic) && !isService) throw new EnquiryError(400, `topic is one of ${TOPIC_CODES.join(', ')}.`);
+  // A service request may come without a note: the request itself says what is wanted.
+  const message = isService && !text(body.message) ? null : readBody(body.message);
   let quantity = null;
   if (body.quantity != null && body.quantity !== '') {
     quantity = Number(body.quantity);
@@ -121,8 +198,18 @@ async function create(userId, body = {}) {
   const { rows: shop } = await pool.query("SELECT id, user_id, business_name FROM vendor_profiles WHERE id = $1 AND status = 'approved'", [vendorId]);
   if (!shop[0]) throw new EnquiryError(404, 'Shop not found');
   if (shop[0].user_id === userId) throw new EnquiryError(400, "You can't send an enquiry to your own shop.");
+  const request = isService ? await readServiceRequest(body, vendorId) : null;
+  if (request) {
+    const { rows: same } = await pool.query(
+      "SELECT reference FROM shop_enquiries WHERE user_id = $1 AND service_id = $2 AND status <> 'closed' LIMIT 1",
+      [userId, request.service.id]
+    );
+    if (same[0]) {
+      throw new EnquiryError(409, `You already asked for this service (${same[0].reference}). Reply there, or close it to ask again.`);
+    }
+  }
   let product = null;
-  if (body.productId != null) {
+  if (!isService && body.productId != null) {
     const productId = readId(body.productId, 'Product');
     const { rows } = await pool.query(
       "SELECT id, name FROM products WHERE id = $1 AND vendor_id = $2 AND is_active = true AND moderation_status = 'approved'",
@@ -168,14 +255,21 @@ async function create(userId, body = {}) {
     const { rows: seq } = await client.query("SELECT nextval('shop_enquiry_ref_seq') AS n");
     const reference = `ENQ-${new Date().getFullYear()}-${String(seq[0].n).padStart(5, '0')}`;
     const { rows } = await client.query(
-      `INSERT INTO shop_enquiries (reference, vendor_id, user_id, topic, product_id, product_name, quantity, ad_campaign_id, customer_read_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now()) RETURNING id`,
-      [reference, vendorId, userId, topic, product?.id ?? null, product?.name ?? null, quantity, adCampaignId]
+      `INSERT INTO shop_enquiries (reference, vendor_id, user_id, topic, product_id, product_name, quantity, ad_campaign_id, customer_read_at,
+                                   service_id, service_title, preferred_date, preferred_slot, visit_address, photos)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9, $10, $11, $12, $13, $14) RETURNING id`,
+      [reference, vendorId, userId, topic, product?.id ?? null, product?.name ?? null, quantity, adCampaignId,
+        request?.service.id ?? null, request?.service.title ?? null, request?.date ?? null, request?.slot ?? null,
+        request?.address ?? null, request?.photos ?? []]
     );
     id = rows[0].id;
-    await client.query("INSERT INTO shop_enquiry_messages (enquiry_id, author_role, author_user_id, body) VALUES ($1, 'customer', $2, $3)", [id, userId, message]);
-    const about = product ? ` about ${product.name}` : '';
-    await notify(client, shop[0].user_id, `New question${about} (${reference})`, message, `/vendor/enquiries/${id}`);
+    // The first message: the note, or for a bare service request what was asked for.
+    const first = message ?? `Service request: ${request.service.title} on ${request.date}${request.slot === 'any' ? '' : ` (${request.slot})`}.`;
+    await client.query("INSERT INTO shop_enquiry_messages (enquiry_id, author_role, author_user_id, body) VALUES ($1, 'customer', $2, $3)", [id, userId, first]);
+    const title = request
+      ? `New service request: ${request.service.title} (${reference})`
+      : `New question${product ? ` about ${product.name}` : ''} (${reference})`;
+    await notify(client, shop[0].user_id, title, first, `/vendor/enquiries/${id}`);
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -257,4 +351,4 @@ async function close(rawId, side, ownerId) {
   return thread(e.id, side);
 }
 
-module.exports = { EnquiryError, TOPICS, create, open, list, reply, close };
+module.exports = { EnquiryError, TOPICS, SERVICE_TOPIC, create, open, list, reply, close, readServiceRequest, todayInIndia };

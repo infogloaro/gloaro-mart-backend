@@ -4022,3 +4022,195 @@ ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS video_url TEXT;
 -- Only what the shop types in shopBranding.readContact; never the login
 -- phone or email. {} = nothing published.
 ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS contact JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- ===== SERVICES (NS1) =====
+-- Local services on Near Me (car service, AC repair, plumber, salon …). A
+-- service provider is a shop (vendor_profiles, it may sell no products), so
+-- its hours, contact, map point, reviews and enquiries are the shop's own.
+-- service_categories is admin-managed (names in en/ta/hi, picture, order);
+-- vendor_services is what a shop offers, with an honest price model:
+--   fixed      price_cents is the price
+--   from       price_cents is the starting price
+--   range      price_cents .. price_max_cents
+--   per_hour   price_cents per hour
+--   on_request no price; the provider quotes after a look
+-- visit_fee_cents is charged on top (NULL = none said). The final price is
+-- always confirmed by the provider. Pictures are image URLs; video_url is a
+-- YouTube link (same rule as campaigns). Plan: G_mart docs/WORK_PLAN.md (NS).
+CREATE TABLE IF NOT EXISTS service_categories (
+  id SERIAL PRIMARY KEY,
+  slug VARCHAR(40) NOT NULL UNIQUE,
+  name VARCHAR(60) NOT NULL,
+  name_ta VARCHAR(80),
+  name_hi VARCHAR(80),
+  group_key VARCHAR(20) NOT NULL DEFAULT 'other'
+    CHECK (group_key IN ('vehicle', 'home', 'gadgets', 'personal', 'daily', 'learning', 'events', 'health', 'other')),
+  icon_key VARCHAR(40) NOT NULL DEFAULT 'other',
+  image_url TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_categories_active ON service_categories (is_active, sort_order);
+
+CREATE TABLE IF NOT EXISTS vendor_services (
+  id SERIAL PRIMARY KEY,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  category_id INTEGER NOT NULL REFERENCES service_categories(id),
+  title VARCHAR(80) NOT NULL,
+  description VARCHAR(1500),
+  price_type VARCHAR(12) NOT NULL DEFAULT 'on_request'
+    CHECK (price_type IN ('fixed', 'from', 'range', 'per_hour', 'on_request')),
+  price_cents INTEGER CHECK (price_cents >= 0),
+  price_max_cents INTEGER CHECK (price_max_cents >= 0),
+  visit_fee_cents INTEGER CHECK (visit_fee_cents >= 0),
+  duration_minutes INTEGER CHECK (duration_minutes BETWEEN 5 AND 10080),
+  at_home BOOLEAN NOT NULL DEFAULT true,
+  at_shop BOOLEAN NOT NULL DEFAULT false,
+  images TEXT[] NOT NULL DEFAULT '{}',
+  video_url TEXT,
+  status VARCHAR(10) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'hidden')),
+  hidden_reason VARCHAR(300),
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (at_home OR at_shop),
+  CHECK (price_type = 'on_request' OR price_cents IS NOT NULL),
+  CHECK (price_type <> 'range' OR (price_max_cents IS NOT NULL AND price_max_cents >= price_cents))
+);
+CREATE INDEX IF NOT EXISTS idx_vendor_services_category ON vendor_services (category_id, status);
+CREATE INDEX IF NOT EXISTS idx_vendor_services_vendor ON vendor_services (vendor_id, sort_order);
+
+INSERT INTO service_categories (slug, name, name_ta, name_hi, group_key, icon_key, sort_order) VALUES
+  ('car-service', 'Car service & repair', 'கார் சர்வீஸ் & பழுது நீக்கம்', 'कार सर्विस और रिपेयर', 'vehicle', 'car', 10),
+  ('bike-service', 'Bike service', 'பைக் சர்வீஸ்', 'बाइक सर्विस', 'vehicle', 'bike', 20),
+  ('car-wash', 'Car wash', 'கார் வாஷ்', 'कार वॉश', 'vehicle', 'car_wash', 30),
+  ('ac-service', 'AC service & repair', 'ஏசி சர்வீஸ் & பழுது நீக்கம்', 'एसी सर्विस और रिपेयर', 'home', 'ac', 40),
+  ('electrician', 'Electrician', 'எலக்ட்ரீஷியன்', 'इलेक्ट्रीशियन', 'home', 'electrician', 50),
+  ('plumber', 'Plumber', 'பிளம்பர்', 'प्लंबर', 'home', 'plumber', 60),
+  ('carpenter', 'Carpenter', 'தச்சர்', 'बढ़ई', 'home', 'carpenter', 70),
+  ('painter', 'Painter', 'பெயிண்டர்', 'पेंटर', 'home', 'painter', 80),
+  ('ro-service', 'RO water purifier service', 'ஆர்ஓ வாட்டர் பியூரிஃபையர் சர்வீஸ்', 'आरओ वॉटर प्यूरीफायर सर्विस', 'home', 'water', 90),
+  ('appliance-repair', 'Appliance repair', 'வீட்டு உபகரணப் பழுது நீக்கம்', 'उपकरण रिपेयर', 'home', 'appliance', 100),
+  ('pest-control', 'Pest control', 'பூச்சிக் கட்டுப்பாடு', 'पेस्ट कंट्रोल', 'home', 'pest', 110),
+  ('home-cleaning', 'Home cleaning', 'வீடு சுத்தம்', 'घर की सफ़ाई', 'home', 'cleaning', 120),
+  ('mobile-repair', 'Mobile repair', 'மொபைல் பழுது நீக்கம்', 'मोबाइल रिपेयर', 'gadgets', 'mobile', 130),
+  ('laptop-repair', 'Laptop & computer repair', 'லேப்டாப் & கணினி பழுது நீக்கம்', 'लैपटॉप और कंप्यूटर रिपेयर', 'gadgets', 'laptop', 140),
+  ('salon-men', 'Men''s salon', 'ஆண்கள் சலூன்', 'मेन्स सैलून', 'personal', 'salon', 150),
+  ('beauty-parlour', 'Beauty parlour', 'பியூட்டி பார்லர்', 'ब्यूटी पार्लर', 'personal', 'beauty', 160),
+  ('tailoring', 'Tailoring', 'தையல்', 'सिलाई', 'personal', 'tailor', 170),
+  ('laundry', 'Laundry & ironing', 'சலவை & இஸ்திரி', 'लॉन्ड्री और इस्त्री', 'daily', 'laundry', 180),
+  ('tuition', 'Home tuition', 'ஹோம் டியூஷன்', 'होम ट्यूशन', 'learning', 'tuition', 190),
+  ('photographer', 'Photographer', 'புகைப்படக் கலைஞர்', 'फ़ोटोग्राफ़र', 'events', 'camera', 200)
+ON CONFLICT (slug) DO NOTHING;
+
+
+-- ===== SERVICE REQUESTS (NS7) =====
+-- "Request service" on a Near Me service page: an enquiry (SB9) with topic
+-- 'service', tied to the shop's service, with the day and part of day the
+-- customer would like, the visit address (a text copy, needed when the
+-- service is only done at home) and up to 4 photos of the job. The thread,
+-- reference, unread counts and notifications are the enquiry's own; the shop
+-- confirms the time and the final price in the thread. Rules in
+-- services/shopEnquiries.js. Plan: G_mart docs/WORK_PLAN.md (NS7).
+ALTER TABLE shop_enquiries DROP CONSTRAINT IF EXISTS shop_enquiries_topic_check;
+ALTER TABLE shop_enquiries ADD CONSTRAINT shop_enquiries_topic_check
+  CHECK (topic IN ('stock', 'variant', 'wholesale', 'delivery', 'other', 'service'));
+ALTER TABLE shop_enquiries ADD COLUMN IF NOT EXISTS service_id INTEGER REFERENCES vendor_services(id) ON DELETE SET NULL;
+ALTER TABLE shop_enquiries ADD COLUMN IF NOT EXISTS service_title TEXT;
+ALTER TABLE shop_enquiries ADD COLUMN IF NOT EXISTS preferred_date DATE;
+ALTER TABLE shop_enquiries ADD COLUMN IF NOT EXISTS preferred_slot VARCHAR(10)
+  CHECK (preferred_slot IS NULL OR preferred_slot IN ('morning', 'afternoon', 'evening', 'any'));
+ALTER TABLE shop_enquiries ADD COLUMN IF NOT EXISTS visit_address VARCHAR(400);
+ALTER TABLE shop_enquiries ADD COLUMN IF NOT EXISTS photos TEXT[] NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_shop_enquiries_service ON shop_enquiries (user_id, service_id) WHERE service_id IS NOT NULL;
+
+
+-- ===== SERVICE REVIEWS (NS9) =====
+-- After a service request (NS7) the shop marks it done (service_done_at);
+-- only then may that request's customer rate the service, once per request
+-- (editing their own review updates it). Shown on the service's page as the
+-- service's own rating; shop ratings (vendor_reviews, from orders) stay as
+-- they are. Reviewer names are shown as first name + initial. Rules in
+-- services/serviceReviews.js. Plan: G_mart docs/WORK_PLAN.md (NS9).
+ALTER TABLE shop_enquiries ADD COLUMN IF NOT EXISTS service_done_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS service_reviews (
+  id SERIAL PRIMARY KEY,
+  enquiry_id INTEGER NOT NULL UNIQUE REFERENCES shop_enquiries(id) ON DELETE CASCADE,
+  service_id INTEGER REFERENCES vendor_services(id) ON DELETE SET NULL,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  comment VARCHAR(1000),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_reviews_service ON service_reviews (service_id, created_at DESC);
+
+
+-- ===== SERVICE BOOKINGS (NS10) =====
+-- Booking a time for a shop's service (user's choices 2026-10-29): the
+-- customer pays the shop after the work (cash/UPI; Gloaro takes no payment),
+-- the free times come from the shop's own hours (shop_open_at) in 30-minute
+-- steps for the service's length, and the shop accepts each booking:
+--   pending → accepted | rejected;  accepted → in_progress | cancelled;
+--   in_progress → completed;  pending → cancelled (by the customer).
+-- The price, title and address are copied at booking time so the record says
+-- what was agreed even if the service changes later. Active bookings of a
+-- service may not overlap (checked under a lock on the service; the unique
+-- index is a backstop for the same start). Every change is kept in
+-- service_booking_events. Shops can block times (all services, or one).
+-- Rules in services/serviceBookings.js. Plan: G_mart docs/WORK_PLAN.md (NS10).
+CREATE SEQUENCE IF NOT EXISTS service_booking_ref_seq;
+
+CREATE TABLE IF NOT EXISTS service_bookings (
+  id SERIAL PRIMARY KEY,
+  reference TEXT NOT NULL UNIQUE,
+  service_id INTEGER REFERENCES vendor_services(id) ON DELETE SET NULL,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  service_title TEXT NOT NULL,
+  starts_at TIMESTAMPTZ NOT NULL,
+  ends_at TIMESTAMPTZ NOT NULL CHECK (ends_at > starts_at),
+  status VARCHAR(12) NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'accepted', 'rejected', 'in_progress', 'completed', 'cancelled')),
+  price_type VARCHAR(12) NOT NULL,
+  price_cents INTEGER,
+  price_max_cents INTEGER,
+  visit_fee_cents INTEGER,
+  at_home BOOLEAN NOT NULL,
+  visit_address VARCHAR(400),
+  note VARCHAR(1000),
+  status_note VARCHAR(300),
+  cancelled_by VARCHAR(10) CHECK (cancelled_by IS NULL OR cancelled_by IN ('customer', 'vendor')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_bookings_vendor ON service_bookings (vendor_id, starts_at);
+CREATE INDEX IF NOT EXISTS idx_service_bookings_user ON service_bookings (user_id, starts_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_service_bookings_active_slot ON service_bookings (service_id, starts_at)
+  WHERE status IN ('pending', 'accepted', 'in_progress');
+
+CREATE TABLE IF NOT EXISTS service_booking_events (
+  id SERIAL PRIMARY KEY,
+  booking_id INTEGER NOT NULL REFERENCES service_bookings(id) ON DELETE CASCADE,
+  status VARCHAR(12) NOT NULL,
+  by_role VARCHAR(10) NOT NULL CHECK (by_role IN ('customer', 'vendor')),
+  by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  note VARCHAR(300),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_booking_events_booking ON service_booking_events (booking_id, created_at);
+
+CREATE TABLE IF NOT EXISTS service_booking_blocks (
+  id SERIAL PRIMARY KEY,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  service_id INTEGER REFERENCES vendor_services(id) ON DELETE CASCADE,
+  starts_at TIMESTAMPTZ NOT NULL,
+  ends_at TIMESTAMPTZ NOT NULL CHECK (ends_at > starts_at),
+  note VARCHAR(140),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_booking_blocks_vendor ON service_booking_blocks (vendor_id, starts_at);

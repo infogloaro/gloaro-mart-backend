@@ -17,6 +17,8 @@ const quotation = require('../controllers/quotation.controller');
 const purchaseOrder = require('../controllers/purchaseOrder.controller');
 const vendorAds = require('../controllers/vendorAds.controller');
 const enquiries = require('../controllers/shopEnquiries.controller');
+const vendorServices = require('../controllers/vendorServices.controller');
+const serviceBookings = require('../controllers/serviceBookings.controller');
 const { uploadTo } = require('../controllers/upload.controller');
 
 /**
@@ -89,10 +91,27 @@ router.post('/ads/campaigns/:id/extend', vendorAds.extend);
 router.post('/ads/campaigns/:id/renew', vendorAds.renew);
 
 // Customers' questions to the shop ("Ask the shop", SB9).
+// The shop's services on Near Me → Services (NS5).
+router.get('/services', vendorServices.list);
+router.post('/services', vendorServices.create);
+router.patch('/services/:id', vendorServices.update);
+router.delete('/services/:id', vendorServices.remove);
+
+// NS10: bookings of the shop's services, and times it blocks.
+router.get('/bookings', serviceBookings.vendorList);
+router.get('/bookings/:id', serviceBookings.vendorGet);
+// accept | reject | start | complete | cancel (anything else is refused by the service).
+router.post('/bookings/:id/:action', serviceBookings.vendorMove);
+router.get('/booking-blocks', serviceBookings.vendorBlocks);
+router.post('/booking-blocks', serviceBookings.vendorAddBlock);
+router.delete('/booking-blocks/:id', serviceBookings.vendorRemoveBlock);
+
 router.get('/enquiries', enquiries.vendorList);
 router.get('/enquiries/:id', enquiries.vendorGet);
 router.post('/enquiries/:id/messages', enquiries.vendorReply);
 router.post('/enquiries/:id/close', enquiries.vendorClose);
+// NS9: the work of a service request is done (the customer is asked to rate it).
+router.post('/enquiries/:id/service-done', enquiries.vendorServiceDone);
 
 // Read-only: attributes are platform-owned, so there is no POST here.
 router.get('/attributes', portal.listAttributes);

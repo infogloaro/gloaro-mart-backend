@@ -3,6 +3,7 @@ const { requireAuth, requireRole } = require("../middleware/auth");
 const admin = require("../controllers/admin.controller");
 const banner = require("../controllers/banner.controller");
 const category = require("../controllers/category.controller");
+const adminServices = require("../controllers/adminServices.controller");
 const brand = require("../controllers/brand.controller");
 const settings = require("../controllers/settings.controller");
 const i18n = require("../controllers/i18n.controller");
@@ -332,6 +333,14 @@ router.get("/categories", category.listAllCategories);
 router.post("/categories", category.createCategory);
 router.patch("/categories/:id", category.updateCategory);
 router.delete("/categories/:id", category.deleteCategory);
+
+// NS4: Near Me service categories and service moderation.
+router.get("/service-categories", adminServices.listCategories);
+router.post("/service-categories", adminServices.createCategory);
+router.patch("/service-categories/:id", adminServices.updateCategory);
+router.delete("/service-categories/:id", adminServices.deleteCategory);
+router.get("/services", adminServices.listServices);
+router.patch("/services/:id", adminServices.moderateService);
 
 router.get("/brands", brand.listAllBrands);
 router.post("/brands", brand.createBrand);

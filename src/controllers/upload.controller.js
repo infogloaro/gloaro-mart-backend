@@ -26,6 +26,8 @@ const FOLDERS = {
   banners: 'banners',
   brands: 'brands',
   categories: 'categories',
+  // Near Me service category pictures (NS4).
+  'service-categories': 'categories',
   vendors: 'vendors',
   settings: 'settings',
   platforms: 'platforms',
