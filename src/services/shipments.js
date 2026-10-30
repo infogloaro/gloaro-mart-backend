@@ -37,11 +37,24 @@ async function codAmountFor(client, order) {
   return (rows[0]?.method ?? 'cod') === 'cod' ? order.total_cents : null;
 }
 
+/**
+ * DR3: the partner checkout chose rides on the shipment. A courier shipment
+ * still has to be booked with the courier (DR4); a re-attempt keeps the
+ * previous shipment's partner and its booking.
+ */
+function providerFor(order, previous) {
+  const provider = previous ? previous.provider ?? null : order.fulfilment_partner ?? null;
+  if (previous?.booking_status === 'booked') return { provider, bookingStatus: 'booked' };
+  return { provider, bookingStatus: provider === 'shiprocket' ? 'needs_booking' : 'not_needed' };
+}
+
 async function createShipment(client, order, { attempt = 1, previous = null, actorRole = 'system', userId = null, description }) {
+  const { provider, bookingStatus } = providerFor(order, previous);
   const { rows } = await client.query(
     `INSERT INTO shipments (tracking_number, order_id, vendor_id, partner_name, partner_phone, external_tracking_id,
-       tracking_url, package_count, weight_grams, cod_amount_cents, estimated_delivery_at, attempt_count, previous_shipment_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+       tracking_url, package_count, weight_grams, cod_amount_cents, estimated_delivery_at, attempt_count, previous_shipment_id,
+       provider, booking_status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING *`,
     [
       attempt > 1 && previous ? `${previous.tracking_number.replace(/-A\d+$/, '')}-A${attempt}` : await nextTrackingNumber(client),
       order.id,
@@ -56,6 +69,8 @@ async function createShipment(client, order, { attempt = 1, previous = null, act
       order.estimated_delivery_at ?? null,
       attempt,
       previous?.id ?? null,
+      provider,
+      bookingStatus,
     ]
   );
   await addEvent(client, rows[0].id, { status: 'created', description, actorRole, userId });
@@ -109,4 +124,4 @@ async function onOrderStatusChanged(client, order, toStatus, { actorRole = 'syst
   }
 }
 
-module.exports = { OPEN, CLOSED, RANK, addEvent, openShipmentFor, createShipment, setStatus, onOrderStatusChanged };
+module.exports = { OPEN, CLOSED, RANK, providerFor, addEvent, openShipmentFor, createShipment, setStatus, onOrderStatusChanged };

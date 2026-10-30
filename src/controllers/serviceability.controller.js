@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const { findOwnedAddress } = require('./address.controller');
 const { resolveUnitPriceCents } = require('./product.controller');
 const shopHours = require('../services/shopHours');
+const deliveryRouting = require('../services/deliveryRouting');
 
 /** Average city delivery speed used for the Phase 1 ETA. Replaced in Phase 3. */
 const AVERAGE_SPEED_KMPH = 20;
@@ -73,8 +74,17 @@ function etaMinutes(rules, distanceKm) {
  * UNRESTRICTED_LOCAL_KM) the shop still serves the address by courier unless
  * it turned ships_outside_area off: delivery only, the outstation charge, and
  * an ETA in days (etaMinutes stays null so older apps show no minutes).
+ *
+ * DR1: with delivery routing on, the shop's areas still decide whether it
+ * serves the address at all, but distance decides how: up to the routing
+ * radius it is a local delivery by the platform's riders (GoKart), beyond it
+ * a courier shipment (Shiprocket). The radius also replaces
+ * UNRESTRICTED_LOCAL_KM for shops with no areas. Without a distance (no
+ * coordinates) an in-area address stays local. `partner` names who carries it.
  */
-function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCents, hasStock }) {
+function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCents, hasStock, routing = null }) {
+  const routed = routing?.enabled === true;
+  const localKm = routed ? Number(routing.local_radius_km) : UNRESTRICTED_LOCAL_KM;
   const result = {
     vendorId: vendor.id,
     businessName: vendor.business_name,
@@ -86,6 +96,7 @@ function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCen
     freeDeliveryApplied: false,
     etaMinutes: null,
     etaDays: null,
+    partner: null,
   };
 
   if (rules.supports_delivery) result.deliveryMethods.push('delivery');
@@ -99,7 +110,7 @@ function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCen
 
   let inArea;
   if (areas.length === 0) {
-    inArea = distanceKm == null || distanceKm <= UNRESTRICTED_LOCAL_KM;
+    inArea = distanceKm == null || distanceKm <= localKm;
   } else {
     const pincodeMatch = pincodeAreas.some((a) => a.pincode === address.pincode);
     const radiusMatch =
@@ -107,8 +118,10 @@ function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCen
     inArea = pincodeMatch || radiusMatch;
   }
 
-  const courier = !inArea && rules.supports_delivery && rules.ships_outside_area !== false;
-  if (!inArea && !courier) {
+  const ships = rules.supports_delivery && rules.ships_outside_area !== false;
+  const local = routed && distanceKm != null ? distanceKm <= localKm : inArea;
+  const courier = !local && (inArea ? rules.supports_delivery : ships);
+  if (!inArea && !ships) {
     // Distinguish "we don't cover your pincode" from "you're too far", so the
     // app can say something specific rather than one generic line.
     const reason =
@@ -136,6 +149,7 @@ function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCen
       deliveryChargeCents: freeDeliveryApplied ? 0 : charge,
       freeDeliveryApplied,
       etaDays: rules.outstation_eta_days ?? DEFAULT_RULES.outstation_eta_days,
+      partner: deliveryRouting.partnerFor(routing, 'courier'),
     };
   }
 
@@ -146,6 +160,8 @@ function evaluateVendor({ vendor, areas, rules, address, distanceKm, subtotalCen
     deliveryChargeCents: freeDeliveryApplied ? 0 : rules.delivery_charge_cents || 0,
     freeDeliveryApplied,
     etaMinutes: etaMinutes(rules, distanceKm),
+    // A pickup-only shop has nobody to carry the order.
+    partner: rules.supports_delivery ? deliveryRouting.partnerFor(routing, 'local') : null,
   };
 }
 
@@ -200,10 +216,11 @@ async function evaluate({ userId, addressId, items }) {
   }
 
   const vendorIds = [...new Set(products.map((p) => p.vendor_id))];
-  const [{ rows: areaRows }, { rows: ruleRows }, openNow] = await Promise.all([
+  const [{ rows: areaRows }, { rows: ruleRows }, openNow, routing] = await Promise.all([
     pool.query('SELECT * FROM vendor_service_areas WHERE vendor_id = ANY($1) AND is_active = true', [vendorIds]),
     pool.query('SELECT * FROM vendor_delivery_rules WHERE vendor_id = ANY($1)', [vendorIds]),
     shopHours.openNowFor(vendorIds),
+    deliveryRouting.getSettings(),
   ]);
   const areasByVendor = new Map();
   for (const area of areaRows) {
@@ -244,6 +261,7 @@ async function evaluate({ userId, addressId, items }) {
       distanceKm: first.distance_km == null ? null : Number(first.distance_km),
       subtotalCents,
       hasStock,
+      routing,
     });
 
     evaluated.items = entries.map((e) => ({

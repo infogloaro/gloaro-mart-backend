@@ -24,6 +24,7 @@ const business = require('../services/business');
 const analytics = require('../services/analytics');
 const { notifyNewOrders } = require('../services/vendorNotify');
 const rewards = require('../services/rewards');
+const paymentSettings = require('../services/paymentSettings');
 const { CancellationError } = cancellations;
 
 const STATUS_FLOW = ['pending', 'confirmed', 'packed', 'out_for_delivery', 'delivered'];
@@ -69,7 +70,7 @@ function addressToLine(a) {
  * Everything payments has understood since Sprint 3. COD is the default because
  * an app build already in the field sends no method at all.
  */
-const PAYMENT_METHODS = ['cod', 'upi', 'card', 'netbanking', 'wallet', 'credit'];
+const PAYMENT_METHODS = ['cod', 'upi', 'card', 'netbanking', 'wallet', 'credit', 'online'];
 
 /**
  * The sales channel an order came through, from the X-Sales-Channel header: the
@@ -112,6 +113,13 @@ async function checkout(req, res) {
   }
   if (paymentMethod === 'credit' && !businessAccountId) {
     return res.status(400).json({ message: 'Credit is only for orders placed for a business account.' });
+  }
+  // RZ3: online (Razorpay) and COD are switched on and off from admin.
+  try {
+    await paymentSettings.assertMethodAllowed(paymentMethod);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ message: err.message });
+    throw err;
   }
   // Credit, like COD, needs nothing more from the buyer now; both commit the sale at once.
   // The customer wallet is paid in full inside this checkout, so it commits too.
@@ -184,6 +192,8 @@ async function checkout(req, res) {
   // Re-run serviceability here rather than trusting whatever the client checked
   // earlier — stock, prices and store hours move between the check and the tap.
   const deliveryChargeByVendor = new Map();
+  // DR1: how each shop's order travels, and who carries it.
+  const routeByVendor = new Map();
   if (address) {
     let serviceability;
     try {
@@ -211,6 +221,11 @@ async function checkout(req, res) {
     }
     for (const v of serviceability.vendors) {
       deliveryChargeByVendor.set(v.vendorId, deliveryMethod === 'pickup' ? 0 : v.deliveryChargeCents);
+      routeByVendor.set(v.vendorId, {
+        mode: deliveryMethod === 'pickup' ? 'pickup' : v.deliveryMode,
+        distanceKm: v.distanceKm,
+        partner: deliveryMethod === 'pickup' ? null : v.partner ?? null,
+      });
     }
   }
 
@@ -347,8 +362,9 @@ async function checkout(req, res) {
            delivery_address, coupon_id, coupon_code_snapshot,
            address_id, delivery_address_snapshot, delivery_charge_cents, delivery_method, checkout_group_id,
            sales_channel_id, campaign_discount_cents, business_account_id, origin,
-           points_redeemed, points_discount_cents)
-         VALUES ($1, $2, 'pending', $15, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $16, $17, $18, $19, $20, $21)
+           points_redeemed, points_discount_cents, delivery_mode, delivery_distance_km, fulfilment_partner)
+         VALUES ($1, $2, 'pending', $15, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $16, $17, $18, $19, $20, $21,
+           $22, $23, $24)
          RETURNING *`,
         [
           req.user.id,
@@ -374,6 +390,9 @@ async function checkout(req, res) {
           origin,
           spend.points,
           spend.cents,
+          routeByVendor.get(vendorId)?.mode ?? (deliveryMethod === 'pickup' ? 'pickup' : null),
+          routeByVendor.get(vendorId)?.distanceKm ?? null,
+          routeByVendor.get(vendorId)?.partner ?? null,
         ]
       );
       const order = orderRows[0];
@@ -470,6 +489,7 @@ async function checkout(req, res) {
         paymentMethod,
       });
     }
+    await paymentSettings.assertCodLimit(paymentMethod, groupTotals[0].total_cents, client);
     const payment = await createPaymentForGroup(client, {
       groupId: group.id,
       userId: req.user.id,

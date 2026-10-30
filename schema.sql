@@ -4214,3 +4214,74 @@ CREATE TABLE IF NOT EXISTS service_booking_blocks (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_service_booking_blocks_vendor ON service_booking_blocks (vendor_id, starts_at);
+
+
+-- ===== DELIVERY ROUTING (DR1) =====
+-- Who carries an order, decided by distance from the shop: up to
+-- local_radius_km the platform's own riders (GoKart), beyond it a courier
+-- (Shiprocket). One row, id pinned to 1. Off: shops' own areas decide local
+-- vs courier as before (SH1) and no partner is named.
+CREATE TABLE IF NOT EXISTS delivery_routing_settings (
+  id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  local_radius_km NUMERIC(6,1) NOT NULL DEFAULT 25 CHECK (local_radius_km > 0 AND local_radius_km <= 500),
+  local_partner VARCHAR(20) NOT NULL DEFAULT 'gokart' CHECK (local_partner IN ('gokart', 'manual')),
+  outstation_partner VARCHAR(20) NOT NULL DEFAULT 'shiprocket' CHECK (outstation_partner IN ('shiprocket', 'manual')),
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO delivery_routing_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- What checkout decided, kept on the order (NULL on orders placed before DR1).
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_mode VARCHAR(10);
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_delivery_mode_check;
+ALTER TABLE orders ADD CONSTRAINT orders_delivery_mode_check
+  CHECK (delivery_mode IS NULL OR delivery_mode IN ('local', 'courier', 'pickup'));
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_distance_km NUMERIC(7,2);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS fulfilment_partner VARCHAR(20);
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_fulfilment_partner_check;
+ALTER TABLE orders ADD CONSTRAINT orders_fulfilment_partner_check
+  CHECK (fulfilment_partner IS NULL OR fulfilment_partner IN ('gokart', 'shiprocket', 'manual'));
+
+-- DR3: the shipment carries the partner too (an admin may switch it), and
+-- whether a courier booking is still owed.
+ALTER TABLE shipments ADD COLUMN IF NOT EXISTS provider VARCHAR(20);
+ALTER TABLE shipments DROP CONSTRAINT IF EXISTS shipments_provider_check;
+ALTER TABLE shipments ADD CONSTRAINT shipments_provider_check
+  CHECK (provider IS NULL OR provider IN ('gokart', 'shiprocket', 'manual'));
+ALTER TABLE shipments ADD COLUMN IF NOT EXISTS booking_status VARCHAR(16) NOT NULL DEFAULT 'not_needed';
+ALTER TABLE shipments DROP CONSTRAINT IF EXISTS shipments_booking_status_check;
+ALTER TABLE shipments ADD CONSTRAINT shipments_booking_status_check
+  CHECK (booking_status IN ('not_needed', 'needs_booking', 'booked', 'failed'));
+ALTER TABLE shipments ADD COLUMN IF NOT EXISTS booking_error TEXT;
+CREATE INDEX IF NOT EXISTS idx_shipments_provider ON shipments (provider, status);
+
+-- ===== RAZORPAY PAYMENTS (RZ1) =====
+-- Online payment through Razorpay, switched on from Admin → Payment settings.
+-- The keys live on the Razorpay platform (platform_connections, encrypted);
+-- this row is what checkout offers. One row, id pinned to 1.
+CREATE TABLE IF NOT EXISTS payment_settings (
+  id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  online_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  cod_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  -- Above this order total COD is not offered; NULL = no limit.
+  cod_max_cents INTEGER CHECK (cod_max_cents IS NULL OR cod_max_cents > 0),
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO payment_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- 'online' = paid through the gateway; which instrument (UPI, card…) the
+-- customer chose there is recorded on the payment once it is captured.
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_method_check;
+ALTER TABLE orders ADD CONSTRAINT orders_payment_method_check
+  CHECK (payment_method IN ('cod', 'upi', 'card', 'netbanking', 'wallet', 'credit', 'online'));
+ALTER TABLE checkout_groups DROP CONSTRAINT IF EXISTS checkout_groups_payment_method_check;
+ALTER TABLE checkout_groups ADD CONSTRAINT checkout_groups_payment_method_check
+  CHECK (payment_method IN ('cod', 'upi', 'card', 'netbanking', 'wallet', 'credit', 'online'));
+ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_method_check;
+ALTER TABLE payments ADD CONSTRAINT payments_method_check
+  CHECK (method IN ('cod', 'upi', 'card', 'netbanking', 'wallet', 'credit', 'online'));
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS instrument TEXT;
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_provider_order ON payment_attempts (provider_order_id);
+CREATE INDEX IF NOT EXISTS idx_payments_provider_payment ON payments (provider_payment_id);

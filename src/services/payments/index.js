@@ -22,8 +22,9 @@ const cod = require('./cod');
 const manual = require('./manual');
 const credit = require('./credit');
 const wallet = require('./wallet');
+const razorpay = require('./razorpay');
 
-const PROVIDERS = { cod, manual, credit, wallet };
+const PROVIDERS = { cod, manual, credit, wallet, razorpay };
 
 /** The provider handling a payment, by name. Throws rather than guessing. */
 function getProvider(name) {
@@ -42,6 +43,8 @@ function providerForMethod(method) {
   if (method === 'credit') return credit;
   // 'wallet' is the customer's Gloaro wallet, not a gateway wallet.
   if (method === 'wallet') return wallet;
+  // RZ1: 'online' is the Razorpay checkout (UPI, cards, net banking, wallets).
+  if (method === 'online') return razorpay;
   return manual;
 }
 

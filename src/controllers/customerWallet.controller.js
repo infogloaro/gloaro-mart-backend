@@ -44,7 +44,9 @@ async function createTopup(req, res) {
     });
   }
 
-  const provider = providerForMethod('upi');
+  // RZ7: through Razorpay when admin has online payment on, else the manual provider as before.
+  const online = (await require('../services/paymentSettings').options()).online.enabled;
+  const provider = providerForMethod(online ? 'online' : 'upi');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -54,7 +56,7 @@ async function createTopup(req, res) {
     );
     const topup = rows[0];
     // The provider takes an attempt-shaped object; the top-up id plays that role.
-    const { providerOrderId, redirect } = provider.createAttempt({
+    const { providerOrderId, redirect, checkout } = await provider.createAttempt({
       payment: null,
       attempt: { id: `topup_${topup.id}` },
       amountCents,
@@ -68,9 +70,11 @@ async function createTopup(req, res) {
       provider: provider.name,
       providerOrderId,
       redirect: redirect ?? null,
+      checkout: checkout ?? null,
     });
   } catch (err) {
     await client.query('ROLLBACK');
+    if (err.status) return res.status(err.status).json({ message: err.message });
     throw err;
   } finally {
     client.release();
@@ -96,12 +100,12 @@ async function getTopup(req, res) {
  * out-of-order event cannot credit twice or undo a settled top-up.
  */
 async function applyTopupEvent(client, parsed) {
-  if (!parsed.providerPaymentId) return null;
+  if (!parsed.providerPaymentId && !parsed.providerOrderId) return null;
   const { rows } = await client.query(
     `SELECT * FROM wallet_topups
-      WHERE provider_order_id = $1 OR provider_payment_id = $1
+      WHERE provider_order_id = $1 OR provider_payment_id = $2
       FOR UPDATE`,
-    [parsed.providerPaymentId]
+    [parsed.providerOrderId ?? parsed.providerPaymentId, parsed.providerPaymentId]
   );
   const topup = rows[0];
   if (!topup) return null;

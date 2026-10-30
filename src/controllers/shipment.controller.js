@@ -20,7 +20,8 @@ const SELECT = `
          vp.business_name AS vendor_name,
          COALESCE(u.full_name, u.email) AS customer_name,
          COALESCE(o.delivery_address_snapshot->>'mobile_number', u.phone_number) AS customer_phone,
-         o.delivery_address_snapshot->>'city' AS delivery_city
+         o.delivery_address_snapshot->>'city' AS delivery_city,
+         o.delivery_mode, o.delivery_distance_km
   FROM shipments s
   JOIN orders o ON o.id = s.order_id
   JOIN vendor_profiles vp ON vp.id = s.vendor_id
@@ -53,6 +54,12 @@ function toJson(s) {
     deliveredAt: s.delivered_at,
     attemptCount: s.attempt_count,
     failureReason: s.failure_reason,
+    // DR3: GoKart (own riders), Shiprocket (courier) or manual; null on shipments before routing.
+    provider: s.provider ?? null,
+    bookingStatus: s.booking_status ?? 'not_needed',
+    bookingError: s.booking_error ?? null,
+    deliveryMode: s.delivery_mode ?? null,
+    distanceKm: s.delivery_distance_km == null ? null : Number(s.delivery_distance_km),
     createdAt: s.created_at,
   };
 }
@@ -86,6 +93,7 @@ const STATUS_FILTERS = {
   delivered: "s.status = 'delivered'",
   failed: "s.status IN ('failed', 'returned')",
 };
+const PROVIDERS = ['gokart', 'shiprocket', 'manual'];
 
 async function listShipments(req, res) {
   const page = Math.max(Number(req.query.page) || 1, 1);
@@ -94,6 +102,16 @@ async function listShipments(req, res) {
   if (req.query.status) {
     if (!STATUS_FILTERS[req.query.status]) return res.status(400).json({ message: 'Unknown status' });
     conditions.push(STATUS_FILTERS[req.query.status]);
+  }
+  if (req.query.provider) {
+    if (req.query.provider === 'none') conditions.push('s.provider IS NULL');
+    else if (PROVIDERS.includes(req.query.provider)) {
+      params.push(req.query.provider);
+      conditions.push(`s.provider = $${params.length}`);
+    } else return res.status(400).json({ message: 'Unknown provider' });
+  }
+  if (req.query.booking === 'needs_booking') {
+    conditions.push("s.booking_status IN ('needs_booking', 'failed') AND s.status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery')");
   }
   if (req.query.q) {
     params.push(`%${req.query.q}%`);
@@ -126,7 +144,12 @@ async function shipmentSummary(req, res) {
        COUNT(*) FILTER (WHERE status = 'failed' AND EXISTS (
          SELECT 1 FROM shipments n WHERE n.previous_shipment_id = shipments.id AND n.status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery')))::int AS failed,
        COUNT(*) FILTER (WHERE status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery') AND estimated_delivery_at < now())::int AS late,
-       COUNT(*) FILTER (WHERE status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery') AND partner_name IS NULL)::int AS unassigned,
+       COUNT(*) FILTER (WHERE status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery') AND partner_name IS NULL
+         AND provider IS DISTINCT FROM 'shiprocket')::int AS unassigned,
+       COUNT(*) FILTER (WHERE status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery') AND provider = 'gokart')::int AS gokart_open,
+       COUNT(*) FILTER (WHERE status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery') AND provider = 'shiprocket')::int AS shiprocket_open,
+       COUNT(*) FILTER (WHERE status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery')
+         AND booking_status IN ('needs_booking', 'failed'))::int AS needs_booking,
        AVG(EXTRACT(EPOCH FROM (delivered_at - dispatched_at)) / 3600)
          FILTER (WHERE status = 'delivered' AND dispatched_at IS NOT NULL AND delivered_at > dispatched_at)::float AS avg_hours
      FROM shipments`
@@ -140,6 +163,9 @@ async function shipmentSummary(req, res) {
     failed: s.failed,
     late: s.late,
     unassigned: s.unassigned,
+    gokartOpen: s.gokart_open,
+    shiprocketOpen: s.shiprocket_open,
+    needsBooking: s.needs_booking,
     avgDeliveryHours: s.avg_hours,
   });
 }
@@ -287,6 +313,15 @@ async function updateShipment(req, res) {
     sets.push(`${column} = $${params.length}`);
   }
   if (!sets.length) return res.status(400).json({ message: 'Nothing to change' });
+  // DR3: a Shiprocket shipment booked by hand in Shiprocket's panel is booked
+  // once its AWB is entered here; clearing the AWB puts it back in the queue.
+  if ('externalTrackingId' in b) {
+    const awb = `$${sets.findIndex((s) => s.startsWith('external_tracking_id')) + 2}`;
+    sets.push(
+      `booking_status = CASE WHEN provider = 'shiprocket' THEN (CASE WHEN ${awb}::text IS NULL THEN 'needs_booking' ELSE 'booked' END) ELSE booking_status END`,
+      `booking_error = CASE WHEN provider = 'shiprocket' AND ${awb}::text IS NOT NULL THEN NULL ELSE booking_error END`
+    );
+  }
   const { rows } = await pool.query(
     `UPDATE shipments SET ${sets.join(', ')}, updated_at = now()
      WHERE id = $1 AND status IN ('created', 'picked_up', 'in_transit', 'out_for_delivery') RETURNING id`,
@@ -322,6 +357,11 @@ async function assignPartner(req, res) {
     if (partnerId === shipment.partner_id) {
       await client.query('ROLLBACK');
       return res.json(await loadDetail(shipment.id));
+    }
+    // Riders carry GoKart (and manual) shipments; Shiprocket brings its own courier.
+    if (partnerId !== null && shipment.provider === 'shiprocket') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'This shipment goes by Shiprocket. Switch it to GoKart to give it to a rider.' });
     }
     let partner = null;
     if (partnerId !== null) {
@@ -360,6 +400,83 @@ async function assignPartner(req, res) {
 }
 
 /** The customer's view of their order's parcels, newest attempt first. No internal names. */
+const PROVIDER_NAMES = { gokart: 'GoKart', shiprocket: 'Shiprocket', manual: 'manual delivery' };
+
+/**
+ * DR7: admin moves an open shipment to another partner (a GoKart rider is
+ * busy, an address turned out nearer than it looked). A shipment already
+ * booked with Shiprocket stays there until that booking is cancelled.
+ */
+async function switchProvider(req, res) {
+  const provider = req.body?.provider;
+  if (!PROVIDERS.includes(provider)) return res.status(400).json({ message: 'provider is gokart, shiprocket or manual' });
+  const client = await pool.connect();
+  let from;
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query('SELECT * FROM shipments WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const shipment = rows[0];
+    if (!shipment) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Shipment not found' });
+    }
+    if (!shipments.OPEN.includes(shipment.status)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'Only a shipment still on the road can change partner.' });
+    }
+    from = shipment.provider;
+    if (provider === from) {
+      await client.query('ROLLBACK');
+      return res.json(await loadDetail(shipment.id));
+    }
+    if (shipment.booking_status === 'booked') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'It is already booked with Shiprocket. Cancel that booking first.' });
+    }
+    // Onto Shiprocket the rider lets go of it and it needs booking.
+    await client.query(
+      `UPDATE shipments SET provider = $2::varchar,
+         booking_status = CASE WHEN $2::varchar = 'shiprocket' THEN 'needs_booking' ELSE 'not_needed' END, booking_error = NULL,
+         partner_id = CASE WHEN $2::varchar = 'shiprocket' THEN NULL ELSE partner_id END,
+         partner_name = CASE WHEN $2::varchar = 'shiprocket' THEN NULL ELSE partner_name END,
+         partner_phone = CASE WHEN $2::varchar = 'shiprocket' THEN NULL ELSE partner_phone END,
+         updated_at = now()
+       WHERE id = $1`,
+      [shipment.id, provider]
+    );
+    await client.query(
+      `UPDATE orders SET fulfilment_partner = $2::varchar,
+         delivery_partner_name = CASE WHEN $2::varchar = 'shiprocket' THEN NULL ELSE delivery_partner_name END,
+         delivery_partner_phone = CASE WHEN $2::varchar = 'shiprocket' THEN NULL ELSE delivery_partner_phone END,
+         updated_at = now()
+       WHERE id = $1`,
+      [shipment.order_id, provider]
+    );
+    await shipments.addEvent(client, shipment.id, {
+      status: shipment.status,
+      description: `Moved to ${PROVIDER_NAMES[provider]}${from ? ` from ${PROVIDER_NAMES[from]}` : ''}`,
+      actorRole: 'admin',
+      userId: req.user.id,
+    });
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+  await recordAudit({
+    actorUserId: req.user.id,
+    action: 'shipment.provider_changed',
+    module: MODULE,
+    entityType: 'shipment',
+    entityId: req.params.id,
+    previousValue: { provider: from },
+    newValue: { provider },
+  }).catch(() => {});
+  res.json(await loadDetail(req.params.id));
+}
+
 async function listForOrder(req, res) {
   const { rows: orderRows } = await pool.query('SELECT id FROM orders WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
   if (!orderRows[0]) return res.status(404).json({ message: 'Order not found' });
@@ -387,4 +504,4 @@ async function listForOrder(req, res) {
   res.json({ shipments: out });
 }
 
-module.exports = { listShipments, shipmentSummary, getShipment, recordEvent, updateShipment, assignPartner, listForOrder };
+module.exports = { listShipments, shipmentSummary, getShipment, recordEvent, updateShipment, assignPartner, switchProvider, listForOrder };

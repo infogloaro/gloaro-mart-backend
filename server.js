@@ -121,3 +121,23 @@ if (whatsappSeconds > 0) {
     }
   }, whatsappSeconds * 1000).unref();
 }
+
+// RZ5: online orders not paid before their stock hold ran out are cancelled
+// and the stock goes back. UNPAID_SWEEP_SECONDS=0 turns it off.
+const unpaidSeconds = Number(process.env.UNPAID_SWEEP_SECONDS ?? 120);
+if (unpaidSeconds > 0) {
+  const { expireUnpaid } = require('./src/services/unpaidOrders');
+  let expiring = false;
+  setInterval(async () => {
+    if (expiring) return;
+    expiring = true;
+    try {
+      const r = await expireUnpaid();
+      if (r.cancelledOrders.length) console.log(`[payments] unpaid orders cancelled: ${r.cancelledOrders.map((id) => `#${id}`).join(', ')}`);
+    } catch (err) {
+      console.error(`[payments] unpaid sweep failed: ${err.message}`);
+    } finally {
+      expiring = false;
+    }
+  }, unpaidSeconds * 1000).unref();
+}

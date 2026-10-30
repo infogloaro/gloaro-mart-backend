@@ -21,7 +21,8 @@
  */
 const pool = require('../config/db');
 
-const HOLD_MINUTES = 30;
+// RZ5: how long an online order may sit unpaid before its stock goes back.
+const HOLD_MINUTES = 15;
 
 /** The key an inventory row is looked up by. A simple product has no variant. */
 function stockKey(productId, variantId) {

@@ -154,10 +154,14 @@ router.post("/credit-notes/:id/cancel", creditNote.cancel);
 // Shipments — guarded by the shipments permission module. /summary above /:id.
 router.get("/shipments", shipment.listShipments);
 router.get("/shipments/summary", shipment.shipmentSummary);
+// DR1: delivery routing (GoKart up to the radius, Shiprocket beyond).
+router.get("/shipments/routing", require("../controllers/deliveryRouting.controller").getSettings);
+router.patch("/shipments/routing", require("../controllers/deliveryRouting.controller").updateSettings);
 router.get("/shipments/:id", shipment.getShipment);
 router.patch("/shipments/:id", shipment.updateShipment);
 router.post("/shipments/:id/events", shipment.recordEvent);
 router.post("/shipments/:id/assign", shipment.assignPartner);
+router.post("/shipments/:id/provider", shipment.switchProvider);
 // Under /shipments so the shipments permission covers picking a partner.
 router.get("/shipments/:id/partners", deliveryPartner.availableForShipment);
 
@@ -367,6 +371,10 @@ router.get("/reports/summary", admin.getPlatformSummary);
 // Payments & refunds (Sprint 3). '/payments/:id' stays below the literal
 // '/payments' list route, and refunds are raised against a payment.
 router.get("/payments", payment.listPayments);
+// RZ3: payment settings (online / COD) and the Razorpay keys. Literal paths above /:id.
+router.get("/payments/settings", require("../controllers/paymentSettings.controller").getSettings);
+router.patch("/payments/settings", require("../controllers/paymentSettings.controller").updateSettings);
+router.post("/payments/settings/razorpay", require("../controllers/paymentSettings.controller").setupRazorpay);
 router.get("/payments/:id", payment.getPayment);
 router.post("/payments/:id/refunds", payment.createRefund);
 router.get("/refunds", payment.listRefunds);

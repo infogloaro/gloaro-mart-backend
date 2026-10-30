@@ -72,6 +72,13 @@ async function receive(req, res) {
       .applyStatuses(req.body)
       .catch((err) => console.error(`[whatsapp] receipts failed: ${err.message}`));
   }
+  // RZ2: Razorpay events pasted at this URL instead of /api/payments/webhook/razorpay
+  // still settle payments and refunds (same secret, already verified above).
+  if (connector.key === "razorpay") {
+    require("./payment.controller")
+      .applyVerifiedWebhook("razorpay", req.body ?? {})
+      .catch((err) => console.error(`[payments] razorpay webhook (platform URL) failed: ${err.message}`));
+  }
   // UltraMsg: acks update the log; START / STOP set the customer's consent.
   if (connector.key === "ultramsg") {
     require("../services/whatsapp")
