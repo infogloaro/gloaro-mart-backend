@@ -3,6 +3,8 @@
  * no reports yet is listed as coming next, so the hub shows the whole plan.
  */
 const sales = require('./sales');
+const payments = require('./payments');
+const tax = require('./tax');
 
 const GROUPS = [
   { key: 'sales', label: 'Sales & orders' },
@@ -19,7 +21,7 @@ const GROUPS = [
   { key: 'platform', label: 'Platform & admin' },
 ];
 
-const REPORTS = [...sales.reports];
+const REPORTS = [...sales.reports, ...payments.reports, ...tax.reports];
 const BY_KEY = new Map(REPORTS.map((r) => [r.key, r]));
 
 module.exports = { GROUPS, REPORTS, BY_KEY };
