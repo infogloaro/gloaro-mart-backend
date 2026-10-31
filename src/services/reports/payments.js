@@ -249,7 +249,8 @@ const settlements = {
     if (f.shop != null) w.push(`s.vendor_id = ${p(f.shop)}`);
     if (f.status) w.push(`s.status = ${p(f.status)}`);
     return `
-      SELECT s.reference, v.business_name AS shop, s.period_start, s.period_end, s.order_count AS orders,
+      SELECT s.reference, v.business_name AS shop, to_char(s.period_start, 'YYYY-MM-DD') AS period_start,
+             to_char(s.period_end, 'YYYY-MM-DD') AS period_end, s.order_count AS orders,
              s.gross_cents AS gross, s.commission_cents AS commission, s.deduction_cents AS deductions,
              s.adjustment_cents AS adjustment, s.net_payable_cents AS net, s.status, s.paid_at, s.payout_utr AS utr
       FROM settlements s JOIN vendor_profiles v ON v.id = s.vendor_id
