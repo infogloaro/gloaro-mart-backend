@@ -36,6 +36,7 @@ const MODULES = [
   // ----- Overview -----
   { key: "dashboard", label: "Dashboard", group: "Overview", routes: ["reports"] },
   { key: "analytics", label: "Analytics", group: "Overview", routes: ["analytics"] },
+  { key: "reports", label: "Reports", group: "Overview", routes: ["report-center"] },
 
   // ----- Catalogue -----
   {

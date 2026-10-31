@@ -45,6 +45,7 @@ const rfq = require("../controllers/rfq.controller");
 const quotation = require("../controllers/quotation.controller");
 const purchaseOrder = require("../controllers/purchaseOrder.controller");
 const analyticsController = require("../controllers/analytics.controller");
+const reportCenter = require("../controllers/reportCenter.controller");
 const whatsappAdmin = require("../controllers/whatsapp.controller");
 const adPricing = require("../controllers/adPricing.controller");
 const adCampaign = require("../controllers/adCampaign.controller");
@@ -490,6 +491,10 @@ router.post("/ads/click-review/mark", adFixes.markTaps);
 
 // Analytics — guarded by the analytics permission module.
 router.get("/analytics", analyticsController.adminAnalytics);
+
+// Reports hub (RP) — guarded by the reports permission module.
+router.get("/report-center", reportCenter.catalogue);
+router.get("/report-center/:key", reportCenter.run);
 
 // Purchase orders — guarded by the purchase_orders permission module. /summary above /:id.
 router.get("/purchase-orders", purchaseOrder.adminList);

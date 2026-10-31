@@ -65,6 +65,7 @@ app.use("/api/matching", require("./routes/matching.routes"));
 app.use("/api/notifications", require("./routes/notification.routes"));
 app.use("/api/webhooks/platforms", require("./routes/platformWebhook.routes"));
 app.use("/api/bot", require("./routes/bot.routes"));
+app.use("/api/assistant", require("./routes/assistant.routes"));
 app.use("/api/ads", require("./routes/ads.routes"));
 app.use("/api/enquiries", require("./routes/enquiry.routes"));
 app.use("/api/services", require("./routes/services.routes"));
