@@ -6,6 +6,7 @@ const sales = require('./sales');
 const payments = require('./payments');
 const tax = require('./tax');
 const delivery = require('./delivery');
+const cancellations = require('./cancellations');
 
 const GROUPS = [
   { key: 'sales', label: 'Sales & orders' },
@@ -22,7 +23,7 @@ const GROUPS = [
   { key: 'platform', label: 'Platform & admin' },
 ];
 
-const REPORTS = [...sales.reports, ...payments.reports, ...tax.reports, ...delivery.reports];
+const REPORTS = [...sales.reports, ...payments.reports, ...tax.reports, ...delivery.reports, ...cancellations.reports];
 const BY_KEY = new Map(REPORTS.map((r) => [r.key, r]));
 
 module.exports = { GROUPS, REPORTS, BY_KEY };
