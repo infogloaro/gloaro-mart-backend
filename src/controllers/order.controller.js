@@ -710,7 +710,22 @@ async function getVendorOrders(req, res) {
   const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [req.user.id]);
   const vendorId = vendorRows[0]?.id;
   if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
-  const { rows } = await pool.query('SELECT * FROM orders WHERE vendor_id = $1 ORDER BY created_at DESC', [vendorId]);
+  // VD4: accept_by — when a new order moves to another shop if not accepted.
+  // The same conditions as the re-route sweep (reassignment.expireUnaccepted),
+  // so the shop's countdown never disagrees with what happens; null otherwise.
+  const { rows } = await pool.query(
+    `SELECT o.*,
+            CASE WHEN o.status = 'pending' AND o.checkout_group_id IS NOT NULL AND o.replacement_of_order_id IS NULL
+                      AND w.id IS NOT NULL AND o.created_at >= w.accept_window_since
+                      AND (p.id IS NULL OR p.method = 'cod' OR p.status = 'successful')
+                      AND NOT EXISTS (SELECT 1 FROM order_assignment_history h WHERE h.from_order_id = o.id)
+                 THEN o.created_at + make_interval(mins => w.accept_window_minutes) END AS accept_by
+     FROM orders o
+     LEFT JOIN payments p ON p.checkout_group_id = o.checkout_group_id
+     LEFT JOIN vendor_matching_weights w ON w.id = 1
+     WHERE o.vendor_id = $1 ORDER BY o.created_at DESC`,
+    [vendorId]
+  );
   res.json(rows);
 }
 

@@ -4285,3 +4285,110 @@ ALTER TABLE payments ADD CONSTRAINT payments_method_check
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS instrument TEXT;
 CREATE INDEX IF NOT EXISTS idx_payment_attempts_provider_order ON payment_attempts (provider_order_id);
 CREATE INDEX IF NOT EXISTS idx_payments_provider_payment ON payments (provider_payment_id);
+
+-- ===== SHOP PAUSE & BUSY (VD2) =====
+-- The shop owner can stop taking orders for a while (paused; paused_until NULL
+-- = until they reopen) or ask for more preparation time (busy). shop_open_at()
+-- reads the pause, so the shop list, shop page, checkout and bookings all see
+-- a paused shop as closed; busy minutes are added to the delivery ETA.
+-- Plan: G_mart docs/WORK_PLAN.md (VD2).
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS paused_until TIMESTAMPTZ;
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS pause_note VARCHAR(80);
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS busy_until TIMESTAMPTZ;
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS busy_extra_minutes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE vendor_profiles DROP CONSTRAINT IF EXISTS vendor_profiles_busy_extra_minutes_check;
+ALTER TABLE vendor_profiles ADD CONSTRAINT vendor_profiles_busy_extra_minutes_check CHECK (busy_extra_minutes BETWEEN 0 AND 180);
+
+-- The hours alone (SB3's rule), kept as its own function.
+CREATE OR REPLACE FUNCTION shop_hours_open_at(p_vendor INTEGER, p_at TIMESTAMPTZ)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $fn$
+  WITH t AS (
+    SELECT l.ts::date AS d, l.ts::time AS tm, EXTRACT(DOW FROM l.ts)::int AS dow
+    FROM (SELECT p_at AT TIME ZONE vp.timezone AS ts FROM vendor_profiles vp WHERE vp.id = p_vendor) l
+  )
+  SELECT CASE
+    WHEN EXISTS (SELECT 1 FROM vendor_hours h WHERE h.vendor_id = p_vendor) THEN (
+      -- Today's window, unless today is a holiday.
+      EXISTS (
+        SELECT 1 FROM vendor_hours h, t
+        WHERE h.vendor_id = p_vendor AND h.day_of_week = t.dow AND NOT h.is_closed
+          AND NOT EXISTS (SELECT 1 FROM vendor_holidays x WHERE x.vendor_id = p_vendor AND x.holiday_date = t.d)
+          AND (h.opens_at = h.closes_at
+               OR (h.opens_at < h.closes_at AND t.tm >= h.opens_at AND t.tm < h.closes_at)
+               OR (h.opens_at > h.closes_at AND t.tm >= h.opens_at)))
+      -- Or yesterday's window running past midnight.
+      OR EXISTS (
+        SELECT 1 FROM vendor_hours h, t
+        WHERE h.vendor_id = p_vendor AND h.day_of_week = (t.dow + 6) % 7 AND NOT h.is_closed
+          AND NOT EXISTS (SELECT 1 FROM vendor_holidays x WHERE x.vendor_id = p_vendor AND x.holiday_date = t.d - 1)
+          AND h.opens_at > h.closes_at AND t.tm < h.closes_at))
+    WHEN EXISTS (SELECT 1 FROM vendor_holidays x, t WHERE x.vendor_id = p_vendor AND x.holiday_date = t.d) THEN false
+    ELSE (
+      SELECT CASE
+        WHEN dr.opens_at IS NULL OR dr.closes_at IS NULL THEN NULL
+        WHEN dr.opens_at = dr.closes_at THEN true
+        WHEN dr.opens_at < dr.closes_at THEN t.tm >= dr.opens_at AND t.tm < dr.closes_at
+        ELSE t.tm >= dr.opens_at OR t.tm < dr.closes_at
+      END
+      FROM t LEFT JOIN vendor_delivery_rules dr ON dr.vendor_id = p_vendor)
+  END
+$fn$;
+
+CREATE OR REPLACE FUNCTION shop_paused_at(p_vendor INTEGER, p_at TIMESTAMPTZ)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $fn$
+  SELECT COALESCE((SELECT vp.paused AND (vp.paused_until IS NULL OR vp.paused_until > p_at)
+                   FROM vendor_profiles vp WHERE vp.id = p_vendor), false)
+$fn$;
+
+CREATE OR REPLACE FUNCTION shop_busy_minutes(p_vendor INTEGER, p_at TIMESTAMPTZ)
+RETURNS INTEGER LANGUAGE sql STABLE AS $fn$
+  SELECT COALESCE((SELECT CASE WHEN vp.busy_until > p_at THEN vp.busy_extra_minutes ELSE 0 END
+                   FROM vendor_profiles vp WHERE vp.id = p_vendor), 0)
+$fn$;
+
+-- Paused: closed whatever the hours say. Otherwise the hours decide (NULL when
+-- the shop never gave hours, as before).
+CREATE OR REPLACE FUNCTION shop_open_at(p_vendor INTEGER, p_at TIMESTAMPTZ)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $fn$
+  SELECT CASE WHEN shop_paused_at(p_vendor, p_at) THEN false ELSE shop_hours_open_at(p_vendor, p_at) END
+$fn$;
+
+-- ===== SHOP BROADCASTS (VD23) =====
+-- A shop's own message to its followers ("Message your followers" in the
+-- vendor app). Sent in the app to followers who opted in to offer alerts
+-- (shop_follows.notify_offers) and haven't switched shop offers off, under the
+-- same per-follower limits as SB8's offer alerts (one shop a day, five shops a
+-- day). At most one broadcast per shop per 24 hours, approved shops only.
+-- offer_key optionally names a running offer ('coupon:12', 'campaign:5');
+-- recipients is how many notifications were created. Each send is also in
+-- audit_logs (module 'shop_broadcast') for the admin.
+-- Rules in src/controllers/vendorBroadcast.controller.js.
+CREATE TABLE IF NOT EXISTS shop_broadcasts (
+  id SERIAL PRIMARY KEY,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  sent_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  title VARCHAR(60),
+  message VARCHAR(160) NOT NULL,
+  offer_key VARCHAR(60),
+  offer_text VARCHAR(300),
+  recipients INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_shop_broadcasts_vendor ON shop_broadcasts (vendor_id, created_at DESC);
+
+-- ===== VENDOR NOTIFICATION PREFS (VD28) =====
+-- Which alerts a shop gets, and how (Shop → Notification settings in the
+-- vendor app). One row per choice the shop has made; no row means the default
+-- in src/controllers/vendorNotificationPrefs.controller.js (everything on).
+-- new_order/sound and new_order/popup are read by the vendor app;
+-- new_order/whatsapp switches off the shop_new_order WhatsApp alert.
+CREATE TABLE IF NOT EXISTS vendor_notification_prefs (
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  topic VARCHAR(20) NOT NULL,
+  channel VARCHAR(20) NOT NULL,
+  enabled BOOLEAN NOT NULL,
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (vendor_id, topic, channel)
+);

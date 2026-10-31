@@ -280,6 +280,167 @@ async function vendorGetSettlement(req, res) {
   res.json(detail);
 }
 
+/**
+ * The shop's next payout: settlements already made but not yet paid, and an
+ * estimate for delivered orders no settlement has taken yet — worked out the
+ * way generateDueSettlements() will (commission, TDS/TCS, refunds, ad charges,
+ * a negative balance carried forward). Cycles are Monday–Sunday, India time;
+ * the pay date is only given when past payouts show how long approval takes.
+ */
+async function vendorNextPayout(req, res) {
+  const vendorId = req.vendorId;
+  const { rows: cfgRows } = await pool.query('SELECT * FROM settlement_config WHERE id = 1');
+  const cfg = cfgRows[0];
+  const DELIVERED_AT = settlements.DELIVERED_AT;
+  const [{ rows: cycle }, { rows: open }, { rows: orders }, { rows: other }, { rows: lag }, { rows: bank }] = await Promise.all([
+    pool.query(
+      `SELECT to_char(w, 'YYYY-MM-DD') AS start, to_char(w + 6, 'YYYY-MM-DD') AS end, to_char(w + 7, 'YYYY-MM-DD') AS settles_on
+       FROM (SELECT date_trunc('week', now() AT TIME ZONE 'Asia/Kolkata')::date AS w) x`
+    ),
+    pool.query(
+      `SELECT id, reference, status, net_payable_cents, hold_reason, failure_reason,
+              to_char(period_start, 'YYYY-MM-DD') AS period_start, to_char(period_end, 'YYYY-MM-DD') AS period_end
+       FROM settlements WHERE vendor_id = $1 AND status IN ('pending_approval', 'approved', 'on_hold', 'failed')
+       ORDER BY period_start`,
+      [vendorId]
+    ),
+    pool.query(
+      `SELECT o.* FROM orders o
+       WHERE o.vendor_id = $1 AND o.status = 'delivered'
+         AND NOT EXISTS (SELECT 1 FROM settlement_orders so WHERE so.order_id = o.id)
+         AND (${DELIVERED_AT} AT TIME ZONE 'Asia/Kolkata')::date >= $2`,
+      [vendorId, cfg.generate_from]
+    ),
+    pool.query(
+      `SELECT
+         (SELECT COALESCE(SUM(r.amount_cents), 0) FROM refunds r JOIN orders o ON o.id = r.order_id
+          WHERE o.vendor_id = $1 AND r.status = 'completed'
+            AND NOT EXISTS (SELECT 1 FROM settlement_deductions d WHERE d.refund_id = r.id)
+            AND EXISTS (SELECT 1 FROM settlement_orders so WHERE so.order_id = o.id))::int AS refunds,
+         (SELECT COALESCE(SUM(amount_cents), 0) FROM vendor_charges WHERE vendor_id = $1 AND settlement_id IS NULL)::int AS charges,
+         (SELECT COALESCE(SUM(net_payable_cents), 0) FROM settlements
+          WHERE vendor_id = $1 AND status = 'draft' AND net_payable_cents < 0 AND carried_into IS NULL)::int AS carried`,
+      [vendorId]
+    ),
+    // How long payouts have taken lately, across all shops: days from the cycle's end to the transfer.
+    pool.query(
+      `SELECT COUNT(*)::int AS n,
+              percentile_disc(0.5) WITHIN GROUP (ORDER BY (paid_at AT TIME ZONE 'Asia/Kolkata')::date - period_end) AS days
+       FROM settlements WHERE status = 'paid' AND paid_at > now() - interval '120 days'`
+    ),
+    pool.query('SELECT 1 FROM vendor_bank_accounts WHERE vendor_id = $1', [vendorId]),
+  ]);
+
+  let gross = 0;
+  let commission = 0;
+  let taxable = 0;
+  for (const o of orders) {
+    const g = await settlements.grossFor(pool, o);
+    gross += g;
+    commission += await settlements.commissionFor(pool, o);
+    if (!o.replacement_of_order_id) taxable += o.subtotal_cents;
+  }
+  const tax = Math.round((gross * Number(cfg.tds_percent)) / 100) + Math.round((taxable * Number(cfg.tcs_percent)) / 100);
+  const { refunds, charges, carried } = other[0];
+  const net = gross - commission - tax - refunds - charges + carried;
+  const days = lag[0].n > 0 ? Number(lag[0].days) : null;
+  let estimatedPayoutDate = null;
+  if (days != null) {
+    const d = new Date(`${cycle[0].end}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + Math.max(days, 1));
+    estimatedPayoutDate = d.toISOString().slice(0, 10);
+  }
+
+  res.json({
+    cycle: { start: cycle[0].start, end: cycle[0].end, settlesOn: cycle[0].settles_on },
+    open: open.map((s) => ({
+      id: s.id,
+      reference: s.reference,
+      status: s.status,
+      periodStart: s.period_start,
+      periodEnd: s.period_end,
+      netPayableCents: s.net_payable_cents,
+      holdReason: s.hold_reason ?? s.failure_reason,
+    })),
+    estimate: {
+      orderCount: orders.length,
+      grossCents: gross,
+      commissionCents: commission,
+      taxCents: tax,
+      refundCents: refunds,
+      chargeCents: charges,
+      carriedCents: carried,
+      netCents: net,
+    },
+    typicalPayoutDays: days,
+    basedOnPayouts: lag[0].n,
+    estimatedPayoutDate,
+    hasBankAccount: bank.length > 0,
+  });
+}
+
+const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+/** One month's statement: the settlements whose cycle ended in it, with their orders and deductions. */
+async function vendorStatement(req, res) {
+  const month = String(req.query.month ?? '');
+  if (!MONTH.test(month)) return res.status(400).json({ message: 'Pick a month as YYYY-MM.' });
+  const { rows } = await pool.query(
+    `SELECT s.id, s.reference, s.status, s.order_count, s.gross_cents, s.commission_cents, s.deduction_cents,
+            s.adjustment_cents, s.net_payable_cents, s.payout_utr,
+            to_char(s.period_start, 'YYYY-MM-DD') AS period_start, to_char(s.period_end, 'YYYY-MM-DD') AS period_end,
+            to_char(s.paid_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') AS paid_on
+     FROM settlements s WHERE s.vendor_id = $1 AND to_char(s.period_end, 'YYYY-MM') = $2
+     ORDER BY s.period_start, s.id`,
+    [req.vendorId, month]
+  );
+  const ids = rows.map((s) => s.id);
+  const [{ rows: orders }, { rows: deductions }] = ids.length
+    ? await Promise.all([
+        pool.query(
+          `SELECT so.settlement_id, so.order_id, so.gross_cents, so.commission_cents, so.net_cents,
+                  COALESCE(cg.reference, '#' || so.order_id) AS group_reference,
+                  to_char(so.delivered_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') AS delivered_on
+           FROM settlement_orders so JOIN orders o ON o.id = so.order_id LEFT JOIN checkout_groups cg ON cg.id = o.checkout_group_id
+           WHERE so.settlement_id = ANY($1) ORDER BY so.delivered_at, so.order_id`,
+          [ids]
+        ),
+        pool.query('SELECT settlement_id, kind, label, amount_cents FROM settlement_deductions WHERE settlement_id = ANY($1) ORDER BY id', [ids]),
+      ])
+    : [{ rows: [] }, { rows: [] }];
+  res.json({
+    month,
+    settlements: rows.map((s) => ({
+      id: s.id,
+      reference: s.reference,
+      status: s.status,
+      periodStart: s.period_start,
+      periodEnd: s.period_end,
+      orderCount: s.order_count,
+      grossCents: s.gross_cents,
+      commissionCents: s.commission_cents,
+      deductionCents: s.deduction_cents,
+      adjustmentCents: s.adjustment_cents,
+      netPayableCents: s.net_payable_cents,
+      paidOn: s.paid_on,
+      payoutUtr: s.payout_utr,
+      orders: orders
+        .filter((o) => o.settlement_id === s.id)
+        .map((o) => ({
+          orderId: o.order_id,
+          orderReference: `${o.group_reference} · #${o.order_id}`,
+          deliveredOn: o.delivered_on,
+          grossCents: o.gross_cents,
+          commissionCents: o.commission_cents,
+          netCents: o.net_cents,
+        })),
+      deductions: deductions
+        .filter((d) => d.settlement_id === s.id)
+        .map((d) => ({ kind: d.kind, label: d.label, amountCents: d.amount_cents })),
+    })),
+  });
+}
+
 module.exports = {
   listSettlements,
   settlementSummary,
@@ -295,4 +456,6 @@ module.exports = {
   vendorSaveBankAccount,
   vendorListSettlements,
   vendorGetSettlement,
+  vendorNextPayout,
+  vendorStatement,
 };

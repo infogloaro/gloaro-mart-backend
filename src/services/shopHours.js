@@ -234,8 +234,27 @@ async function openNowFor(vendorIds) {
   }
 }
 
+/**
+ * VD2: extra preparation minutes each shop asked for while busy (0 when not
+ * busy). Empty before the migration, so ETAs stay as they were.
+ */
+async function busyMinutesFor(vendorIds) {
+  if (vendorIds.length === 0) return new Map();
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, shop_busy_minutes(id, now()) AS busy FROM vendor_profiles WHERE id = ANY($1)',
+      [vendorIds]
+    );
+    return new Map(rows.map((r) => [r.id, r.busy]));
+  } catch (err) {
+    if (err.code === '42883' || err.code === '42P01' || err.code === '42703') return new Map();
+    throw err;
+  }
+}
+
 module.exports = {
   HoursError,
+  busyMinutesFor,
   MAX_UPCOMING_HOLIDAYS,
   openNowSql,
   todaySql,

@@ -338,6 +338,12 @@ async function dispatch() {
           out.skipped += 1;
         }
       };
+      // VD28: a shop that switched WhatsApp order alerts off (no setting = on).
+      if (event.audience === 'shop' && !(await require('../controllers/vendorNotificationPrefs.controller').shopAllows(pool, r.order_id, 'new_order', 'whatsapp'))) {
+        await logSkip({ ...base, phone: r.u_wa ?? null, template, reason: 'The shop switched WhatsApp order alerts off.' });
+        out.skipped += 1;
+        continue;
+      }
       const who = recipient(r, event.audience);
       if (who.phone) await send(who.phone, base);
       else if (who.skip) {

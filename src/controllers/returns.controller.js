@@ -576,7 +576,59 @@ async function creditNoteForReturn(request, userId) {
   }
 }
 
+// ------------------------------------------------------------ The shop's view (VD9)
+
+/** Returns still being worked on vs. finished, for the shop's two lists. */
+const SHOP_OPEN = ['requested', 'approved', 'pickup_scheduled', 'picked_up', 'received', 'disputed'];
+
+/**
+ * GET /api/vendor/returns?state=open|closed — returns on the shop's orders.
+ * Gloaro Mart decides them; the shop sees where each one stands.
+ */
+async function vendorListReturns(req, res) {
+  const state = req.query.state === 'closed' ? 'closed' : 'open';
+  const { rows } = await pool.query(
+    `${SELECT} WHERE o.vendor_id = $1 AND (r.status = ANY($2)) = $3 ORDER BY r.created_at DESC, r.id DESC LIMIT 100`,
+    [req.vendorId, SHOP_OPEN, state === 'open']
+  );
+  const { rows: count } = await pool.query(
+    `SELECT COUNT(*) FILTER (WHERE r.status = ANY($2))::int AS open, COUNT(*) FILTER (WHERE NOT r.status = ANY($2))::int AS closed
+     FROM order_returns r JOIN orders o ON o.id = r.order_id WHERE o.vendor_id = $1`,
+    [req.vendorId, SHOP_OPEN]
+  );
+  res.json({ items: rows.map(toJson), counts: count[0] });
+}
+
+/** GET /api/vendor/returns/:id — one return on the shop's order, with photos and timeline. */
+async function vendorGetReturn(req, res) {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ message: 'Return not found' });
+  const detail = await loadDetail(req.params.id);
+  if (!detail || detail.vendorId !== req.vendorId) return res.status(404).json({ message: 'Return not found' });
+  res.json(detail);
+}
+
+/**
+ * POST /api/vendor/returns/:id/note { note } — the shop's side for Gloaro Mart
+ * (say, "the seal was intact when packed"), added to the timeline. It doesn't
+ * change the return's status.
+ */
+async function vendorNoteReturn(req, res) {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ message: 'Return not found' });
+  const note = typeof req.body?.note === 'string' ? req.body.note.trim() : '';
+  if (note.length < 3 || note.length > 500) return res.status(400).json({ message: 'Write 3–500 characters' });
+  const { rows } = await pool.query(
+    'SELECT r.id, r.status FROM order_returns r JOIN orders o ON o.id = r.order_id WHERE r.id = $1 AND o.vendor_id = $2',
+    [Number(req.params.id), req.vendorId]
+  );
+  if (!rows[0]) return res.status(404).json({ message: 'Return not found' });
+  await addEvent(pool, rows[0].id, rows[0].status, { note, actorRole: 'vendor', userId: req.user.id });
+  res.status(201).json(await loadDetail(rows[0].id));
+}
+
 module.exports = {
+  vendorListReturns,
+  vendorGetReturn,
+  vendorNoteReturn,
   requestReturn,
   listReturnsForOrder,
   cancelReturn,

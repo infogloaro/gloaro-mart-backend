@@ -230,6 +230,10 @@ router.get("/vendors/kyc-summary", kyc.listKycSummary);
 router.get("/vendors/reports", shopReports.adminListReports);
 router.get("/vendors/reports/:reportId", shopReports.adminGetReport);
 router.patch("/vendors/reports/:reportId", shopReports.adminCloseReport);
+// T20: shop messages to followers (VD23), paused / busy shops (VD2), shop health (VD29). Read-only.
+router.get("/vendors/broadcasts", require("../controllers/adminVendorInsights.controller").listBroadcasts);
+router.get("/vendors/paused", require("../controllers/adminVendorInsights.controller").listPausedShops);
+router.get("/vendors/health", require("../controllers/adminVendorInsights.controller").listShopHealth);
 router.get("/vendors/:id/performance", matching.getVendorPerformance);
 router.get("/vendors/:id/documents", kyc.listVendorDocuments);
 router.post("/vendors/:id/documents", kyc.createDocument);

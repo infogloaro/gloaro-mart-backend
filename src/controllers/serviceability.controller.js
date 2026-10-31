@@ -59,7 +59,8 @@ function isOpenNow(rules, now = new Date()) {
 
 function etaMinutes(rules, distanceKm) {
   const travel = distanceKm == null ? 0 : Math.ceil((distanceKm / AVERAGE_SPEED_KMPH) * 60);
-  return (rules.preparation_minutes ?? 30) + travel;
+  // VD2: a busy shop's extra preparation time.
+  return (rules.preparation_minutes ?? 30) + (rules.busy_minutes ?? 0) + travel;
 }
 
 /**
@@ -216,11 +217,12 @@ async function evaluate({ userId, addressId, items }) {
   }
 
   const vendorIds = [...new Set(products.map((p) => p.vendor_id))];
-  const [{ rows: areaRows }, { rows: ruleRows }, openNow, routing] = await Promise.all([
+  const [{ rows: areaRows }, { rows: ruleRows }, openNow, routing, busy] = await Promise.all([
     pool.query('SELECT * FROM vendor_service_areas WHERE vendor_id = ANY($1) AND is_active = true', [vendorIds]),
     pool.query('SELECT * FROM vendor_delivery_rules WHERE vendor_id = ANY($1)', [vendorIds]),
     shopHours.openNowFor(vendorIds),
     deliveryRouting.getSettings(),
+    shopHours.busyMinutesFor(vendorIds),
   ]);
   const areasByVendor = new Map();
   for (const area of areaRows) {
@@ -256,7 +258,7 @@ async function evaluate({ userId, addressId, items }) {
     const evaluated = evaluateVendor({
       vendor: { id: vendorId, business_name: first.business_name },
       areas: areasByVendor.get(vendorId) || [],
-      rules: { ...rulesFor(rulesByVendor, vendorId), open_now: openNow.get(vendorId) },
+      rules: { ...rulesFor(rulesByVendor, vendorId), open_now: openNow.get(vendorId), busy_minutes: busy.get(vendorId) ?? 0 },
       address,
       distanceKm: first.distance_km == null ? null : Number(first.distance_km),
       subtotalCents,

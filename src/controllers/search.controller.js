@@ -99,9 +99,9 @@ const JOINS = `
   LEFT JOIN vendor_delivery_rules dr ON dr.vendor_id = vp.id
   LEFT JOIN vendor_performance_metrics pm ON pm.vendor_id = vp.id`;
 
-/** Preparation time plus travel, as SQL — needed both to filter and to sort by. */
+/** Preparation time (plus a busy shop's extra, VD2) plus travel, as SQL — needed both to filter and to sort by. */
 function etaExpression() {
-  return `(COALESCE(dr.preparation_minutes, ${DEFAULT_PREPARATION_MINUTES}) +
+  return `(COALESCE(dr.preparation_minutes, ${DEFAULT_PREPARATION_MINUTES}) + shop_busy_minutes(vp.id, now()) +
      CASE WHEN vp.latitude IS NOT NULL AND vp.longitude IS NOT NULL
                AND $1::float8 IS NOT NULL AND $2::float8 IS NOT NULL
           THEN CEIL(earth_distance(ll_to_earth($1, $2), ll_to_earth(vp.latitude, vp.longitude))

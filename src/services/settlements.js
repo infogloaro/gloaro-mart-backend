@@ -389,4 +389,4 @@ async function addAdjustment({ id, amountCents, note, userId }) {
   }
 }
 
-module.exports = { SettlementError, generateDueSettlements, approve, hold, pay, fail, addAdjustment, mask };
+module.exports = { SettlementError, generateDueSettlements, approve, hold, pay, fail, addAdjustment, mask, grossFor, commissionFor, DELIVERED_AT };

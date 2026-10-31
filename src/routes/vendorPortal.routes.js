@@ -37,6 +37,36 @@ const router = express.Router();
 router.use(requireAuth, requireRole('vendor'), attachVendor);
 
 router.get('/dashboard', portal.getDashboard);
+// How the shop did over a range of days (VD1).
+router.get('/insights', portal.getInsights);
+// Pause taking orders, or ask for more preparation time (VD2).
+router.get('/status', portal.getStatus);
+router.put('/status', portal.setStatus);
+// Printable invoice / packing slip / label for one of the shop's orders (VD7).
+router.post('/orders/:id/documents', portal.documentLink);
+// Views, add-to-carts and sales per product (VD13).
+router.get('/products/stats', portal.productStats);
+// Add or change many products from a pasted spreadsheet (VD14).
+router.post('/products/import', require('../controllers/vendorImport.controller').importProducts);
+// Returns on the shop's orders: where each stands, and the shop's note (VD9).
+router.get('/returns', require('../controllers/returns.controller').vendorListReturns);
+router.get('/returns/:id', require('../controllers/returns.controller').vendorGetReturn);
+router.post('/returns/:id/note', require('../controllers/returns.controller').vendorNoteReturn);
+// A message from the shop to its followers who want offer alerts (VD23).
+router.get('/broadcasts', require('../controllers/vendorBroadcast.controller').getBroadcasts);
+router.post('/broadcasts', require('../controllers/vendorBroadcast.controller').sendBroadcast);
+// Reports: sales by day, category and product over a range (VD16).
+router.get('/reports/sales', require('../controllers/vendorReports.controller').salesReport);
+router.get('/reports/inventory', require('../controllers/vendorReportInventory.controller').inventoryReport); // VD19
+router.get('/reports/payments', require('../controllers/vendorReportPayments.controller').paymentsReport); // VD17
+router.get('/notification-prefs', require('../controllers/vendorNotificationPrefs.controller').getPrefs); // VD28
+router.put('/notification-prefs', require('../controllers/vendorNotificationPrefs.controller').updatePrefs); // VD28
+router.get('/reports/gst', require('../controllers/vendorReportGst.controller').gstReport); // VD18
+router.get('/reports/cancellations', require('../controllers/vendorReportCancellations.controller').cancellationsReport); // VD21
+router.get('/reports/customers', require('../controllers/vendorReportCustomers.controller').customersReport); // VD20
+router.get('/reports/promotions', require('../controllers/vendorReportPromotions.controller').promotionsReport); // VD22
+router.get('/health', require('../controllers/vendorHealth.controller').getHealth); // VD29
+router.get('/plan', require('../controllers/vendorPlan.controller').getPlan); // VD26
 
 // Campaigns the shop would pay for, and joining or leaving them.
 router.get('/campaigns', campaigns.vendorCampaigns);
@@ -50,6 +80,8 @@ router.delete('/reviews/:id/reply', reviews.vendorDeleteReply);
 
 // Payouts: the shop's settlements and the account they're paid into.
 router.get('/settlements', settlements.vendorListSettlements);
+router.get('/settlements/next', settlements.vendorNextPayout);
+router.get('/settlements/statement', settlements.vendorStatement);
 router.get('/settlements/:id', settlements.vendorGetSettlement);
 router.get('/bank-account', settlements.vendorGetBankAccount);
 router.put('/bank-account', settlements.vendorSaveBankAccount);

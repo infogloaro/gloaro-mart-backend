@@ -21,6 +21,8 @@ router.param('returnId', numericId);
 
 router.post('/checkout', requireAuth, orderController.checkout);
 router.get('/vendor', requireAuth, requireRole('vendor'), orderController.getVendorOrders);
+// VD7: a shop's printable order document, opened in the browser; the signed link is the key.
+router.get('/documents/:token', require('../controllers/vendorPortal.controller').documentPage);
 // Literal paths stay above '/:id', or Express matches 'groups' as an order id.
 router.get('/groups', requireAuth, orderController.getOrderGroups);
 router.get('/groups/:id', requireAuth, orderController.getOrderGroup);
