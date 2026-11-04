@@ -342,6 +342,10 @@ router.get("/categories", category.listAllCategories);
 router.post("/categories", category.createCategory);
 router.patch("/categories/:id", category.updateCategory);
 router.delete("/categories/:id", category.deleteCategory);
+// CT1: each category's sub-categories.
+router.post("/categories/:id/subcategories", category.createSubcategory);
+router.patch("/categories/:id/subcategories/:subId", category.updateSubcategory);
+router.delete("/categories/:id/subcategories/:subId", category.deleteSubcategory);
 
 // NS4: Near Me service categories and service moderation.
 router.get("/service-categories", adminServices.listCategories);

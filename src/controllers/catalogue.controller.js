@@ -134,10 +134,10 @@ async function loadProductCatalogue(productId) {
      FROM product_attributes a
      LEFT JOIN attribute_values av ON av.attribute_id = a.id
      WHERE a.is_active = true
-       AND (a.category_id IS NULL
-            OR a.category_id = (SELECT c.id FROM categories c
-                                JOIN products p ON p.category = c.name
-                                WHERE p.id = $1))
+       AND ((a.category_id IS NULL AND a.category_ids IS NULL)
+            OR EXISTS (SELECT 1 FROM categories c
+                       JOIN products p ON p.category = c.name
+                       WHERE p.id = $1 AND (c.id = a.category_id OR c.id = ANY(a.category_ids))))
      GROUP BY a.id
      ORDER BY a.sort_order ASC, a.id ASC`,
     [productId]
@@ -225,13 +225,16 @@ async function listAttributes(req, res) {
     params.push(Number(categoryId));
     // NULL means every category, so a scoped list must include the global ones
     // or Fashion would stop offering 'Material'.
-    conditions.push(`(a.category_id = $${params.length} OR a.category_id IS NULL)`);
+    conditions.push(
+      `(a.category_id = $${params.length} OR $${params.length} = ANY(a.category_ids) OR (a.category_id IS NULL AND a.category_ids IS NULL))`
+    );
   }
   if (includeInactive !== 'true') conditions.push('a.is_active = true');
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
   const { rows } = await pool.query(
     `SELECT a.*, c.name AS category_name,
+            (SELECT array_agg(c2.name ORDER BY c2.sort_order, c2.name) FROM categories c2 WHERE c2.id = ANY(a.category_ids)) AS category_names,
             COALESCE(
               json_agg(json_build_object('id', av.id, 'value', av.value, 'sortOrder', av.sort_order, 'colorHex', av.color_hex)
                        ORDER BY av.sort_order, av.id)
@@ -249,8 +252,15 @@ async function listAttributes(req, res) {
   res.json(rows);
 }
 
+/** Every category a filter applies to (CT1): positive ids, or null for none listed. */
+function normaliseCategoryIds(value) {
+  if (!Array.isArray(value)) return null;
+  const ids = [...new Set(value.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  return ids.length ? ids : null;
+}
+
 async function createAttribute(req, res) {
-  const { name, code, categoryId, inputType, isVariantDefining, sortOrder, isFilter, filterKind, unit, subcategories } =
+  const { name, code, categoryId, categoryIds, inputType, isVariantDefining, sortOrder, isFilter, filterKind, unit, subcategories } =
     req.body || {};
   if (!name || !code) return res.status(400).json({ message: 'name and code are required' });
   if (inputType && !INPUT_TYPES.includes(inputType)) {
@@ -263,12 +273,12 @@ async function createAttribute(req, res) {
   try {
     const { rows } = await pool.query(
       `INSERT INTO product_attributes
-         (name, code, category_id, input_type, is_variant_defining, sort_order, is_filter, filter_kind, unit, subcategories)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+         (name, code, category_id, input_type, is_variant_defining, sort_order, is_filter, filter_kind, unit, subcategories, category_ids)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
       [
         name,
         code,
-        categoryId ?? null,
+        categoryId ?? normaliseCategoryIds(categoryIds)?.[0] ?? null,
         inputType || 'select',
         isVariantDefining ?? true,
         sortOrder ?? 0,
@@ -276,6 +286,7 @@ async function createAttribute(req, res) {
         filterKind || 'chips',
         unit || null,
         normaliseSubcategories(subcategories),
+        normaliseCategoryIds(categoryIds),
       ]
     );
     res.status(201).json(rows[0]);
@@ -309,7 +320,8 @@ async function updateAttribute(req, res) {
        is_filter = COALESCE($8, is_filter),
        filter_kind = COALESCE($9, filter_kind),
        unit = CASE WHEN $10::boolean THEN NULLIF(trim($11::text), '') ELSE unit END,
-       subcategories = CASE WHEN $12::boolean THEN $13::text[] ELSE subcategories END
+       subcategories = CASE WHEN $12::boolean THEN $13::text[] ELSE subcategories END,
+       category_ids = CASE WHEN $14::boolean THEN $15::int[] ELSE category_ids END
      WHERE id = $1 RETURNING *`,
     [
       req.params.id,
@@ -325,6 +337,8 @@ async function updateAttribute(req, res) {
       unit == null ? '' : String(unit),
       'subcategories' in body,
       normaliseSubcategories(subcategories),
+      'categoryIds' in body,
+      normaliseCategoryIds(body.categoryIds),
     ]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Attribute not found' });

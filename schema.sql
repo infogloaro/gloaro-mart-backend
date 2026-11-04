@@ -4392,3 +4392,19 @@ CREATE TABLE IF NOT EXISTS vendor_notification_prefs (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (vendor_id, topic, channel)
 );
+
+-- ===== CATEGORY TAXONOMY (CT1) =====
+-- An admin-owned list of sub-categories per category (products still store
+-- the name in products.subcategory), and filters shared by several categories
+-- (category_ids; category_id stays the main one). scripts/migrate-category-taxonomy.js
+CREATE TABLE IF NOT EXISTS category_subcategories (
+  id SERIAL PRIMARY KEY,
+  category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_category_subcategories_name ON category_subcategories(category_id, lower(name));
+ALTER TABLE product_attributes ADD COLUMN IF NOT EXISTS category_ids INTEGER[];
+CREATE INDEX IF NOT EXISTS idx_product_attributes_category_ids ON product_attributes USING GIN (category_ids);

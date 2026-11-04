@@ -525,6 +525,7 @@ async function documentPage(req, res) {
 async function listAttributes(req, res) {
   const { rows } = await pool.query(
     `SELECT a.id, a.name, a.code, a.input_type, a.is_variant_defining, c.name AS category_name,
+            (SELECT array_agg(c3.name ORDER BY c3.sort_order, c3.name) FROM categories c3 WHERE c3.id = ANY(a.category_ids)) AS category_names,
             a.is_filter, a.filter_kind, a.unit, a.subcategories,
             COALESCE(
               json_agg(json_build_object('id', av.id, 'value', av.value, 'colorHex', av.color_hex)
@@ -536,7 +537,8 @@ async function listAttributes(req, res) {
      LEFT JOIN categories c ON c.id = a.category_id
      LEFT JOIN attribute_values av ON av.attribute_id = a.id
      WHERE a.is_active = true
-       AND ($1::text IS NULL OR c.name = $1 OR a.category_id IS NULL)
+       AND ($1::text IS NULL OR c.name = $1 OR (a.category_id IS NULL AND a.category_ids IS NULL)
+            OR EXISTS (SELECT 1 FROM categories c2 WHERE c2.name = $1 AND c2.id = ANY(a.category_ids)))
      GROUP BY a.id, c.name
      ORDER BY a.sort_order ASC, a.id ASC`,
     [req.query.category || null]
