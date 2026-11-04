@@ -193,6 +193,7 @@ router.get("/reviews/summary", review.adminSummary);
 router.patch("/reviews/:id", review.adminModerate);
 router.post("/reviews/:id/dismiss-reports", review.adminDismissReports);
 router.delete("/reviews/:id/reply", review.adminDeleteReply);
+router.post("/reviews/:id/remove-photo", review.adminRemovePhoto);
 
 // Home sections — guarded by the home_sections permission module.
 router.get("/home-sections", homeSections.listSections);

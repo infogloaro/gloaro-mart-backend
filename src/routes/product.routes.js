@@ -19,6 +19,7 @@ router.get('/:id/tiers', productController.getTiers);
 // Public reviews (optionalAuth only to mark the ones the viewer found helpful),
 // and the signed-in customer's own review of the product.
 router.get('/:id/reviews', optionalAuth, review.listProductReviews);
+router.get('/:id/review-photos', review.listProductPhotos);
 router.get('/:id/review', requireAuth, review.getMyProductReview);
 router.put('/:id/review', requireAuth, review.upsertProductReview);
 router.put('/:id/tiers', requireAuth, requireRole('vendor'), productController.setTiers);

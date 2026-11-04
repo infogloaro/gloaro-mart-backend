@@ -331,6 +331,8 @@ const PUBLIC_SORTS = {
 
 /** Published reviews matching `where`, in the shape both public lists return. */
 async function publicReviews(req, where, params) {
+  // ?withPhotos=1 keeps only reviews that carry customer photos.
+  if (req.query.withPhotos === '1' || req.query.withPhotos === 'true') where += ' AND jsonb_array_length(r.photos) > 0';
   const limit = Math.min(Number(req.query.limit) || 20, 100);
   const page = Math.max(Number(req.query.page) || 1, 1);
   const order = PUBLIC_SORTS[req.query.sort] ?? PUBLIC_SORTS.recent;
@@ -353,6 +355,17 @@ async function publicReviews(req, where, params) {
   return rows;
 }
 
+/** How many published reviews matching `where` have photos, and how many photos in all. */
+async function photoCountsOf(where, params) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) FILTER (WHERE jsonb_array_length(r.photos) > 0)::int AS with_photos,
+            COALESCE(SUM(jsonb_array_length(r.photos)), 0)::int AS photos
+     FROM vendor_reviews r WHERE ${where} AND r.status = 'published'`,
+    params
+  );
+  return { with_photos_count: rows[0].with_photos, photo_count: rows[0].photos };
+}
+
 /**
  * A shop's reviews with its rating summary. Public: this is what a customer
  * reads before deciding to buy.
@@ -368,11 +381,12 @@ async function listVendorReviews(req, res) {
   const summary = summaryRows[0] ?? { count: 0, average: null };
   const where = "r.vendor_id = $1 AND r.target = 'vendor'";
 
-  const [distribution, reviews] = await Promise.all([
+  const [distribution, reviews, photos] = await Promise.all([
     distributionOf(where, [req.params.id]),
     publicReviews(req, where, [req.params.id]),
+    photoCountsOf(where, [req.params.id]),
   ]);
-  res.json({ average: summary.average, count: summary.count, distribution, reviews });
+  res.json({ average: summary.average, count: summary.count, distribution, ...photos, reviews });
 }
 
 /** A product's published reviews with its rating summary. Public. */
@@ -381,16 +395,43 @@ async function listProductReviews(req, res) {
   if (!rows[0]) return res.status(404).json({ message: 'Product not found' });
   const where = "r.product_id = $1 AND r.target = 'product'";
 
-  const [distribution, reviews] = await Promise.all([
+  const [distribution, reviews, photos] = await Promise.all([
     distributionOf(where, [req.params.id]),
     publicReviews(req, where, [req.params.id]),
+    photoCountsOf(where, [req.params.id]),
   ]);
   res.json({
     average: rows[0].rating_average == null ? null : Number(rows[0].rating_average),
     count: rows[0].rating_count,
     distribution,
+    ...photos,
     reviews,
   });
+}
+
+/**
+ * Every customer photo of a product, newest review first, each with the
+ * review it belongs to — the product page's "Customer photos" strip and its
+ * gallery. Public; published reviews only. ?limit (default 60, max 200).
+ */
+async function listProductPhotos(req, res) {
+  const limit = Math.min(Number(req.query.limit) || 60, 200);
+  const { rows: exists } = await pool.query('SELECT 1 FROM products WHERE id = $1', [req.params.id]);
+  if (!exists[0]) return res.status(404).json({ message: 'Product not found' });
+  const where = "r.product_id = $1 AND r.target = 'product'";
+  const { rows } = await pool.query(
+    `SELECT p.path AS url, r.id AS review_id, r.rating, r.created_at, u.full_name AS customer_name,
+            r.order_id IS NOT NULL AS verified_purchase
+     FROM vendor_reviews r
+     JOIN users u ON u.id = r.user_id
+     CROSS JOIN LATERAL jsonb_array_elements_text(r.photos) WITH ORDINALITY AS p(path, n)
+     WHERE ${where} AND r.status = 'published'
+     ORDER BY r.created_at DESC, p.n
+     LIMIT $2`,
+    [req.params.id, limit]
+  );
+  const counts = await photoCountsOf(where, [req.params.id]);
+  res.json({ total: counts.photo_count, photos: rows });
 }
 
 // ------------------------------------------------------------------ vendors
@@ -722,7 +763,42 @@ async function adminDeleteReply(req, res) {
   res.json(await loadAdminReview(req.params.id));
 }
 
+/**
+ * Takes one photo off a review — wrong, blurry or not suitable — without
+ * taking the review down. Body: { path } (as listed in the review's photos).
+ * The author is told; the review's words and stars stay up.
+ */
+async function adminRemovePhoto(req, res) {
+  const path = req.body?.path;
+  if (typeof path !== 'string' || !path) return res.status(400).json({ message: 'path is required' });
+  const { rows } = await pool.query(
+    `UPDATE vendor_reviews
+     SET photos = COALESCE((SELECT jsonb_agg(p) FROM jsonb_array_elements(photos) p WHERE p #>> '{}' <> $2), '[]'::jsonb)
+     WHERE id = $1 AND photos ? $2
+     RETURNING id, user_id, order_id`,
+    [req.params.id, path]
+  );
+  if (!rows[0]) return res.status(404).json({ message: 'That photo is not on this review.' });
+  await notify(
+    rows[0].user_id,
+    'review_photo_removed',
+    'A photo was removed from your review',
+    "It didn't meet our photo guidelines. The rest of your review stays up.",
+    rows[0].order_id
+  );
+  await recordAudit({
+    actorUserId: req.user.id,
+    action: 'review.photo_removed',
+    module: MODULE,
+    entityType: 'review',
+    entityId: req.params.id,
+    previousValue: { photo: path },
+  });
+  res.json(await loadAdminReview(req.params.id));
+}
+
 module.exports = {
+  adminRemovePhoto,
   refreshRatings,
   upsertReview,
   getReviewForOrder,
@@ -734,6 +810,7 @@ module.exports = {
   unmarkHelpful,
   listVendorReviews,
   listProductReviews,
+  listProductPhotos,
   vendorListReviews,
   vendorReply,
   vendorDeleteReply,
