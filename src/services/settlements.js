@@ -225,7 +225,8 @@ async function generateDueSettlements() {
         await client.query(
           `INSERT INTO settlement_deductions (settlement_id, kind, label, amount_cents, note, vendor_charge_id)
            VALUES ($1, $2, $3, $4, $5, $6)`,
-          [settlement.id, ch.amount_cents > 0 ? 'advertising' : 'adjustment', ch.label, ch.amount_cents, ch.kind, ch.id]
+          // SV8: service bookings — commission owed shows as commission; an online-paid booking is a credit.
+          [settlement.id, ch.kind === 'service_commission' ? 'commission' : ch.amount_cents > 0 ? 'advertising' : 'adjustment', ch.label, ch.amount_cents, ch.kind, ch.id]
         );
         await client.query('UPDATE vendor_charges SET settlement_id = $2 WHERE id = $1', [ch.id, settlement.id]);
       }

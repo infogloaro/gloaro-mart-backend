@@ -134,6 +134,9 @@ if (unpaidSeconds > 0) {
     try {
       const r = await expireUnpaid();
       if (r.cancelledOrders.length) console.log(`[payments] unpaid orders cancelled: ${r.cancelledOrders.map((id) => `#${id}`).join(', ')}`);
+      // SV8: pay-now service bookings nobody paid in time are released too.
+      const b = await require('./src/services/serviceCommissions').expireUnpaid();
+      if (b.cancelled.length) console.log(`[bookings] unpaid bookings released: ${b.cancelled.map((id) => `#${id}`).join(', ')}`);
     } catch (err) {
       console.error(`[payments] unpaid sweep failed: ${err.message}`);
     } finally {

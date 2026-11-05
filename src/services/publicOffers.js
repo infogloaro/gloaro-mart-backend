@@ -38,6 +38,11 @@ function optionalDate(value, name) {
  */
 function readRules(body = {}) {
   const out = {};
+  // SV7: where the code works — shopping orders, service bookings, or both.
+  if (body.scope !== undefined) {
+    if (!['orders', 'services', 'both'].includes(body.scope)) throw new OfferError(400, 'scope must be orders, services or both.');
+    out.scope = body.scope;
+  }
   if (body.isPublic !== undefined) {
     if (typeof body.isPublic !== 'boolean') throw new OfferError(400, 'isPublic must be true or false.');
     out.is_public = body.isPublic;
@@ -90,8 +95,10 @@ async function checkRules(coupon, { userId } = {}) {
   if (coupon.max_uses == null && !needUser) return;
   const { rows } = await pool.query(
     `SELECT
-       (SELECT COUNT(*)::int FROM orders WHERE coupon_id = $1 AND status <> 'cancelled') AS used,
-       (SELECT COUNT(*)::int FROM orders WHERE coupon_id = $1 AND user_id = $2 AND status <> 'cancelled') AS used_by_me,
+       (SELECT COUNT(*)::int FROM orders WHERE coupon_id = $1 AND status <> 'cancelled')
+         + (SELECT COUNT(*)::int FROM service_bookings WHERE coupon_id = $1 AND status NOT IN ('cancelled', 'rejected')) AS used,
+       (SELECT COUNT(*)::int FROM orders WHERE coupon_id = $1 AND user_id = $2 AND status <> 'cancelled')
+         + (SELECT COUNT(*)::int FROM service_bookings WHERE coupon_id = $1 AND user_id = $2 AND status NOT IN ('cancelled', 'rejected')) AS used_by_me,
        (SELECT COUNT(*)::int FROM orders WHERE user_id = $2 AND status <> 'cancelled'
           AND ($3::int IS NULL OR vendor_id = $3::int)) AS my_orders`,
     [coupon.id, userId ?? null, coupon.vendor_id]
@@ -111,8 +118,11 @@ async function checkRules(coupon, { userId } = {}) {
 async function useCounts(couponIds) {
   if (couponIds.length === 0) return new Map();
   const { rows } = await pool.query(
-    `SELECT coupon_id, COUNT(*)::int AS n FROM orders
-     WHERE coupon_id = ANY($1) AND status <> 'cancelled' GROUP BY coupon_id`,
+    `SELECT coupon_id, SUM(n)::int AS n FROM (
+       SELECT coupon_id, COUNT(*) AS n FROM orders WHERE coupon_id = ANY($1) AND status <> 'cancelled' GROUP BY coupon_id
+       UNION ALL
+       SELECT coupon_id, COUNT(*) FROM service_bookings WHERE coupon_id = ANY($1) AND status NOT IN ('cancelled', 'rejected') GROUP BY coupon_id
+     ) x GROUP BY coupon_id`,
     [couponIds]
   );
   return new Map(rows.map((r) => [r.coupon_id, r.n]));

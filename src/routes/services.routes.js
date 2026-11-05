@@ -8,6 +8,8 @@ const router = express.Router();
 
 router.get('/categories', services.categories);
 router.get('/', services.list);
+// SV3: the first free time of each service on a list page.
+router.get('/next-slots', bookings.nextSlots);
 router.get('/:id/reviews', enquiries.serviceReviewsList);
 // NS10: free times to book.
 router.get('/:id/slots', bookings.slots);

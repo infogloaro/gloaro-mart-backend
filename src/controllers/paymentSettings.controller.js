@@ -28,6 +28,9 @@ async function overview(req) {
     onlineEnabled: s.online_enabled,
     codEnabled: s.cod_enabled,
     codMaxCents: s.cod_max_cents,
+    // SV7: service bookings.
+    bookingPayNow: s.booking_pay_now ?? 'off',
+    bookingRefundOnCancel: s.booking_refund_on_cancel !== false,
     updatedAt: s.updated_at,
     // What customers actually get, after the keys are checked.
     onlineLive: s.online_enabled && ready,
@@ -70,7 +73,7 @@ async function setupRazorpay(req, res) {
 async function updateSettings(req, res) {
   const b = req.body ?? {};
   const set = {};
-  for (const [key, column] of [['onlineEnabled', 'online_enabled'], ['codEnabled', 'cod_enabled']]) {
+  for (const [key, column] of [['onlineEnabled', 'online_enabled'], ['codEnabled', 'cod_enabled'], ['bookingRefundOnCancel', 'booking_refund_on_cancel']]) {
     if (b[key] === undefined) continue;
     if (typeof b[key] !== 'boolean') return res.status(400).json({ message: `${key} is on or off.` });
     set[column] = b[key];
@@ -81,6 +84,14 @@ async function updateSettings(req, res) {
       return res.status(400).json({ message: 'The COD limit is an amount in paise, or empty for no limit.' });
     }
     set.cod_max_cents = v;
+  }
+  if (b.bookingPayNow !== undefined) {
+    if (!['off', 'optional', 'required'].includes(b.bookingPayNow)) return res.status(400).json({ message: 'bookingPayNow is off, optional or required.' });
+    set.booking_pay_now = b.bookingPayNow;
+  }
+  if (b.bookingPayNow !== undefined) {
+    if (!['off', 'optional', 'required'].includes(b.bookingPayNow)) return res.status(400).json({ message: 'bookingPayNow is off, optional or required.' });
+    set.booking_pay_now = b.bookingPayNow;
   }
   const keys = Object.keys(set);
   if (!keys.length) return res.status(400).json({ message: 'Nothing to change.' });

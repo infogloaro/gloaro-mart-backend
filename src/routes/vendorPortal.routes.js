@@ -128,10 +128,16 @@ router.get('/services', vendorServices.list);
 router.post('/services', vendorServices.create);
 router.patch('/services/:id', vendorServices.update);
 router.delete('/services/:id', vendorServices.remove);
+// SV4: a service's packages and add-ons, replaced as a whole.
+router.put('/services/:id/packages', vendorServices.setPackages);
+router.put('/services/:id/addons', vendorServices.setAddons);
 
 // NS10: bookings of the shop's services, and times it blocks.
+router.get('/service-earnings', serviceBookings.vendorEarnings); // SV8
 router.get('/bookings', serviceBookings.vendorList);
 router.get('/bookings/:id', serviceBookings.vendorGet);
+router.get('/bookings/:id/invoice', serviceBookings.vendorInvoice); // SV9
+router.get('/bookings/:id/invoice.pdf', serviceBookings.vendorInvoice);
 // accept | reject | start | complete | cancel (anything else is refused by the service).
 router.post('/bookings/:id/:action', serviceBookings.vendorMove);
 router.get('/booking-blocks', serviceBookings.vendorBlocks);

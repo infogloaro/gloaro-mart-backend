@@ -12,7 +12,7 @@ const { sendMail } = require('../services/mailer');
 
 const MODULE = 'support';
 const PAGE_SIZE = 25;
-const CATEGORIES = ['order', 'payment', 'delivery', 'vendor', 'product', 'account', 'other'];
+const CATEGORIES = ['order', 'payment', 'delivery', 'vendor', 'product', 'account', 'service', 'other'];
 const PRIORITIES = ['low', 'normal', 'high', 'urgent'];
 const STATUSES = ['open', 'pending_customer', 'pending_vendor', 'resolved', 'closed'];
 const DONE = ['resolved', 'closed'];
@@ -59,13 +59,15 @@ const SELECT = `
          vp.business_name AS vendor_name,
          a.full_name AS assignee_name,
          CASE WHEN t.order_id IS NULL THEN NULL ELSE COALESCE(cg.reference, '#' || t.order_id) END AS order_reference,
+         sb.reference AS booking_reference, sb.service_title AS booking_service,
          (SELECT COUNT(*)::int FROM support_ticket_messages m WHERE m.ticket_id = t.id AND NOT m.internal) AS message_count
   FROM support_tickets t
   JOIN users u ON u.id = t.requester_user_id
   LEFT JOIN vendor_profiles vp ON vp.id = t.vendor_id
   LEFT JOIN users a ON a.id = t.assignee_id
   LEFT JOIN orders o ON o.id = t.order_id
-  LEFT JOIN checkout_groups cg ON cg.id = o.checkout_group_id`;
+  LEFT JOIN checkout_groups cg ON cg.id = o.checkout_group_id
+  LEFT JOIN service_bookings sb ON sb.id = t.booking_id`;
 
 const BREACHED = `t.status NOT IN ('resolved', 'closed') AND (
   (t.first_responded_at IS NULL AND t.first_response_due_at < now()) OR t.resolution_due_at < now())`;
@@ -84,6 +86,10 @@ function adminJson(t) {
     requesterPhone: t.requester_phone,
     orderId: t.order_id,
     orderReference: t.order_reference,
+    // SV9: the service booking it is about.
+    bookingId: t.booking_id ?? null,
+    bookingReference: t.booking_reference ?? null,
+    bookingService: t.booking_service ?? null,
     vendorName: t.vendor_name,
     assigneeId: t.assignee_id,
     assigneeName: t.assignee_name,
@@ -108,6 +114,8 @@ function requesterJson(t) {
     status: t.status,
     order_id: t.order_id,
     order_reference: t.order_reference,
+    booking_id: t.booking_id ?? null,
+    booking_reference: t.booking_reference ?? null,
     message_count: t.message_count,
     last_message_at: t.last_message_at,
     last_message_from: t.last_message_from,
@@ -200,6 +208,18 @@ async function createTicket(req, res) {
       vendorId = rows[0].vendor_id;
     }
 
+    // SV9: a service booking — the requester's own, or one at the requester's shop.
+    let bookingId = null;
+    if (req.body?.bookingId != null) {
+      const { rows } = await pool.query(
+        role === 'vendor' ? 'SELECT id, vendor_id FROM service_bookings WHERE id = $1 AND vendor_id = $2' : 'SELECT id, vendor_id FROM service_bookings WHERE id = $1 AND user_id = $2',
+        [req.body.bookingId, role === 'vendor' ? vendorId : req.user.id]
+      );
+      if (!rows[0]) throw new SupportError(404, 'Booking not found');
+      bookingId = rows[0].id;
+      vendorId = rows[0].vendor_id;
+    }
+
     const { rows: openRows } = await pool.query(
       "SELECT COUNT(*)::int AS n FROM support_tickets WHERE requester_user_id = $1 AND status NOT IN ('resolved', 'closed')",
       [req.user.id]
@@ -218,10 +238,10 @@ async function createTicket(req, res) {
       const reference = `TKT-${now.getFullYear()}-${String(seq[0].n).padStart(5, '0')}`;
       const { rows } = await client.query(
         `INSERT INTO support_tickets (reference, requester_user_id, requester_type, vendor_id, order_id, subject, category,
-           priority, first_response_due_at, resolution_due_at, last_message_at, last_message_from, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $3, $11) RETURNING id`,
+           priority, first_response_due_at, resolution_due_at, last_message_at, last_message_from, created_at, booking_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $3, $11, $12) RETURNING id`,
         [reference, req.user.id, role, vendorId, orderId, subject, category, priority,
-          dueAt(now, SLA[priority].firstResponse), dueAt(now, SLA[priority].resolution), now]
+          dueAt(now, SLA[priority].firstResponse), dueAt(now, SLA[priority].resolution), now, bookingId]
       );
       id = rows[0].id;
       await addMessage(client, { ticketId: id, userId: req.user.id, role, text: message.text, attachments: message.attachments });
@@ -342,6 +362,11 @@ async function adminListTickets(req, res) {
     if (!ADMIN_FILTERS[req.query.filter]) return res.status(400).json({ message: 'Unknown filter' });
     conditions.push(ADMIN_FILTERS[req.query.filter]);
   }
+  // SV10: one category (e.g. service = complaints about bookings).
+  if (req.query.category && CATEGORIES.includes(req.query.category)) {
+    params.push(req.query.category);
+    conditions.push(`t.category = $${params.length}`);
+  }
   if (req.query.q) {
     params.push(`%${req.query.q}%`);
     const p = `$${params.length}`;
@@ -356,7 +381,7 @@ async function adminListTickets(req, res) {
     pool.query(
       `SELECT COUNT(*)::int AS total FROM support_tickets t JOIN users u ON u.id = t.requester_user_id
        LEFT JOIN vendor_profiles vp ON vp.id = t.vendor_id LEFT JOIN orders o ON o.id = t.order_id
-       LEFT JOIN checkout_groups cg ON cg.id = o.checkout_group_id ${where}`,
+       LEFT JOIN checkout_groups cg ON cg.id = o.checkout_group_id LEFT JOIN service_bookings sb ON sb.id = t.booking_id ${where}`,
       params
     ),
   ]);

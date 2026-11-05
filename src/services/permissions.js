@@ -51,8 +51,8 @@ const MODULES = [
     label: "Categories",
     group: "Catalogue",
     // NS4: the Near Me service categories and service moderation too.
-    routes: ["categories", "service-categories", "services"],
-    covers: ["Categories", "Service categories", "Services"],
+    routes: ["categories", "service-categories", "services", "service-bookings", "service-commissions"],
+    covers: ["Categories", "Service categories", "Services", "Service bookings"],
   },
   { key: "brands", label: "Brands", group: "Catalogue", routes: ["brands"] },
   { key: "attributes", label: "Attributes", group: "Catalogue", routes: ["attributes"] },

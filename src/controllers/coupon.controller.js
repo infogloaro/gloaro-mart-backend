@@ -97,14 +97,17 @@ async function deleteCoupon(req, res) {
 }
 
 const validateCoupon = offers(async (req, res) => {
-  const { vendorId, code, subtotalCents, deliveryChargeCents } = req.body || {};
+  const { vendorId, code, subtotalCents, deliveryChargeCents, scope } = req.body || {};
+  // SV7: scope 'service' = a booking; only coupons meant for services count.
+  const forService = scope === 'service';
   if (!vendorId || !code || !Number.isInteger(subtotalCents)) {
     return res.status(400).json({ message: 'vendorId, code, and subtotalCents are required' });
   }
   const { rows } = await pool.query(
     `SELECT * FROM coupons WHERE (vendor_id = $1 OR vendor_id IS NULL) AND code = $2 AND is_active = true
+       AND scope ${forService ? "IN ('services', 'both')" : "IN ('orders', 'both')"} AND ($3 = false OR discount_type <> 'free_delivery')
      ORDER BY vendor_id NULLS LAST LIMIT 1`,
-    [vendorId, code.toUpperCase()]
+    [vendorId, code.toUpperCase(), forService]
   );
   const coupon = rows[0];
   if (!coupon) return res.status(404).json({ message: 'Invalid coupon code' });
@@ -159,6 +162,34 @@ async function resolveCouponForCheckout(vendorId, code, subtotalCents, { userId,
   return { couponId: coupon.id, code: coupon.code, discountCents: computeDiscountCents(coupon, subtotalCents, deliveryChargeCents) };
 }
 
+/**
+ * SV7: a coupon on a service booking, checked the same way at booking time.
+ * Only coupons with scope 'services' or 'both'; free delivery means nothing
+ * here. Returns { couponId, code, discountCents } or throws a BookingError-
+ * shaped { status, message }.
+ */
+async function resolveServiceCoupon(db, vendorId, code, subtotalCents, { userId } = {}) {
+  const { rows } = await db.query(
+    `SELECT * FROM coupons WHERE (vendor_id = $1 OR vendor_id IS NULL) AND code = $2 AND is_active = true
+       AND scope IN ('services', 'both') AND discount_type <> 'free_delivery'
+     ORDER BY vendor_id NULLS LAST LIMIT 1`,
+    [vendorId, code.toUpperCase()]
+  );
+  const coupon = rows[0];
+  if (!coupon) throw { status: 400, message: `Coupon "${code}" doesn't work on this booking.` };
+  if (coupon.expires_at && new Date(coupon.expires_at) <= new Date()) throw { status: 400, message: `Coupon "${code}" has expired` };
+  if (subtotalCents < coupon.min_order_value_cents) {
+    throw { status: 400, message: `Coupon "${code}" needs a booking of at least ₹${(coupon.min_order_value_cents / 100).toFixed(0)}` };
+  }
+  try {
+    await publicOffers.checkRules(coupon, { userId });
+  } catch (err) {
+    if (err instanceof publicOffers.OfferError) throw { status: err.status, message: err.message };
+    throw err;
+  }
+  return { couponId: coupon.id, code: coupon.code, discountCents: computeDiscountCents(coupon, subtotalCents, 0) };
+}
+
 /** The offers hub (SB6): public shop coupons and running campaigns. */
 const listPublicOffers = offers(async (req, res) => {
   res.set('Cache-Control', 'public, max-age=60');
@@ -166,6 +197,7 @@ const listPublicOffers = offers(async (req, res) => {
 });
 
 module.exports = {
+  resolveServiceCoupon,
   createCoupon,
   getMyCoupons,
   updateCoupon,

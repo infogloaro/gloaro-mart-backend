@@ -8,7 +8,7 @@ const razorpay = require('./payments/razorpay');
  * says. A database without the table yet gets the old behaviour: COD only.
  */
 
-const DEFAULTS = { online_enabled: false, cod_enabled: true, cod_max_cents: null, updated_at: null };
+const DEFAULTS = { online_enabled: false, cod_enabled: true, cod_max_cents: null, booking_pay_now: 'off', booking_refund_on_cancel: true, updated_at: null };
 
 async function getSettings(db = pool) {
   try {
@@ -27,6 +27,11 @@ async function options(db = pool) {
   return {
     online: { enabled: s.online_enabled && ready, environment: ready ? conn.environment : null },
     cod: { enabled: s.cod_enabled, maxCents: s.cod_max_cents },
+    // SV7: service bookings — pay now off / optional / required (only while online is on), and the refund rule.
+    bookings: {
+      payNow: s.online_enabled && ready && ['optional', 'required'].includes(s.booking_pay_now) ? s.booking_pay_now : 'off',
+      refundOnCancel: s.booking_refund_on_cancel !== false,
+    },
   };
 }
 

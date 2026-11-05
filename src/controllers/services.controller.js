@@ -8,7 +8,8 @@ const shopHours = require('../services/shopHours');
  * the rating is the shop's (vendor_reviews → vendor_performance_metrics).
  * Distance is only sent when the caller gave a point and the shop has one.
  *   GET /api/services/categories
- *   GET /api/services?categoryId&q&lat&lng&radiusKm&home&shop&openNow&verified&minRating&minPrice&maxPrice&sort&page&pageSize
+ *   GET /api/services?categoryId&q&lat&lng&radiusKm&home&shop&openNow&verified&hasOffer&minRating&minPrice&maxPrice&sort&page&pageSize
+ *     (SV6: hasOffer=true keeps services with a live offer; `offer` = { price_cents, until } when live)
  *     (SV1: verified=true keeps only KYC-verified shops; sort=popular = most-reviewed first)
  *     (minPrice/maxPrice in paise: a service whose price or range touches them; on-request
  *     services have no price, so a price filter leaves them out)
@@ -35,9 +36,17 @@ const flag = (v) => v === 'true' || v === '1';
 const SERVICE_FIELDS = `
   s.id, s.title, s.description, s.price_type, s.price_cents, s.price_max_cents, s.visit_fee_cents,
   s.duration_minutes, s.at_home, s.at_shop, s.images, s.video_url, s.updated_at,
+  -- SV6: the shop's live offer on this service, else null.
+  CASE WHEN (s.offer_price_cents IS NOT NULL AND s.price_cents IS NOT NULL AND s.offer_price_cents < s.price_cents AND s.price_type IN ('fixed', 'from') AND (s.offer_until IS NULL OR s.offer_until > now())) THEN json_build_object('price_cents', s.offer_price_cents, 'until', s.offer_until) END AS offer,
   -- NS9: the service's own reviews (from requests the shop finished).
   (SELECT json_build_object('average', ROUND(AVG(r.rating)::numeric, 2), 'count', COUNT(*)::int)
      FROM service_reviews r WHERE r.service_id = s.id) AS reviews,
+  -- SV4: packages and add-ons the shop offers for this service (active, in its order).
+  COALESCE((SELECT json_agg(json_build_object('id', p.id, 'name', p.name, 'description', p.description, 'price_cents', p.price_cents,
+                     'duration_minutes', p.duration_minutes, 'included', p.included, 'excluded', p.excluded) ORDER BY p.sort_order, p.id)
+     FROM service_packages p WHERE p.service_id = s.id AND p.is_active), '[]'::json) AS packages,
+  COALESCE((SELECT json_agg(json_build_object('id', a.id, 'name', a.name, 'price_cents', a.price_cents) ORDER BY a.sort_order, a.id)
+     FROM service_addons a WHERE a.service_id = s.id AND a.is_active), '[]'::json) AS addons,
   json_build_object('id', c.id, 'slug', c.slug, 'name', c.name, 'name_ta', c.name_ta, 'name_hi', c.name_hi,
                     'image_url', c.image_url, 'icon_key', c.icon_key) AS category,
   CASE WHEN $1::float8 IS NOT NULL AND vp.latitude IS NOT NULL AND vp.longitude IS NOT NULL
@@ -131,9 +140,10 @@ async function list(req, res) {
   if (flag(req.query.shop)) where.push('s.at_shop');
   if (flag(req.query.openNow)) where.push(`${shopHours.openNowSql('vp')} IS TRUE`);
   if (flag(req.query.verified)) where.push(shopTrust.verifiedSql('vp'));
+  if (flag(req.query.hasOffer)) where.push(`(s.offer_price_cents IS NOT NULL AND s.price_cents IS NOT NULL AND s.offer_price_cents < s.price_cents AND s.price_type IN ('fixed', 'from') AND (s.offer_until IS NULL OR s.offer_until > now()))`);
   if (minRating !== null) where.push(`(pm.rating_count > 0 AND pm.rating_sum / pm.rating_count >= ${push(minRating)})`);
   if (minPrice !== null || maxPrice !== null) where.push("s.price_type <> 'on_request' AND s.price_cents IS NOT NULL");
-  if (maxPrice !== null) where.push(`s.price_cents <= ${push(maxPrice)}`);
+  if (maxPrice !== null) where.push(`COALESCE(CASE WHEN (s.offer_price_cents IS NOT NULL AND s.price_cents IS NOT NULL AND s.offer_price_cents < s.price_cents AND s.price_type IN ('fixed', 'from') AND (s.offer_until IS NULL OR s.offer_until > now())) THEN s.offer_price_cents END, s.price_cents) <= ${push(maxPrice)}`);
   if (minPrice !== null) where.push(`COALESCE(s.price_max_cents, s.price_cents) >= ${push(minPrice)}`);
   if (radiusKm !== null) {
     where.push(`vp.latitude IS NOT NULL AND vp.longitude IS NOT NULL
@@ -148,7 +158,7 @@ async function list(req, res) {
       : 'pm.rating_count DESC NULLS LAST, s.updated_at DESC',
     nearest: 'distance_km ASC NULLS LAST, s.id',
     rating: 'CASE WHEN pm.rating_count > 0 THEN pm.rating_sum / pm.rating_count END DESC NULLS LAST, pm.rating_count DESC NULLS LAST, s.id',
-    price_asc: "CASE WHEN s.price_type = 'on_request' THEN NULL ELSE s.price_cents END ASC NULLS LAST, s.id",
+    price_asc: `CASE WHEN s.price_type = 'on_request' THEN NULL ELSE COALESCE(CASE WHEN (s.offer_price_cents IS NOT NULL AND s.price_cents IS NOT NULL AND s.offer_price_cents < s.price_cents AND s.price_type IN ('fixed', 'from') AND (s.offer_until IS NULL OR s.offer_until > now())) THEN s.offer_price_cents END, s.price_cents) END ASC NULLS LAST, s.id`,
     price_desc: "CASE WHEN s.price_type = 'on_request' THEN NULL ELSE COALESCE(s.price_max_cents, s.price_cents) END DESC NULLS LAST, s.id",
     // Most talked about: the service's own reviews, then the shop's, then bookings.
     popular: `(SELECT COUNT(*) FROM service_reviews r WHERE r.service_id = s.id) DESC, pm.rating_count DESC NULLS LAST,

@@ -295,4 +295,79 @@ const byCategory = {
   },
 };
 
-module.exports = { reports: [requests, bookings, providers, reviews, byCategory] };
+/** SV8: Gloaro's commission on completed bookings and what each shop gets. */
+const commissions = {
+  key: 'service-commissions',
+  group: 'services',
+  title: 'Service commissions',
+  description: 'Every completed booking: what it came to, how it was paid, the commission rate and amount, the shop\'s share, and the payout it went into.',
+  keywords: ['commission', 'service earnings', 'payout', 'bookings revenue', 'take rate'],
+  filters: [
+    F.shop,
+    SHOP_CITY,
+    CATEGORY,
+    {
+      key: 'paid',
+      label: 'Paid',
+      type: 'select',
+      options: [
+        { value: 'online', label: 'Online, through Gloaro Mart' },
+        { value: 'shop', label: 'To the shop after the work' },
+      ],
+    },
+    {
+      key: 'settled',
+      label: 'Payout',
+      type: 'select',
+      options: [
+        { value: 'yes', label: 'In a settlement' },
+        { value: 'no', label: 'Not settled yet' },
+      ],
+    },
+  ],
+  columns: [
+    { key: 'reference', label: 'Booking', type: 'text', search: true },
+    { key: 'completed_at', label: 'Completed', type: 'datetime' },
+    { key: 'provider', label: 'Provider', type: 'text', search: true },
+    { key: 'service', label: 'Service', type: 'text', search: true },
+    { key: 'category', label: 'Type', type: 'text', search: true },
+    { key: 'paid', label: 'Paid', type: 'status' },
+    { key: 'gross', label: 'Booking value', type: 'money' },
+    { key: 'rate', label: 'Rate', type: 'percent' },
+    { key: 'commission', label: 'Commission', type: 'money' },
+    { key: 'shop_share', label: 'Shop keeps', type: 'money' },
+    { key: 'settlement', label: 'Settlement', type: 'text', search: true },
+  ],
+  defaultSort: { key: 'completed_at', dir: 'desc' },
+  summary: [
+    { key: 'bookings', label: 'Completed bookings', type: 'int', sql: 'COUNT(*)' },
+    { key: 'gross', label: 'Booking value', type: 'money', sql: 'COALESCE(SUM(r.gross), 0)' },
+    { key: 'commission', label: 'Commission', type: 'money', sql: 'COALESCE(SUM(r.commission), 0)' },
+    { key: 'online', label: 'Paid online', type: 'money', sql: `COALESCE(SUM(r.gross) FILTER (WHERE r.paid = 'online'), 0)` },
+    { key: 'take', label: 'Take rate', type: 'percent', sql: 'ROUND(100.0 * COALESCE(SUM(r.commission), 0) / NULLIF(SUM(r.gross), 0), 1)' },
+  ],
+  notes: 'By the date the shop marked the work done. Commission = the category\'s rate (else the global plan) on the fixed total, or on the price plus visit fee; nothing on an on-request price. "Shop keeps" = value − commission, paid out with the shop\'s weekly settlement.',
+  sql: ({ f, p, inRange }) => {
+    const w = [];
+    if (f.shop != null) w.push(`c.vendor_id = ${p(f.shop)}`);
+    if (f.city) w.push(`LOWER(v.city) = LOWER(${p(f.city)})`);
+    if (f.paid === 'online') w.push('c.paid_online');
+    if (f.paid === 'shop') w.push('NOT c.paid_online');
+    if (f.settled === 'yes') w.push('ch.settlement_id IS NOT NULL');
+    if (f.settled === 'no') w.push('ch.settlement_id IS NULL');
+    return `
+      SELECT b.reference, c.created_at AS completed_at, v.business_name AS provider, b.service_title AS service, sc.name AS category,
+             CASE WHEN c.paid_online THEN 'online' ELSE 'to shop' END AS paid,
+             c.gross_cents AS gross, c.commission_percent::float AS rate, c.commission_cents AS commission,
+             c.gross_cents - c.commission_cents AS shop_share, s.reference AS settlement
+      FROM service_commissions c
+      JOIN service_bookings b ON b.id = c.booking_id
+      JOIN vendor_profiles v ON v.id = c.vendor_id
+      LEFT JOIN service_categories sc ON sc.id = c.category_id
+      LEFT JOIN vendor_charges ch ON ch.id = c.vendor_charge_id
+      LEFT JOIN settlements s ON s.id = ch.settlement_id
+      WHERE ${inRange('c.created_at')} ${and(w)}`;
+  },
+};
+
+module.exports = { reports: [requests, bookings, providers, reviews, byCategory, commissions] };

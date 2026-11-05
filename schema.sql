@@ -4408,3 +4408,255 @@ CREATE TABLE IF NOT EXISTS category_subcategories (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_category_subcategories_name ON category_subcategories(category_id, lower(name));
 ALTER TABLE product_attributes ADD COLUMN IF NOT EXISTS category_ids INTEGER[];
 CREATE INDEX IF NOT EXISTS idx_product_attributes_category_ids ON product_attributes USING GIN (category_ids);
+
+-- ===== SERVICE GROUPS & CATEGORIES (SV2) =====
+-- The prompt's ten groups (2026-11-05): new groups cleaning / moving / pets,
+-- home-cleaning + pest-control move to cleaning, tailoring to daily; 29 new
+-- categories (names only - config, not data); sort_order laid out by group.
+-- scripts/migrate-service-groups.js. Safe to run again (slug conflicts skip).
+ALTER TABLE service_categories DROP CONSTRAINT IF EXISTS service_categories_group_key_check;
+ALTER TABLE service_categories ADD CONSTRAINT service_categories_group_key_check
+  CHECK (group_key IN ('vehicle', 'home', 'cleaning', 'personal', 'health', 'learning', 'events', 'moving', 'gadgets', 'pets', 'daily', 'other'));
+INSERT INTO service_categories (slug, name, name_ta, name_hi, group_key, icon_key, sort_order) VALUES
+  ('tyre-service', 'Tyre & wheel service', 'டயர் & வீல் சர்வீஸ்', 'टायर और व्हील सर्विस', 'vehicle', 'tyre', 40),
+  ('battery-service', 'Car & bike battery', 'கார் & பைக் பேட்டரி', 'कार और बाइक बैटरी', 'vehicle', 'battery', 50),
+  ('towing', 'Towing & breakdown help', 'டோயிங் & பிரேக்டவுன் உதவி', 'टोइंग और ब्रेकडाउन मदद', 'vehicle', 'towing', 60),
+  ('bathroom-cleaning', 'Bathroom cleaning', 'குளியலறை சுத்தம்', 'बाथरूम की सफ़ाई', 'cleaning', 'bathroom', 210),
+  ('sofa-cleaning', 'Sofa & carpet cleaning', 'சோபா & கார்பெட் சுத்தம்', 'सोफ़ा और कारपेट की सफ़ाई', 'cleaning', 'sofa', 220),
+  ('spa', 'Spa & massage', 'ஸ்பா & மசாஜ்', 'स्पा और मसाज', 'personal', 'spa', 320),
+  ('makeup', 'Makeup artist', 'மேக்கப் ஆர்ட்டிஸ்ட்', 'मेकअप आर्टिस्ट', 'personal', 'makeup', 330),
+  ('home-beauty', 'Beauty at home', 'வீட்டிலேயே அழகு சேவை', 'घर पर ब्यूटी सर्विस', 'personal', 'beauty', 340),
+  ('doctor', 'Doctor home visit', 'மருத்துவர் வீட்டு வருகை', 'डॉक्टर होम विज़िट', 'health', 'doctor', 400),
+  ('dental', 'Dental clinic', 'பல் மருத்துவம்', 'डेंटल क्लिनिक', 'health', 'dental', 410),
+  ('lab-tests', 'Lab tests at home', 'வீட்டிலேயே ஆய்வக பரிசோதனை', 'घर पर लैब टेस्ट', 'health', 'lab', 420),
+  ('physiotherapy', 'Physiotherapy', 'பிசியோதெரபி', 'फ़िज़ियोथेरेपी', 'health', 'physio', 430),
+  ('nursing', 'Home nursing', 'வீட்டு நர்சிங்', 'होम नर्सिंग', 'health', 'nursing', 440),
+  ('ambulance', 'Ambulance', 'ஆம்புலன்ஸ்', 'एम्बुलेंस', 'health', 'ambulance', 450),
+  ('music-classes', 'Music classes', 'இசை வகுப்புகள்', 'म्यूज़िक क्लासेस', 'learning', 'music', 510),
+  ('dance-classes', 'Dance classes', 'நடன வகுப்புகள்', 'डांस क्लासेस', 'learning', 'dance', 520),
+  ('computer-training', 'Computer training', 'கணினி பயிற்சி', 'कंप्यूटर ट्रेनिंग', 'learning', 'computer', 530),
+  ('spoken-english', 'Spoken English', 'ஸ்போக்கன் இங்கிலீஷ்', 'स्पोकन इंग्लिश', 'learning', 'language', 540),
+  ('videography', 'Videography', 'வீடியோகிராபி', 'वीडियोग्राफ़ी', 'events', 'video', 610),
+  ('dj', 'DJ & sound', 'டிஜே & சவுண்ட்', 'डीजे और साउंड', 'events', 'dj', 620),
+  ('catering', 'Catering', 'கேட்டரிங்', 'कैटरिंग', 'events', 'catering', 630),
+  ('decoration', 'Event decoration', 'நிகழ்ச்சி அலங்காரம்', 'इवेंट डेकोरेशन', 'events', 'decor', 640),
+  ('packers-movers', 'Packers & movers', 'பேக்கர்ஸ் & மூவர்ஸ்', 'पैकर्स और मूवर्स', 'moving', 'moving', 700),
+  ('local-transport', 'Local transport & mini truck', 'உள்ளூர் போக்குவரத்து & மினி டிரக்', 'लोकल ट्रांसपोर्ट और मिनी ट्रक', 'moving', 'truck', 710),
+  ('cctv', 'CCTV installation', 'சிசிடிவி நிறுவல்', 'सीसीटीवी इंस्टॉलेशन', 'gadgets', 'cctv', 820),
+  ('wifi', 'Wi-Fi & networking', 'வைஃபை & நெட்வொர்க்கிங்', 'वाई-फ़ाई और नेटवर्किंग', 'gadgets', 'wifi', 830),
+  ('pet-grooming', 'Pet grooming', 'செல்லப்பிராணி க்ரூமிங்', 'पेट ग्रूमिंग', 'pets', 'pet', 900),
+  ('pet-walking', 'Pet walking & sitting', 'செல்லப்பிராணி நடை & பராமரிப்பு', 'पेट वॉकिंग और सिटिंग', 'pets', 'pet_walk', 910),
+  ('veterinary', 'Veterinary clinic', 'கால்நடை மருத்துவம்', 'वेटरनरी क्लिनिक', 'pets', 'vet', 920)
+ON CONFLICT (slug) DO NOTHING;
+-- Group and order of every launch category.
+UPDATE service_categories AS c SET group_key = v.group_key, sort_order = v.sort_order
+FROM (VALUES
+  ('car-service', 'vehicle', 10),
+  ('bike-service', 'vehicle', 20),
+  ('car-wash', 'vehicle', 30),
+  ('tyre-service', 'vehicle', 40),
+  ('battery-service', 'vehicle', 50),
+  ('towing', 'vehicle', 60),
+  ('ac-service', 'home', 100),
+  ('electrician', 'home', 110),
+  ('plumber', 'home', 120),
+  ('carpenter', 'home', 130),
+  ('painter', 'home', 140),
+  ('ro-service', 'home', 150),
+  ('appliance-repair', 'home', 160),
+  ('home-cleaning', 'cleaning', 200),
+  ('bathroom-cleaning', 'cleaning', 210),
+  ('sofa-cleaning', 'cleaning', 220),
+  ('pest-control', 'cleaning', 230),
+  ('salon-men', 'personal', 300),
+  ('beauty-parlour', 'personal', 310),
+  ('spa', 'personal', 320),
+  ('makeup', 'personal', 330),
+  ('home-beauty', 'personal', 340),
+  ('doctor', 'health', 400),
+  ('dental', 'health', 410),
+  ('lab-tests', 'health', 420),
+  ('physiotherapy', 'health', 430),
+  ('nursing', 'health', 440),
+  ('ambulance', 'health', 450),
+  ('tuition', 'learning', 500),
+  ('music-classes', 'learning', 510),
+  ('dance-classes', 'learning', 520),
+  ('computer-training', 'learning', 530),
+  ('spoken-english', 'learning', 540),
+  ('photographer', 'events', 600),
+  ('videography', 'events', 610),
+  ('dj', 'events', 620),
+  ('catering', 'events', 630),
+  ('decoration', 'events', 640),
+  ('packers-movers', 'moving', 700),
+  ('local-transport', 'moving', 710),
+  ('mobile-repair', 'gadgets', 800),
+  ('laptop-repair', 'gadgets', 810),
+  ('cctv', 'gadgets', 820),
+  ('wifi', 'gadgets', 830),
+  ('pet-grooming', 'pets', 900),
+  ('pet-walking', 'pets', 910),
+  ('veterinary', 'pets', 920),
+  ('laundry', 'daily', 950),
+  ('tailoring', 'daily', 960)
+) AS v(slug, group_key, sort_order)
+WHERE c.slug = v.slug AND (c.group_key <> v.group_key OR c.sort_order <> v.sort_order);
+
+-- ===== SERVICE PACKAGES & ADD-ONS (SV4) =====
+-- A service's packages (Basic / Standard / Premium: own price, time,
+-- what is and is not included) and add-ons (extras with a price). A booking
+-- keeps a snapshot of what was chosen. scripts/migrate-service-packages.js
+CREATE TABLE IF NOT EXISTS service_packages (
+  id SERIAL PRIMARY KEY,
+  service_id INTEGER NOT NULL REFERENCES vendor_services(id) ON DELETE CASCADE,
+  name VARCHAR(80) NOT NULL,
+  description VARCHAR(500),
+  price_cents INTEGER NOT NULL CHECK (price_cents >= 0),
+  duration_minutes INTEGER CHECK (duration_minutes BETWEEN 5 AND 10080),
+  included TEXT[] NOT NULL DEFAULT '{}',
+  excluded TEXT[] NOT NULL DEFAULT '{}',
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_packages_service ON service_packages (service_id, sort_order);
+CREATE TABLE IF NOT EXISTS service_addons (
+  id SERIAL PRIMARY KEY,
+  service_id INTEGER NOT NULL REFERENCES vendor_services(id) ON DELETE CASCADE,
+  name VARCHAR(80) NOT NULL,
+  price_cents INTEGER NOT NULL CHECK (price_cents >= 0),
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_addons_service ON service_addons (service_id, sort_order);
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS package_id INTEGER REFERENCES service_packages(id) ON DELETE SET NULL;
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS package_name VARCHAR(80);
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS package_cents INTEGER;
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS addons JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS total_cents INTEGER;
+
+-- ===== BOOKING FLOW V2 (SV5) =====
+-- Two more steps between accepted and in_progress: on_the_way, arrived. The
+-- active-slot index covers them so a slot stays taken. scripts/migrate-service-booking-flow.js
+ALTER TABLE service_bookings DROP CONSTRAINT IF EXISTS service_bookings_status_check;
+ALTER TABLE service_bookings ADD CONSTRAINT service_bookings_status_check
+  CHECK (status IN ('pending', 'accepted', 'on_the_way', 'arrived', 'rejected', 'in_progress', 'completed', 'cancelled'));
+DROP INDEX IF EXISTS uq_service_bookings_active_slot;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_service_bookings_active_slot ON service_bookings (service_id, starts_at)
+  WHERE status IN ('pending', 'accepted', 'on_the_way', 'arrived', 'in_progress');
+
+-- ===== SERVICE OFFERS (SV6) =====
+-- A shop's own offer on a service: a lower price until a date (or open-ended).
+-- Live when offer_price_cents is set, below the price, and offer_until is
+-- null or ahead. A booking keeps the list price next to the price paid.
+-- scripts/migrate-service-offers.js
+ALTER TABLE vendor_services ADD COLUMN IF NOT EXISTS offer_price_cents INTEGER CHECK (offer_price_cents >= 0);
+ALTER TABLE vendor_services ADD COLUMN IF NOT EXISTS offer_until TIMESTAMPTZ;
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS list_price_cents INTEGER;
+
+-- ===== SERVICE BOOKING PAYMENTS (SV7) =====
+-- Paying for a service booking online through the same Razorpay set-up as
+-- shopping (RZ1), when admin allows it. One payment row per booking, so a
+-- second tap re-opens the same Razorpay order instead of charging again.
+-- Coupons get a scope: shopping orders, service bookings, or both.
+-- scripts/migrate-service-payments.js
+ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS booking_pay_now TEXT NOT NULL DEFAULT 'optional'
+  CHECK (booking_pay_now IN ('off', 'optional', 'required'));
+ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS booking_refund_on_cancel BOOLEAN NOT NULL DEFAULT TRUE;
+
+CREATE TABLE IF NOT EXISTS service_payments (
+  id SERIAL PRIMARY KEY,
+  booking_id INTEGER NOT NULL UNIQUE REFERENCES service_bookings(id) ON DELETE RESTRICT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  provider TEXT NOT NULL DEFAULT 'razorpay',
+  status TEXT NOT NULL DEFAULT 'created'
+    CHECK (status IN ('created', 'successful', 'failed', 'refund_pending', 'refunded', 'refund_failed')),
+  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+  instrument TEXT,
+  provider_order_id TEXT UNIQUE,
+  provider_payment_id TEXT,
+  provider_refund_id TEXT,
+  refund_cents INTEGER NOT NULL DEFAULT 0,
+  refund_reason TEXT,
+  failure_reason TEXT,
+  paid_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_payments_provider_payment ON service_payments (provider_payment_id);
+CREATE INDEX IF NOT EXISTS idx_service_payments_provider_refund ON service_payments (provider_refund_id);
+
+-- Append-only; the gateway's own event id makes a replayed webhook a no-op.
+CREATE TABLE IF NOT EXISTS service_payment_events (
+  id SERIAL PRIMARY KEY,
+  payment_id INTEGER NOT NULL REFERENCES service_payments(id) ON DELETE CASCADE,
+  event TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL DEFAULT 0,
+  provider_event_id TEXT UNIQUE,
+  note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS pay_online BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS coupon_id INTEGER REFERENCES coupons(id) ON DELETE SET NULL;
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS coupon_code TEXT;
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS discount_cents INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_service_bookings_coupon ON service_bookings (coupon_id) WHERE coupon_id IS NOT NULL;
+
+ALTER TABLE coupons ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'orders' CHECK (scope IN ('orders', 'services', 'both'));
+
+-- ===== SERVICE COMMISSIONS (SV8) =====
+-- Gloaro's commission on a completed service booking: the category's own
+-- rate, else the global commission plan. One row per booking. The shop's
+-- side goes through vendor_charges into the weekly settlement: a booking
+-- paid online credits the shop gross − commission; one paid to the shop
+-- after the work charges the commission. pay_deadline: a pay-now booking
+-- is released if not paid by then (services/serviceCommissions.js sweep).
+-- scripts/migrate-service-commissions.js
+ALTER TABLE service_categories ADD COLUMN IF NOT EXISTS commission_percent NUMERIC(5,2)
+  CHECK (commission_percent IS NULL OR (commission_percent >= 0 AND commission_percent <= 100));
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS pay_deadline TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_service_bookings_pay_deadline ON service_bookings (pay_deadline) WHERE pay_deadline IS NOT NULL;
+
+ALTER TABLE vendor_charges DROP CONSTRAINT IF EXISTS vendor_charges_kind_check;
+ALTER TABLE vendor_charges ADD CONSTRAINT vendor_charges_kind_check
+  CHECK (kind IN ('advertising', 'ad_refund', 'ad_commission', 'service_commission', 'service_payout'));
+
+CREATE TABLE IF NOT EXISTS service_commissions (
+  id SERIAL PRIMARY KEY,
+  booking_id INTEGER NOT NULL UNIQUE REFERENCES service_bookings(id) ON DELETE RESTRICT,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE RESTRICT,
+  category_id INTEGER REFERENCES service_categories(id) ON DELETE SET NULL,
+  gross_cents INTEGER NOT NULL DEFAULT 0,
+  commission_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+  commission_cents INTEGER NOT NULL DEFAULT 0,
+  paid_online BOOLEAN NOT NULL DEFAULT FALSE,
+  -- + = Gloaro owes the shop (paid online, net of commission); − = the shop owes the commission.
+  shop_cents INTEGER NOT NULL DEFAULT 0,
+  vendor_charge_id INTEGER REFERENCES vendor_charges(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_service_commissions_vendor ON service_commissions (vendor_id, created_at DESC);
+
+-- ===== SERVICE BOOKING SUPPORT (SV9) =====
+-- "Report a problem" on a service booking opens a support ticket tied to it
+-- (category 'service'). The booking's invoice is derived, nothing stored.
+-- scripts/migrate-service-support.js
+ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS booking_id INTEGER REFERENCES service_bookings(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_support_tickets_booking ON support_tickets (booking_id) WHERE booking_id IS NOT NULL;
+ALTER TABLE support_tickets DROP CONSTRAINT IF EXISTS support_tickets_category_check;
+ALTER TABLE support_tickets ADD CONSTRAINT support_tickets_category_check
+  CHECK (category IN ('order', 'payment', 'delivery', 'vendor', 'product', 'account', 'service', 'other'));
+
+-- ===== SERVICE BOOKINGS ADMIN (SV10) =====
+-- Gloaro Mart staff may cancel a booking (either side is refunded in full);
+-- the booking and its history say so. scripts/migrate-service-admin.js
+ALTER TABLE service_bookings DROP CONSTRAINT IF EXISTS service_bookings_cancelled_by_check;
+ALTER TABLE service_bookings ADD CONSTRAINT service_bookings_cancelled_by_check
+  CHECK (cancelled_by IS NULL OR cancelled_by IN ('customer', 'vendor', 'admin'));
+ALTER TABLE service_booking_events DROP CONSTRAINT IF EXISTS service_booking_events_by_role_check;
+ALTER TABLE service_booking_events ADD CONSTRAINT service_booking_events_by_role_check
+  CHECK (by_role IN ('customer', 'vendor', 'admin', 'system'));

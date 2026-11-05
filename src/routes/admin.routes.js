@@ -355,6 +355,16 @@ router.patch("/service-categories/:id", adminServices.updateCategory);
 router.delete("/service-categories/:id", adminServices.deleteCategory);
 router.get("/services", adminServices.listServices);
 router.patch("/services/:id", adminServices.moderateService);
+// SV10: service bookings, their payments and the service payouts.
+{
+  const sb = require("../controllers/adminServiceBookings.controller");
+  router.get("/service-bookings", sb.list);
+  router.get("/service-bookings/summary", sb.summary);
+  router.get("/service-bookings/:id", sb.get);
+  router.post("/service-bookings/:id/cancel", sb.cancel);
+  router.post("/service-bookings/:id/refund", sb.retryRefund);
+  router.get("/service-commissions", sb.commissions);
+}
 
 router.get("/brands", brand.listAllBrands);
 router.post("/brands", brand.createBrand);

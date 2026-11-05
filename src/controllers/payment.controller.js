@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const { getProvider, providerForMethod } = require('../services/payments');
 const razorpay = require('../services/payments/razorpay');
 const { applyTopupEvent } = require('./customerWallet.controller');
+const bookingPayments = require('../services/serviceBookingPayments');
 const { confirmReservations, releaseReservations } = require('../services/inventory');
 const { notifyNewOrders } = require('../services/vendorNotify');
 
@@ -417,6 +418,9 @@ async function applyGatewayEvent(client, provider, parsed, { payload = null } = 
     // Not a purchase payment — it may be a wallet top-up.
     const topup = await applyTopupEvent(client, parsed);
     if (topup) return { status: topup.status === 'ignored' ? 'ignored' : 'applied' };
+    // SV7: or a service booking paid online.
+    const booking = await bookingPayments.applyEvent(client, parsed);
+    if (booking) return booking;
     return { status: 'not_found' };
   }
 
@@ -587,7 +591,11 @@ async function refundCancelledShare(client, provider, payment) {
 async function applyRefundEvent(client, parsed, payload) {
   const { rows } = await client.query('SELECT * FROM refunds WHERE provider_refund_id = $1 FOR UPDATE', [parsed.providerRefundId]);
   const refund = rows[0];
-  if (!refund) return { status: 'not_found' };
+  if (!refund) {
+    // SV7: a service booking's refund.
+    const booking = await bookingPayments.applyEvent(client, parsed);
+    return booking ?? { status: 'not_found' };
+  }
   if (refund.status === 'completed' || refund.status === 'failed') return { status: 'ignored' };
   const status = parsed.event === 'refund.completed' ? 'completed' : 'failed';
   await client.query('UPDATE refunds SET status = $2, updated_at = now() WHERE id = $1', [refund.id, status]);
@@ -630,6 +638,8 @@ async function verifyPayment(req, res) {
      WHERE a.provider_order_id = $1 AND p.user_id = $2
      UNION ALL
      SELECT 'topup', t.id FROM wallet_topups t WHERE t.provider_order_id = $1 AND t.user_id = $2
+     UNION ALL
+     SELECT 'booking', sp.booking_id FROM service_payments sp WHERE sp.provider_order_id = $1 AND sp.user_id = $2
      LIMIT 1`,
     [razorpayOrderId, req.user.id]
   );
@@ -657,6 +667,11 @@ async function verifyPayment(req, res) {
     throw err;
   } finally {
     client.release();
+  }
+  if (row.kind === 'booking') {
+    // SV7: the booking as the app shows it, payment included.
+    const b = await require('../services/serviceBookings').get(row.id, 'customer', req.user.id);
+    return res.json({ kind: 'booking', bookingId: b.id, status: b.payment?.status === 'successful' ? 'successful' : 'unpaid', booking: b });
   }
   if (row.kind === 'topup') {
     const { rows: t } = await pool.query('SELECT id, amount_cents, status FROM wallet_topups WHERE id = $1', [row.id]);
