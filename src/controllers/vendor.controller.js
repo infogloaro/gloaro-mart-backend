@@ -64,8 +64,11 @@ async function createProfile(req, res) {
 
 async function getMyProfile(req, res) {
   const { rows } = await pool.query(
-    `SELECT vp.*, ${shopTrust.verifiedSql('vp')} AS verified, ${shopFollows.followerCountSql('vp')} AS follower_count
-     FROM vendor_profiles vp WHERE vp.user_id = $1`,
+    `SELECT vp.*, ${shopTrust.verifiedSql('vp')} AS verified, ${shopFollows.followerCountSql('vp')} AS follower_count,
+            -- VD27: owner, or the staff member's role.
+            CASE WHEN vp.user_id = $1 THEN 'owner'
+                 ELSE (SELECT s.role FROM vendor_staff s WHERE s.user_id = $1 AND s.vendor_id = vp.id AND s.disabled_at IS NULL) END AS staff_role
+     FROM vendor_profiles vp WHERE vp.id = shop_for_user($1)`,
     [req.user.id]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Vendor profile not found' });
@@ -116,7 +119,7 @@ async function updateMyProfile(req, res) {
 }
 
 async function myVendorId(userId) {
-  const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [userId]);
+  const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = shop_for_user($1)', [userId]);
   return rows[0]?.id ?? null;
 }
 

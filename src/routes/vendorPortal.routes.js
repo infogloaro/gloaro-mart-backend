@@ -95,6 +95,11 @@ router.get('/quotations/:id/messages', quotation.vendorThread);
 router.post('/quotations/:id/messages', quotation.vendorMessage);
 router.post('/quotations/:id/withdraw', quotation.vendorWithdraw);
 
+// VD27: the owner's staff logins (the shopStaff gate keeps staff out).
+router.get('/staff', require('../controllers/shopStaff.controller').list);
+router.post('/staff', require('../controllers/shopStaff.controller').create);
+router.patch('/staff/:id', require('../controllers/shopStaff.controller').update);
+
 // Purchase orders the shop won: acknowledging, delivering, confirming payment.
 router.get('/purchase-orders', purchaseOrder.vendorList);
 router.get('/purchase-orders/:id', purchaseOrder.vendorGet);

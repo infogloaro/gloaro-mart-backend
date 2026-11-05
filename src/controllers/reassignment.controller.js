@@ -284,7 +284,7 @@ async function rejectOrder(req, res) {
     return res.status(400).json({ message: 'A reason is required to reject an order' });
   }
 
-  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [req.user.id]);
+  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = shop_for_user($1)', [req.user.id]);
   const vendorId = vendorRows[0]?.id;
   if (!vendorId && req.user.role !== 'admin') {
     return res.status(404).json({ message: 'Vendor profile not found' });

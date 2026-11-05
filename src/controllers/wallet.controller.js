@@ -38,7 +38,7 @@ async function creditWalletForOrder(order) {
 }
 
 async function getWallet(req, res) {
-  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [req.user.id]);
+  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = shop_for_user($1)', [req.user.id]);
   const vendorId = vendorRows[0]?.id;
   if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
   const wallet = await getOrCreateWallet(vendorId);
@@ -46,7 +46,7 @@ async function getWallet(req, res) {
 }
 
 async function getTransactions(req, res) {
-  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [req.user.id]);
+  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = shop_for_user($1)', [req.user.id]);
   const vendorId = vendorRows[0]?.id;
   if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
   const wallet = await getOrCreateWallet(vendorId);

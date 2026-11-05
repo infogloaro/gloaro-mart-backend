@@ -194,7 +194,7 @@ async function createTicket(req, res) {
     // The shop involved, and the order if one was named — which must be the requester's own.
     let vendorId = null;
     if (role === 'vendor') {
-      const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [req.user.id]);
+      const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = shop_for_user($1)', [req.user.id]);
       vendorId = rows[0]?.id ?? null;
     }
     let orderId = null;

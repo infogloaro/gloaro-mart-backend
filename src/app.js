@@ -34,6 +34,8 @@ app.use(
   }),
 );
 
+// VD27: a shop's manager / packer is narrowed here, before any router.
+app.use(require("./middleware/shopStaff").shopStaffGate);
 app.use("/api/auth", require("./routes/auth.routes"));
 app.use("/api/vendors", require("./routes/vendor.routes"));
 app.use("/api/products", require("./routes/product.routes"));

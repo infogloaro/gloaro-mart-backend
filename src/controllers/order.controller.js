@@ -674,7 +674,7 @@ async function getOrderHistory(req, res) {
   if (!order) return res.status(404).json({ message: 'Order not found' });
 
   if (req.user.role !== 'admin' && order.user_id !== req.user.id) {
-    const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [req.user.id]);
+    const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = shop_for_user($1)', [req.user.id]);
     if (!vendorRows.some((v) => v.id === order.vendor_id)) {
       return res.status(403).json({ message: 'Forbidden' });
     }
@@ -707,7 +707,7 @@ async function getOrderHistory(req, res) {
 }
 
 async function getVendorOrders(req, res) {
-  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [req.user.id]);
+  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = shop_for_user($1)', [req.user.id]);
   const vendorId = vendorRows[0]?.id;
   if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
   // VD4: accept_by — when a new order moves to another shop if not accepted.
@@ -734,7 +734,7 @@ async function getOrder(req, res) {
   const order = rows[0];
   if (!order) return res.status(404).json({ message: 'Order not found' });
 
-  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [req.user.id]);
+  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = shop_for_user($1)', [req.user.id]);
   const ownsAsVendor = vendorRows[0]?.id === order.vendor_id;
   const ownsAsCustomer = order.user_id === req.user.id;
   if (!ownsAsVendor && !ownsAsCustomer) {
@@ -773,7 +773,7 @@ async function getOrder(req, res) {
 
 async function updateStatus(req, res) {
   const { status, deliveryPartnerName, deliveryPartnerPhone, estimatedDeliveryAt } = req.body || {};
-  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [req.user.id]);
+  const { rows: vendorRows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = shop_for_user($1)', [req.user.id]);
   const vendorId = vendorRows[0]?.id;
   if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
 

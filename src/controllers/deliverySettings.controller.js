@@ -25,7 +25,7 @@ function defaultsFor(vendorId) {
 }
 
 async function vendorIdForUser(userId) {
-  const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE user_id = $1', [userId]);
+  const { rows } = await pool.query('SELECT id FROM vendor_profiles WHERE id = shop_for_user($1)', [userId]);
   return rows[0]?.id || null;
 }
 

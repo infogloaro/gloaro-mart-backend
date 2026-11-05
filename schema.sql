@@ -4695,3 +4695,30 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS carton_qty INTEGER CHECK (carton_q
 ALTER TABLE products ADD COLUMN IF NOT EXISTS sample_available BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE products ADD COLUMN IF NOT EXISTS lead_time_days INTEGER CHECK (lead_time_days IS NULL OR lead_time_days BETWEEN 0 AND 365);
 CREATE INDEX IF NOT EXISTS idx_products_moq ON products (moq);
+
+-- ===== SHOP STAFF (VD27) =====
+-- People who work in a shop under the owner's account: a manager (everything
+-- but money, bank, plan, KYC and staff) or a packer (orders and stock only).
+-- Each has their own users row (role 'vendor', signs in with a username the
+-- owner picked and a temporary password). shop_for_user() is the shop a
+-- signed-in user acts for: the one they own, else the one they staff.
+-- Disabling bumps users.token_version so their sessions end at once.
+-- scripts/migrate-shop-staff.js. Safe to run again.
+CREATE TABLE IF NOT EXISTS vendor_staff (
+  id SERIAL PRIMARY KEY,
+  vendor_id INTEGER NOT NULL REFERENCES vendor_profiles(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('manager', 'packer')),
+  added_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  disabled_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_vendor_staff_vendor ON vendor_staff (vendor_id);
+
+CREATE OR REPLACE FUNCTION shop_for_user(p_user INTEGER) RETURNS INTEGER
+LANGUAGE sql STABLE AS $fn$
+  SELECT COALESCE(
+    (SELECT id FROM vendor_profiles WHERE user_id = p_user ORDER BY id LIMIT 1),
+    (SELECT vendor_id FROM vendor_staff WHERE user_id = p_user AND disabled_at IS NULL)
+  )
+$fn$;
