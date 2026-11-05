@@ -3,6 +3,7 @@ const { recordAudit } = require('../services/auditLog');
 const shipments = require('../services/shipments');
 const cancellations = require('../services/cancellations');
 const { bumpMetrics, metricsForTransition } = require('../services/matching');
+const orderDocuments = require('../services/orderDocuments');
 
 /**
  * Admin → Shipments, plus the customer's tracking view. The rules for how
@@ -506,4 +507,18 @@ async function listForOrder(req, res) {
   res.json({ shipments: out });
 }
 
-module.exports = { listShipments, shipmentSummary, getShipment, recordEvent, updateShipment, assignPartner, switchProvider, listForOrder };
+/**
+ * DR7: GET /api/admin/shipments/:id/documents/:kind (label | packing-slip |
+ * invoice) → { path, expiresInMinutes }: the same signed printable page the
+ * shop gets (VD7), for this shipment's order. Admin opens API base + path.
+ */
+async function documentLink(req, res) {
+  const kind = req.params.kind;
+  if (!orderDocuments.KINDS.includes(kind)) return res.status(400).json({ message: `kind is ${orderDocuments.KINDS.join(', ')}` });
+  const { rows } = await pool.query('SELECT order_id, vendor_id FROM shipments WHERE id = $1', [Number(req.params.id)]);
+  if (!rows[0]) return res.status(404).json({ message: 'Shipment not found' });
+  const token = orderDocuments.linkToken(rows[0].order_id, rows[0].vendor_id, kind, Number(req.params.id));
+  res.json({ path: `/api/orders/documents/${token}`, expiresInMinutes: orderDocuments.LINK_MINUTES });
+}
+
+module.exports = { listShipments, shipmentSummary, getShipment, recordEvent, updateShipment, assignPartner, switchProvider, listForOrder, documentLink };

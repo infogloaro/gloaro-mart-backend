@@ -503,7 +503,7 @@ async function documentLink(req, res) {
 /** GET /api/orders/documents/:token — the page itself (no login: the link is the key). */
 async function documentPage(req, res) {
   const t = orderDocuments.readToken(req.params.token);
-  const html = t ? await orderDocuments.render(t.kind, t.orderId, t.vendorId) : null;
+  const html = t ? await orderDocuments.render(t.kind, t.orderId, t.vendorId, t.shipmentId) : null;
   res.set('Cache-Control', 'no-store');
   res.set('X-Robots-Tag', 'noindex');
   res.set('Referrer-Policy', 'no-referrer');

@@ -15,15 +15,19 @@ const AUDIENCE = 'order-document';
 const LINK_MINUTES = 15;
 const KINDS = ['invoice', 'packing-slip', 'label'];
 
-function linkToken(orderId, vendorId, kind) {
-  return jwt.sign({ o: orderId, v: vendorId, k: kind }, SECRET, { audience: AUDIENCE, expiresIn: `${LINK_MINUTES}m` });
+/** [shipmentId] (DR7, admin): print that shipment rather than the order's latest. */
+function linkToken(orderId, vendorId, kind, shipmentId) {
+  return jwt.sign({ o: orderId, v: vendorId, k: kind, ...(shipmentId ? { s: shipmentId } : {}) }, SECRET, {
+    audience: AUDIENCE,
+    expiresIn: `${LINK_MINUTES}m`,
+  });
 }
 
-/** { orderId, vendorId, kind } from a link, or null when bad or expired. */
+/** { orderId, vendorId, kind, shipmentId? } from a link, or null when bad or expired. */
 function readToken(token) {
   try {
     const p = jwt.verify(token, SECRET, { audience: AUDIENCE });
-    return KINDS.includes(p.k) ? { orderId: p.o, vendorId: p.v, kind: p.k } : null;
+    return KINDS.includes(p.k) ? { orderId: p.o, vendorId: p.v, kind: p.k, shipmentId: p.s ?? null } : null;
   } catch {
     return null;
   }
@@ -53,7 +57,7 @@ function addressLines(snap, fallback) {
 }
 
 /** Everything the three documents print, for the shop's own order; null if not its order. */
-async function loadOrder(orderId, vendorId) {
+async function loadOrder(orderId, vendorId, shipmentId = null) {
   const { rows } = await pool.query(
     `SELECT o.*, cg.reference AS group_reference,
             vp.business_name, vp.address_line, vp.city AS shop_city, vp.state AS shop_state, vp.pincode AS shop_pincode,
@@ -77,7 +81,12 @@ async function loadOrder(orderId, vendorId) {
         return { ...inv[0], lines };
       }),
     pool
-      .query('SELECT * FROM shipments WHERE order_id = $1 ORDER BY id DESC LIMIT 1', [orderId])
+      .query(
+        // $2 null: the order's latest shipment (the shop's link).
+        `SELECT s.*, dp.name AS rider_name FROM shipments s LEFT JOIN delivery_partners dp ON dp.id = s.partner_id
+         WHERE s.order_id = $1 AND ($2::int IS NULL OR s.id = $2) ORDER BY s.id DESC LIMIT 1`,
+        [orderId, shipmentId]
+      )
       .then((r) => r.rows[0] || null)
       .catch(() => null),
   ]);
@@ -196,15 +205,56 @@ function packingSlipHtml({ order: o, items }) {
   );
 }
 
-function labelHtml({ order: o, shipment: s }) {
+/**
+ * Code 128 (set B) as an inline SVG, so a courier or rider can scan the
+ * tracking number off the label. Printable ASCII only; anything else → null.
+ */
+const CODE128 = [
+  '212222', '222122', '222221', '121223', '121322', '131222', '122213', '122312', '132212', '221213', '221312', '231212', '112232',
+  '122132', '122231', '113222', '123122', '123221', '223211', '221132', '221231', '213212', '223112', '312131', '311222', '321122',
+  '321221', '312212', '322112', '322211', '212123', '212321', '232121', '111323', '131123', '131321', '112313', '132113', '132311',
+  '211313', '231113', '231311', '112133', '112331', '132131', '113123', '113321', '133121', '313121', '211331', '231131', '213113',
+  '213311', '213131', '311123', '311321', '331121', '312113', '312311', '332111', '314111', '221411', '431111', '111224', '111422',
+  '121124', '121421', '141122', '141221', '112214', '112412', '122114', '122411', '142112', '142211', '241211', '221114', '413111',
+  '241112', '134111', '111242', '121142', '121241', '114212', '124112', '124211', '411212', '421112', '421211', '212141', '214121',
+  '412121', '111143', '111341', '131141', '114113', '114311', '411113', '411311', '113141', '114131', '311141', '411131', '211412',
+  '211214', '211232', '2331112',
+];
+function barcodeSvg(text, height = 56) {
+  if (!text || !/^[\x20-\x7E]{1,40}$/.test(text)) return null;
+  const codes = [104, ...[...text].map((ch) => ch.charCodeAt(0) - 32)];
+  const check = codes.reduce((sum, c, i) => sum + c * (i || 1), 0) % 103;
+  const pattern = [...codes, check, 106].map((c) => CODE128[c]).join('');
+  let x = 10; // quiet zone
+  let bars = '';
+  [...pattern].forEach((w, i) => {
+    if (i % 2 === 0) bars += `<rect x="${x}" y="0" width="${w}" height="${height}"/>`;
+    x += Number(w);
+  });
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${x + 10} ${height}" width="100%" height="${height}" preserveAspectRatio="none" role="img" aria-label="Barcode ${esc(text)}" shape-rendering="crispEdges">${bars}</svg>`;
+}
+
+const CARRIER = { gokart: 'GoKart', shiprocket: 'Shiprocket', manual: 'Own delivery' };
+
+function labelHtml({ order: o, shipment: s, items = [] }) {
   const cod = o.payment_method === 'cod' ? (s?.cod_amount_cents ?? o.total_cents) : null;
+  // DR7: the courier's AWB when there is one (it's what their scanners read), else our number.
   const tracking = s?.external_tracking_id || s?.tracking_number;
+  const barcode = barcodeSvg(tracking);
+  const carrier = [CARRIER[s?.provider], s?.rider_name || s?.partner_name].filter(Boolean).join(' · ');
+  const pieces = items.reduce((n, i) => n + Number(i.quantity || 0), 0);
+  const weight = s?.weight_grams ? (s.weight_grams >= 1000 ? `${(s.weight_grams / 1000).toFixed(2).replace(/\.?0+$/, '')} kg` : `${s.weight_grams} g`) : null;
   return page(
     `Label #${o.id}`,
-    `<div class="label"><div class="muted">ORDER</div><div class="big">#${o.id}</div>
-    ${tracking ? `<div>Tracking <strong>${esc(tracking)}</strong>${s?.partner_name ? ` · ${esc(s.partner_name)}` : ''}</div>` : ''}
+    `<div class="label">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+      <div><div class="muted">ORDER</div><div class="big">#${o.id}</div>${o.group_reference ? `<div class="muted">${esc(o.group_reference)}</div>` : ''}</div>
+      ${carrier ? `<div style="text-align:right"><div class="muted">CARRIER</div><strong style="font-size:15px">${esc(carrier)}</strong></div>` : ''}
+    </div>
+    ${tracking ? `<div style="margin-top:8px">${barcode ?? ''}<div style="text-align:center;font-family:monospace;font-size:13px;letter-spacing:.08em">${s?.external_tracking_id ? 'AWB ' : ''}${esc(tracking)}</div></div>` : ''}
     <hr><h2>Deliver to</h2><div style="font-size:15px">${customerBlock(o)}</div>
-    <hr><div>${cod != null ? `<span class="cod">COD ${rupees(cod)}</span>` : '<span class="cod">PREPAID</span>'} &nbsp; ${s?.package_count > 1 ? `${s.package_count} boxes` : ''}</div>
+    <hr><div>${cod != null ? `<span class="cod">COD ${rupees(cod)}</span>` : '<span class="cod">PREPAID</span>'}
+      &nbsp; ${[s?.package_count > 1 ? `${s.package_count} boxes` : null, pieces ? `${pieces} item${pieces === 1 ? '' : 's'}` : null, weight].filter(Boolean).join(' · ')}</div>
     <hr><h2>From</h2><div class="muted" style="color:#0F2547">${shopBlock(o)}</div></div>`,
     { label: true }
   );
@@ -212,8 +262,8 @@ function labelHtml({ order: o, shipment: s }) {
 
 const RENDER = { invoice: invoiceHtml, 'packing-slip': packingSlipHtml, label: labelHtml };
 
-async function render(kind, orderId, vendorId) {
-  const data = await loadOrder(orderId, vendorId);
+async function render(kind, orderId, vendorId, shipmentId = null) {
+  const data = await loadOrder(orderId, vendorId, shipmentId);
   return data ? RENDER[kind](data) : null;
 }
 

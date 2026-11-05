@@ -163,6 +163,8 @@ router.patch("/shipments/:id", shipment.updateShipment);
 router.post("/shipments/:id/events", shipment.recordEvent);
 router.post("/shipments/:id/assign", shipment.assignPartner);
 router.post("/shipments/:id/provider", shipment.switchProvider);
+// DR7: printable label / packing slip / invoice (a GET, so viewers can print).
+router.get("/shipments/:id/documents/:kind", shipment.documentLink);
 // Under /shipments so the shipments permission covers picking a partner.
 router.get("/shipments/:id/partners", deliveryPartner.availableForShipment);
 
