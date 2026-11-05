@@ -8,6 +8,7 @@ const pool = require('../config/db');
 const { EnquiryError: BookingError } = require('./shopEnquiries');
 const payments = require('./serviceBookingPayments');
 const commissions = require('./serviceCommissions');
+const tracking = require('./serviceBookingTracking');
 
 const STEP_MINUTES = 30;
 const DEFAULT_MINUTES = 60;
@@ -369,6 +370,8 @@ function shape(r, side, events) {
     coupon: r.coupon_code ? { code: r.coupon_code, discountCents: r.discount_cents ?? 0 } : null,
     payOnline: r.pay_online === true,
     payDeadline: r.pay_deadline ?? null,
+    // SV11: the shop is sharing its live location for this trip.
+    tracking: r.status === 'on_the_way' && r.tracking_on === true,
     payment: payments.shape(r),
     atHome: r.at_home,
     visitAddress: r.visit_address,
@@ -442,6 +445,8 @@ async function move(rawId, side, ownerId, actorUserId, action, rawNote) {
     );
     // SV8: the commission is fixed the moment the work is done.
     if (rule.to === 'completed') await commissions.record(client, id);
+    // SV11: off the way → stop sharing and forget the last point.
+    if (b.status === 'on_the_way' && rule.to !== 'on_the_way') await tracking.clear(client, id);
     await client.query('INSERT INTO service_booking_events (booking_id, status, by_role, by_user_id, note) VALUES ($1, $2, $3, $4, $5)', [
       id, rule.to, side, actorUserId, note || null,
     ]);

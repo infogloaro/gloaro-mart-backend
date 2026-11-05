@@ -27,6 +27,10 @@ const invoice = (side, owner) => handle(async (req, res) => {
 
 module.exports = {
   customerInvoice: invoice('customer', (req) => req.user.id),
+  // SV11: live location while on the way.
+  customerLocation: handle(async (req, res) => res.json(await require('../services/serviceBookingTracking').forCustomer(req.params.id, req.user.id))),
+  vendorTracking: handle(async (req, res) => res.json(await require('../services/serviceBookingTracking').setSharing(req.params.id, req.vendorId, req.body?.share))),
+  vendorLocation: handle(async (req, res) => res.json(await require('../services/serviceBookingTracking').update(req.params.id, req.vendorId, req.body || {}))),
   vendorInvoice: invoice('vendor', (req) => req.vendorId),
   slots: handle(async (req, res) => res.json(await bookings.slots(req.params.id, req.query.date))),
   availability: handle(async (req, res) => res.json(await bookings.availability(req.params.id, req.query.days))),

@@ -164,6 +164,8 @@ const cancel = handle(async (req, res) => {
       [b.id, `Gloaro Mart: ${reason}`]
     );
     await client.query("INSERT INTO service_booking_events (booking_id, status, by_role, by_user_id, note) VALUES ($1, 'cancelled', 'admin', $2, $3)", [b.id, req.user.id, reason]);
+    // SV11: no live location on a cancelled booking.
+    await require('../services/serviceBookingTracking').clear(client, b.id);
     for (const [userId, link] of [[b.user_id, `/bookings/${b.id}`], [b.shop_user_id, `/vendor/bookings/${b.id}`]]) {
       await client.query(
         "INSERT INTO notifications (user_id, type, title, body, deep_link) VALUES ($1, 'service_booking', $2, $3, $4)",

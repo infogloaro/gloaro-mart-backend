@@ -22,5 +22,7 @@ router.post('/:id/pay', bookings.customerPay);
 // SV9: the invoice of a completed booking (JSON; ?format=pdf or /invoice.pdf for the file).
 router.get('/:id/invoice', bookings.customerInvoice);
 router.get('/:id/invoice.pdf', bookings.customerInvoice);
+// SV11: where the provider is while on the way (only when the shop shares it).
+router.get('/:id/location', bookings.customerLocation);
 
 module.exports = router;

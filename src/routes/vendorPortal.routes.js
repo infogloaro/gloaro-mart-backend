@@ -137,6 +137,9 @@ router.get('/service-earnings', serviceBookings.vendorEarnings); // SV8
 router.get('/bookings', serviceBookings.vendorList);
 router.get('/bookings/:id', serviceBookings.vendorGet);
 router.get('/bookings/:id/invoice', serviceBookings.vendorInvoice); // SV9
+// SV11: share live location for this trip (consent), and the points.
+router.post('/bookings/:id/tracking', serviceBookings.vendorTracking);
+router.put('/bookings/:id/location', serviceBookings.vendorLocation);
 router.get('/bookings/:id/invoice.pdf', serviceBookings.vendorInvoice);
 // accept | reject | start | complete | cancel (anything else is refused by the service).
 router.post('/bookings/:id/:action', serviceBookings.vendorMove);

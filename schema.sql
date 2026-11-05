@@ -4660,3 +4660,19 @@ ALTER TABLE service_bookings ADD CONSTRAINT service_bookings_cancelled_by_check
 ALTER TABLE service_booking_events DROP CONSTRAINT IF EXISTS service_booking_events_by_role_check;
 ALTER TABLE service_booking_events ADD CONSTRAINT service_booking_events_by_role_check
   CHECK (by_role IN ('customer', 'vendor', 'admin', 'system'));
+
+-- ===== SERVICE LIVE TRACKING (SV11) =====
+-- The provider's live location while a booking is "on the way", only after
+-- the shop switches sharing on for that booking (tracking_on, with the time
+-- it consented). One row per booking holds the last point only; it is
+-- deleted when the booking moves on or sharing is switched off.
+-- scripts/migrate-service-tracking.js
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS tracking_on BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE service_bookings ADD COLUMN IF NOT EXISTS tracking_started_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS service_booking_locations (
+  booking_id INTEGER PRIMARY KEY REFERENCES service_bookings(id) ON DELETE CASCADE,
+  latitude DOUBLE PRECISION NOT NULL CHECK (latitude BETWEEN -90 AND 90),
+  longitude DOUBLE PRECISION NOT NULL CHECK (longitude BETWEEN -180 AND 180),
+  accuracy_m REAL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
