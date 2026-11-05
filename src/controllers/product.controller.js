@@ -41,13 +41,40 @@ async function attachTiers(products) {
   return products.map((p) => ({ ...p, tiers: tiersByProduct.get(p.id) || [] }));
 }
 
+/**
+ * PD5: the product's facts (Material, Care, Warranty, Best before, Dimensions
+ * …) as an ordered [{ label, value }] list in products.specifications. Accepts
+ * that list or a { label: value } object; blanks are dropped, at most 20 rows.
+ * Returns undefined for "not sent", null to clear.
+ */
+function normaliseSpecifications(value) {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const pairs = Array.isArray(value)
+    ? value.filter((r) => r && typeof r === 'object').map((r) => [r.label ?? r.name ?? r.key, r.value])
+    : typeof value === 'object'
+      ? Object.entries(value)
+      : [];
+  const seen = new Set();
+  const out = [];
+  for (const [rawLabel, rawValue] of pairs) {
+    const label = String(rawLabel ?? '').trim().slice(0, 40);
+    const val = String(rawValue ?? '').trim().slice(0, 300);
+    if (!label || !val || seen.has(label.toLowerCase())) continue;
+    seen.add(label.toLowerCase());
+    out.push({ label, value: val });
+    if (out.length === 20) break;
+  }
+  return out.length ? out : null;
+}
+
 async function createProduct(req, res) {
   const vendorId = await getVendorProfileId(req.user.id);
   if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
 
   const {
     name, description, priceCents, currency, stockQuantity, imageUrl, category, subcategory, brandId, gstRatePercent, moq,
-    attributeValueIds,
+    attributeValueIds, specifications,
   } = req.body || {};
   if (!name || !Number.isInteger(priceCents) || priceCents < 0) {
     return res.status(400).json({ message: 'name and a valid priceCents are required' });
@@ -67,8 +94,8 @@ async function createProduct(req, res) {
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO products (vendor_id, name, description, price_cents, currency, stock_quantity, image_url, category, brand_id, gst_rate_percent, moq, subcategory)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `INSERT INTO products (vendor_id, name, description, price_cents, currency, stock_quantity, image_url, category, brand_id, gst_rate_percent, moq, subcategory, specifications)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
        RETURNING *`,
       [
         vendorId,
@@ -83,6 +110,7 @@ async function createProduct(req, res) {
         gstRatePercent ?? 0,
         moq ?? 1,
         typeof subcategory === 'string' && subcategory.trim() ? subcategory.trim() : null,
+        JSON.stringify(normaliseSpecifications(specifications) ?? null),
       ]
     );
     product = rows[0];
@@ -164,6 +192,7 @@ async function updateProduct(req, res) {
     moq,
     attributeValueIds,
   } = req.body || {};
+  const specs = normaliseSpecifications((req.body || {}).specifications);
   if (brandId != null && (!Number.isInteger(brandId) || brandId < 1)) {
     return res.status(400).json({ message: 'brandId must be a positive integer or null' });
   }
@@ -196,6 +225,8 @@ async function updateProduct(req, res) {
         moq = COALESCE($12, moq),
         -- Absent leaves it; an empty string clears it.
         subcategory = CASE WHEN $13::text IS NULL THEN subcategory ELSE NULLIF(trim($13::text), '') END,
+        -- PD5: absent leaves them; null or an empty list clears them.
+        specifications = CASE WHEN $14::boolean THEN $15::jsonb ELSE specifications END,
         updated_at = now()
        WHERE id = $1 AND vendor_id = $2
        RETURNING *`,
@@ -213,6 +244,8 @@ async function updateProduct(req, res) {
         gstRatePercent,
         moq,
         typeof subcategory === 'string' ? subcategory : null,
+        specs !== undefined,
+        JSON.stringify(specs ?? null),
       ]
     );
     product = rows[0];
@@ -406,6 +439,7 @@ async function setTiers(req, res) {
 }
 
 module.exports = {
+  normaliseSpecifications,
   createProduct,
   getMyProducts,
   updateProduct,
