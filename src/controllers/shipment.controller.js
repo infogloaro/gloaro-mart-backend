@@ -494,6 +494,8 @@ async function listForOrder(req, res) {
       partner_name: s.partner_name,
       partner_phone: s.status === 'out_for_delivery' ? s.partner_phone : null,
       courier_tracking_url: s.tracking_url,
+      // DR8: who carries it (gokart | shiprocket | manual), so the app can say so.
+      provider: s.provider ?? null,
       cod_amount_cents: s.cod_amount_cents,
       estimated_delivery_at: s.estimated_delivery_at,
       delivered_at: s.delivered_at,
