@@ -4676,3 +4676,11 @@ CREATE TABLE IF NOT EXISTS service_booking_locations (
   accuracy_m REAL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ===== SHOP POLICIES & FAQ (AB3) =====
+-- The shop's own return / exchange / warranty wording and up to 10 questions
+-- and answers, shown on its About tab: {returns?, exchange?, warranty?, faq?:
+-- [{q, a}]}. Empty = the app shows the platform rules only. Written through
+-- PATCH /api/vendors/me (policies replaces the whole set; {} or null clears).
+-- scripts/migrate-shop-policies.js. Safe to run again.
+ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS policies JSONB NOT NULL DEFAULT '{}'::jsonb;

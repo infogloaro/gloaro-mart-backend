@@ -44,6 +44,7 @@ function readBranding(body = {}) {
     }
   }
   if (body.contact !== undefined) out.contact = readContact(body.contact);
+  if (body.policies !== undefined) out.policies = readPolicies(body.policies);
   return out;
 }
 
@@ -104,6 +105,46 @@ function readContact(c) {
   };
   social('instagram', 'instagram.com', /^[A-Za-z0-9._]{1,30}$/, 'Instagram account');
   social('facebook', 'facebook.com', /^[A-Za-z0-9.-]{1,80}$/, 'Facebook page');
+  return out;
+}
+
+/**
+ * AB3: the shop's own policies and FAQ. `policies` replaces the whole set
+ * ({} or null clears it): returns / exchange / warranty text (≤1000 chars
+ * each) and faq [{q ≤150, a ≤600}] (≤10, both parts required).
+ */
+const POLICY_TEXTS = ['returns', 'exchange', 'warranty'];
+const MAX_POLICY = 1000;
+const MAX_FAQ = 10;
+
+function readPolicies(p) {
+  if (p === null) return {};
+  if (typeof p !== 'object' || Array.isArray(p)) throw new BrandingError(400, 'policies must be an object.');
+  const unknown = Object.keys(p).filter((k) => ![...POLICY_TEXTS, 'faq'].includes(k));
+  if (unknown.length) throw new BrandingError(400, `Unknown policy field: ${unknown.join(', ')}.`);
+  const out = {};
+  for (const k of POLICY_TEXTS) {
+    if (p[k] == null) continue;
+    if (typeof p[k] !== 'string') throw new BrandingError(400, `The ${k} policy must be text.`);
+    const v = p[k].trim();
+    if (v.length > MAX_POLICY) throw new BrandingError(400, `The ${k} policy is at most ${MAX_POLICY} characters.`);
+    if (v) out[k] = v;
+  }
+  if (p.faq != null) {
+    if (!Array.isArray(p.faq)) throw new BrandingError(400, 'faq must be a list of questions and answers.');
+    const faq = [];
+    for (const item of p.faq) {
+      const q = typeof item?.q === 'string' ? item.q.trim() : '';
+      const a = typeof item?.a === 'string' ? item.a.trim() : '';
+      if (!q && !a) continue;
+      if (!q || !a) throw new BrandingError(400, 'Each FAQ needs both a question and an answer.');
+      if (q.length > 150) throw new BrandingError(400, 'A question is at most 150 characters.');
+      if (a.length > 600) throw new BrandingError(400, 'An answer is at most 600 characters.');
+      faq.push({ q, a });
+    }
+    if (faq.length > MAX_FAQ) throw new BrandingError(400, `At most ${MAX_FAQ} questions.`);
+    if (faq.length) out.faq = faq;
+  }
   return out;
 }
 
@@ -218,6 +259,7 @@ async function setPhotoStatus(vendorId, photoId, { status, reason } = {}, userId
 }
 
 module.exports = {
+  readPolicies,
   BrandingError,
   MAX_PHOTOS,
   readBranding,
