@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const shopHours = require('../services/shopHours');
 
 /**
  * The shop's catalogue query: filters, sorting and facets.
@@ -205,6 +206,12 @@ function buildFilters(query) {
   if (minProductRating != null) {
     conditions.push(`(p.rating_count > 0 AND p.rating_average >= ${push(minProductRating)})`);
   }
+
+  // CT5 quick filters — the same meaning as the shop list's (vendor.controller).
+  if (query.newArrivals === 'true') conditions.push("p.created_at >= now() - interval '30 days'");
+  if (query.freeDelivery === 'true') conditions.push('(dr.supports_delivery IS TRUE AND dr.delivery_charge_cents = 0)');
+  if (query.storePickup === 'true') conditions.push('dr.supports_pickup IS TRUE');
+  if (query.openNow === 'true') conditions.push(`${shopHours.openNowSql('vp')} IS TRUE`);
 
   const maxEta = toNumber(query.maxEtaMinutes);
   if (maxEta != null) conditions.push(`${etaExpression()} <= ${push(maxEta)}`);
