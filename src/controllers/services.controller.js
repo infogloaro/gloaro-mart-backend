@@ -8,13 +8,14 @@ const shopHours = require('../services/shopHours');
  * the rating is the shop's (vendor_reviews → vendor_performance_metrics).
  * Distance is only sent when the caller gave a point and the shop has one.
  *   GET /api/services/categories
- *   GET /api/services?categoryId&q&lat&lng&radiusKm&home&shop&openNow&minRating&minPrice&maxPrice&sort&page&pageSize
+ *   GET /api/services?categoryId&q&lat&lng&radiusKm&home&shop&openNow&verified&minRating&minPrice&maxPrice&sort&page&pageSize
+ *     (SV1: verified=true keeps only KYC-verified shops; sort=popular = most-reviewed first)
  *     (minPrice/maxPrice in paise: a service whose price or range touches them; on-request
  *     services have no price, so a price filter leaves them out)
  *   GET /api/services/:id
  */
 
-const SORTS = ['recommended', 'nearest', 'rating', 'price_asc', 'price_desc'];
+const SORTS = ['recommended', 'nearest', 'rating', 'price_asc', 'price_desc', 'popular'];
 
 // What a customer may see of a service: active, by an approved shop, in an
 // active category.
@@ -129,6 +130,7 @@ async function list(req, res) {
   if (flag(req.query.home)) where.push('s.at_home');
   if (flag(req.query.shop)) where.push('s.at_shop');
   if (flag(req.query.openNow)) where.push(`${shopHours.openNowSql('vp')} IS TRUE`);
+  if (flag(req.query.verified)) where.push(shopTrust.verifiedSql('vp'));
   if (minRating !== null) where.push(`(pm.rating_count > 0 AND pm.rating_sum / pm.rating_count >= ${push(minRating)})`);
   if (minPrice !== null || maxPrice !== null) where.push("s.price_type <> 'on_request' AND s.price_cents IS NOT NULL");
   if (maxPrice !== null) where.push(`s.price_cents <= ${push(maxPrice)}`);
@@ -148,6 +150,9 @@ async function list(req, res) {
     rating: 'CASE WHEN pm.rating_count > 0 THEN pm.rating_sum / pm.rating_count END DESC NULLS LAST, pm.rating_count DESC NULLS LAST, s.id',
     price_asc: "CASE WHEN s.price_type = 'on_request' THEN NULL ELSE s.price_cents END ASC NULLS LAST, s.id",
     price_desc: "CASE WHEN s.price_type = 'on_request' THEN NULL ELSE COALESCE(s.price_max_cents, s.price_cents) END DESC NULLS LAST, s.id",
+    // Most talked about: the service's own reviews, then the shop's, then bookings.
+    popular: `(SELECT COUNT(*) FROM service_reviews r WHERE r.service_id = s.id) DESC, pm.rating_count DESC NULLS LAST,
+              (SELECT COUNT(*) FROM service_bookings b WHERE b.service_id = s.id AND b.status = 'completed') DESC, s.updated_at DESC`,
   }[sort];
 
   const whereSql = where.join(' AND ');
