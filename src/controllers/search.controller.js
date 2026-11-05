@@ -13,7 +13,10 @@ const shopHours = require('../services/shopHours');
 const AVERAGE_SPEED_KMPH = 20;
 const DEFAULT_PREPARATION_MINUTES = 30;
 
-const SORTS = ['relevance', 'price_asc', 'price_desc', 'newest', 'discount', 'nearest', 'fastest', 'rating', 'popular', 'top_rated'];
+const SORTS = ['relevance', 'price_asc', 'price_desc', 'newest', 'discount', 'nearest', 'fastest', 'rating', 'popular', 'top_rated', 'moq_asc', 'wholesale_asc'];
+
+/** F6: the lowest bulk price per piece, else the product's own price. */
+const WHOLESALE_PRICE = 'COALESCE((SELECT MIN(t.unit_price_cents) FROM product_price_tiers t WHERE t.product_id = p.id), p.price_cents)';
 
 /**
  * Attribute filters from the query string: attr[3]=7 or attr[3]=7,9 (any of
@@ -87,6 +90,8 @@ const DERIVED = `
        THEN ROUND((p.mrp_cents - p.price_cents)::numeric * 100 / p.mrp_cents)
   END AS discount_percent,
   COALESCE((SELECT SUM(i.available_qty)::int FROM inventory i WHERE i.product_id = p.id), 0) AS available_qty,
+  ${WHOLESALE_PRICE} AS wholesale_price_cents,
+  EXISTS (SELECT 1 FROM product_price_tiers t WHERE t.product_id = p.id) AS has_bulk_price,
   COALESCE(
     (SELECT m.url FROM product_media m WHERE m.product_id = p.id AND m.is_primary LIMIT 1),
     p.image_url
@@ -213,6 +218,17 @@ function buildFilters(query) {
   if (query.storePickup === 'true') conditions.push('dr.supports_pickup IS TRUE');
   if (query.openNow === 'true') conditions.push(`${shopHours.openNowSql('vp')} IS TRUE`);
 
+  // F6 wholesale filters.
+  const maxMoq = toNumber(query.maxMoq);
+  if (maxMoq != null) conditions.push(`p.moq <= ${push(maxMoq)}`);
+  const maxWholesale = toNumber(query.maxWholesalePriceCents);
+  if (maxWholesale != null) conditions.push(`${WHOLESALE_PRICE} <= ${push(maxWholesale)}`);
+  if (query.bulkPrice === 'true') conditions.push('EXISTS (SELECT 1 FROM product_price_tiers t WHERE t.product_id = p.id)');
+  if (query.sampleAvailable === 'true') conditions.push('p.sample_available IS TRUE');
+  if (query.cartonPack === 'true') conditions.push('p.carton_qty IS NOT NULL');
+  const maxLead = toNumber(query.maxLeadTimeDays);
+  if (maxLead != null) conditions.push(`COALESCE(p.lead_time_days, 0) <= ${push(maxLead)}`);
+
   const maxEta = toNumber(query.maxEtaMinutes);
   if (maxEta != null) conditions.push(`${etaExpression()} <= ${push(maxEta)}`);
 
@@ -258,6 +274,10 @@ function orderBy(sort, hasQuery) {
     case 'popular':
       // Units sold across the product's stock rows; newest first among equals.
       return '(SELECT COALESCE(SUM(i.sold_qty), 0) FROM inventory i WHERE i.product_id = p.id) DESC, p.created_at DESC';
+    case 'moq_asc':
+      return 'p.moq ASC, p.price_cents ASC, p.id DESC';
+    case 'wholesale_asc':
+      return 'wholesale_price_cents ASC, p.moq ASC, p.id DESC';
     case 'relevance':
     default:
       // Nothing to be relevant to without a search term, so recency stands in.
@@ -313,6 +333,7 @@ function toListingJson(r) {
     eta_minutes: r.eta_minutes == null ? null : Number(r.eta_minutes),
     vendor_rating: r.vendor_rating == null ? null : Number(r.vendor_rating),
     in_stock: r.available_qty > 0,
+    wholesale_price_cents: r.wholesale_price_cents == null ? null : Number(r.wholesale_price_cents),
   };
 }
 

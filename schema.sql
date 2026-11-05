@@ -4684,3 +4684,14 @@ CREATE TABLE IF NOT EXISTS service_booking_locations (
 -- PATCH /api/vendors/me (policies replaces the whole set; {} or null clears).
 -- scripts/migrate-shop-policies.js. Safe to run again.
 ALTER TABLE vendor_profiles ADD COLUMN IF NOT EXISTS policies JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- ===== WHOLESALE FACTS (F6) =====
+-- What bulk buyers filter by, set by the shop on each product: units per
+-- carton (null = sold loose), whether a sample can be ordered, and how many
+-- days the shop needs before dispatching a bulk order (null = ready stock).
+-- Wholesale price is derived: the lowest product_price_tiers price, else the
+-- product's price. scripts/migrate-wholesale-facts.js. Safe to run again.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS carton_qty INTEGER CHECK (carton_qty IS NULL OR carton_qty >= 1);
+ALTER TABLE products ADD COLUMN IF NOT EXISTS sample_available BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS lead_time_days INTEGER CHECK (lead_time_days IS NULL OR lead_time_days BETWEEN 0 AND 365);
+CREATE INDEX IF NOT EXISTS idx_products_moq ON products (moq);

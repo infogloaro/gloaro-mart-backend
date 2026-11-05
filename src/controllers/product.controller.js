@@ -68,6 +68,30 @@ function normaliseSpecifications(value) {
   return out.length ? out : null;
 }
 
+/**
+ * F6: the wholesale facts in a request body, checked. Absent keys are left
+ * out (update leaves them); null clears carton / lead time.
+ */
+function readWholesale(body = {}) {
+  const out = {};
+  const whole = (key, col, min, max, label) => {
+    if (!(key in body)) return;
+    const v = body[key];
+    if (v === null || v === '') return void (out[col] = null);
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      const err = new Error(`${label} must be a whole number from ${min} to ${max}.`);
+      err.status = 400;
+      throw err;
+    }
+    out[col] = n;
+  };
+  whole('cartonQty', 'carton_qty', 1, 100000, 'Units per carton');
+  whole('leadTimeDays', 'lead_time_days', 0, 365, 'Lead time');
+  if ('sampleAvailable' in body) out.sample_available = body.sampleAvailable === true;
+  return out;
+}
+
 async function createProduct(req, res) {
   const vendorId = await getVendorProfileId(req.user.id);
   if (!vendorId) return res.status(404).json({ message: 'Vendor profile not found' });
@@ -114,6 +138,15 @@ async function createProduct(req, res) {
       ]
     );
     product = rows[0];
+    const wholesale = readWholesale(req.body || {});
+    if (Object.keys(wholesale).length) {
+      const cols = Object.keys(wholesale);
+      const { rows: w } = await client.query(
+        `UPDATE products SET ${cols.map((c, i) => `${c} = ${i + 2}`).join(', ')} WHERE id = $1 RETURNING *`,
+        [product.id, ...cols.map((c) => wholesale[c])]
+      );
+      product = w[0];
+    }
     await openingStock(client, product, req.user.id);
     // The product's filter facts (Material, Fit …) from the platform's attributes.
     if (Array.isArray(attributeValueIds)) {
@@ -252,6 +285,15 @@ async function updateProduct(req, res) {
     if (!product) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Product not found' });
+    }
+    const wholesale = readWholesale(req.body || {});
+    if (Object.keys(wholesale).length) {
+      const cols = Object.keys(wholesale);
+      const { rows: w } = await client.query(
+        `UPDATE products SET ${cols.map((c, i) => `${c} = ${i + 2}`).join(', ')} WHERE id = $1 RETURNING *`,
+        [product.id, ...cols.map((c) => wholesale[c])]
+      );
+      product = w[0];
     }
     if (stockQuantity != null) {
       await setSimpleStock(client, {
@@ -439,6 +481,7 @@ async function setTiers(req, res) {
 }
 
 module.exports = {
+  readWholesale,
   normaliseSpecifications,
   createProduct,
   getMyProducts,
