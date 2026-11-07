@@ -65,6 +65,7 @@ router.get('/reports/gst', require('../controllers/vendorReportGst.controller').
 router.get('/reports/cancellations', require('../controllers/vendorReportCancellations.controller').cancellationsReport); // VD21
 router.get('/reports/customers', require('../controllers/vendorReportCustomers.controller').customersReport); // VD20
 router.get('/reports/promotions', require('../controllers/vendorReportPromotions.controller').promotionsReport); // VD22
+router.get('/reports/operations', require('../controllers/vendorReportOperations.controller').operationsReport); // DB4 busy hours + timings
 router.get('/health', require('../controllers/vendorHealth.controller').getHealth); // VD29
 router.get('/plan', require('../controllers/vendorPlan.controller').getPlan); // VD26
 
